@@ -1,5 +1,4 @@
 const std = @import("std");
-const Scanner = @import("./scanner.zig").Scanner;
 const Token = @import("./scanner.zig").Token;
 const Ast = @import("./ast.zig");
 
@@ -7,60 +6,27 @@ const Allocator = std.mem.Allocator;
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 
+pub const Error = error{ParseError} || Allocator.Error;
+
 const null_node: Node.Index = 0;
 
 pub const Parser = struct {
     source: [:0]const u8,
     nodes: std.MultiArrayList(Node),
-    errors: std.ArrayListUnmanaged(Error),
-    tokens: Ast.TokenList,
+    errors: std.ArrayListUnmanaged(Ast.Error),
     token_tags: []const Token.Tag,
     token_starts: []const Ast.ByteOffset,
     gpa: Allocator,
     token_index: TokenIndex,
 
-    pub fn init(source: [:0]const u8, gpa: Allocator) !Parser {
-        var tokens = Ast.TokenList{};
-
-        // Empirically, the zig std lib has an 8:1 ratio of source bytes to token count.
-        const estimated_token_count = source.len / 8;
-        try tokens.ensureTotalCapacity(gpa, estimated_token_count);
-        var scanner = Scanner.init(source);
-
-        while (true) {
-            const token = scanner.next();
-            try tokens.append(gpa, .{
-                .tag = token.tag,
-                .start = @intCast(token.loc.start),
-            });
-            if (token.tag == .eof) break;
-        }
-
-        return Parser{
-            .gpa = gpa,
-            .errors = .{},
-            .nodes = .{},
-            .source = source,
-            .tokens = tokens,
-            .token_tags = tokens.items(.tag),
-            .token_starts = tokens.items(.start),
-            .token_index = 0,
-        };
-    }
-
     pub fn deinit(self: *Parser) void {
         self.errors.deinit(self.gpa);
         self.nodes.deinit(self.gpa);
-        self.tokens.deinit(self.gpa);
         // self.extra_data.deinit(self.gpa);
         // self.scratch.deinit(self.gpa);
     }
 
     pub fn parse(self: *Parser) !void {
-        const estimated_node_count = (self.tokens.len + 2) / 2;
-        // Empirically, Zig source code has a 2:1 ratio of tokens to AST nodes.
-        // Make sure at least 1 so we can use appendAssumeCapacity on the root node below.
-        try self.nodes.ensureTotalCapacity(self.gpa, estimated_node_count);
         // Root node must be index 0.
         self.nodes.appendAssumeCapacity(.{
             .tag = .root,
@@ -68,9 +34,22 @@ pub const Parser = struct {
             .data = undefined,
         });
 
-        std.debug.print("tokens {any}  \n", .{self.token_tags});
-        _ = try self.expression();
-        _ = try self.consume(.eof);
+        //  parse declarations
+        //  attach them to the root
+
+        const root_members = try self.globalexpr();
+        if (self.token_tags[self.token_index] != .eof) {
+            try self.warnExpected(.eof);
+        }
+
+        self.nodes.items(.data)[0] = .{
+            .lhs = root_members,
+            .rhs = undefined,
+        };
+    }
+
+    fn globalexpr(self: *Parser) !Node.Index {
+        return self.addNode(.{ .tag = .global_exp, .main_token = 0, .data = .{ .lhs = try self.expression(), .rhs = undefined } });
     }
 
     pub fn expression(self: *Parser) !Node.Index {
@@ -79,24 +58,24 @@ pub const Parser = struct {
 
     fn parsePrecedence(self: *Parser, precedence: Precedence) !Node.Index {
         const prefixRule = self.getRule(self.current()).prefix orelse {
-            try self.failMsg(.{
+            return self.failMsg(.{
                 .tag = .expected_expression,
                 .token = self.token_index,
             });
 
-            return null_node;
+            // return null_node;
         };
 
         var node = try prefixRule(self);
 
         while (@intFromEnum(precedence) <= @intFromEnum(self.getRule(self.current()).precedence)) {
             const infixRule = self.getRule(self.current()).infix orelse {
-                try self.failMsg(.{
+                return self.failMsg(.{
                     .tag = .expected_expression,
                     .token = self.token_index,
                 });
 
-                return node;
+                // return node;
             };
 
             node = try infixRule(self, node);
@@ -256,13 +235,13 @@ pub const Parser = struct {
         try self.warnMsg(.{ .tag = error_tag, .token = self.token_index });
     }
 
-    fn failMsg(self: *Parser, msg: Error) error{ ParseError, OutOfMemory } {
+    fn failMsg(self: *Parser, msg: Ast.Error) error{ ParseError, OutOfMemory } {
         @branchHint(.cold);
         try self.warnMsg(msg);
         return error.ParseError;
     }
 
-    fn warnMsg(self: *Parser, msg: Error) !void {
+    fn warnMsg(self: *Parser, msg: Ast.Error) !void {
         @branchHint(.cold);
         switch (msg.tag) {
             .expected_comma_after_arg,
@@ -295,6 +274,30 @@ pub const Parser = struct {
 
     // Public Helpers
 
+    pub fn renderError(self: *Parser, parse_error: Error, stream: anytype) !void {
+        switch (parse_error.tag) {
+            .expected_expression => {
+                return stream.print("expected expression, found '{s}'", .{
+                    self.token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
+                });
+            },
+            .expected_comma_after_arg => {
+                return stream.writeAll("expected ',' after argument");
+            },
+            .expected_token => {
+                const found_tag = self.token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)];
+                const expected_symbol = parse_error.extra.expected_tag.symbol();
+                switch (found_tag) {
+                    .invalid => return stream.print("expected '{s}', found invalid bytes", .{
+                        expected_symbol,
+                    }),
+                    else => return stream.print("expected '{s}', found '{s}'", .{
+                        expected_symbol, found_tag.symbol(),
+                    }),
+                }
+            },
+        }
+    }
     pub fn tokenLocation(self: *Parser, start_offset: Ast.ByteOffset, token_index: TokenIndex) Location {
         var loc = Location{
             .line = 0,
@@ -359,17 +362,6 @@ const Precedence = enum {
     prec_unary, // ! -
     prec_call, // . ()
     prec_primary,
-};
-
-pub const Error = struct {
-    tag: Tag,
-    is_note: bool = false,
-    /// True if `token` points to the token before the token causing an issue.
-    token_is_prev: bool = false,
-    token: TokenIndex,
-    extra: union { none: void, expected_tag: Token.Tag } = .{ .none = {} },
-
-    pub const Tag = enum { expected_comma_after_arg, expected_token, expected_expression };
 };
 
 pub const Location = struct {

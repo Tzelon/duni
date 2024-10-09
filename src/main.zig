@@ -1,5 +1,6 @@
 const std = @import("std");
-const Parser = @import("./parser.zig").Parser;
+const AstGen = @import("./AstGen.zig");
+const Ast = @import("./ast.zig");
 const io = std.io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
@@ -50,13 +51,9 @@ fn runFile(allocator: Allocator, path: []const u8) !void {
     const source = try std.fs.cwd().readFileAllocOptions(allocator, path, std.math.maxInt(u32), null, @alignOf(u8), 0);
     defer allocator.free(source);
 
-    std.debug.print("{s}", .{source});
-    var parser = try Parser.init(source, allocator);
-    try parser.parse();
-    std.debug.print("tags {any} \n", .{parser.nodes.items(.tag)});
-    std.debug.print("main_token {any} \n", .{parser.nodes.items(.main_token)});
-    std.debug.print("data {any} \n", .{parser.nodes.items(.data)});
-    // _ = try interpret(source);
+    std.debug.print("source \n {s} :source \n", .{source});
+    const tree = try Ast.parse(allocator, source);
+    try AstGen.generate(allocator, tree);
 }
 
 test "simple test" {}

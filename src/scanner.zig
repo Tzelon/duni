@@ -90,79 +90,73 @@ pub const Token = struct {
 
         doc_comment,
         doc_comment_start,
+
+        pub fn lexeme(tag: Tag) ?[]const u8 {
+            return switch (tag) {
+                .invalid,
+                .identifier,
+                .string_literal,
+                .eof,
+                .number_literal,
+                .doc_comment,
+                // .container_doc_comment,
+                => null,
+
+                .bang => "!",
+                .equal => "=",
+                .equal_equal => "==",
+                .equal_angle_bracket_right => "=>",
+                .bang_equal => "!=",
+                .l_paren => "(",
+                .r_paren => ")",
+                .percent => "%",
+                .l_brace => "{",
+                .r_brace => "}",
+                .l_bracket => "[",
+                .r_bracket => "]",
+                .dot => ".",
+                .ellipsis2 => "..",
+                .ellipsis3 => "...",
+                .plus => "+",
+                .plus_equal => "+=",
+                .minus => "-",
+                .minus_equal => "-=",
+                .star_star => "**",
+                .colon => ":",
+                .slash => "/",
+                .comma => ",",
+                .ampersand => "&",
+                .ampersand_equal => "&=",
+                .angle_bracket_left => "<",
+                .angle_bracket_left_equal => "<=",
+                .angle_bracket_right => ">",
+                .angle_bracket_right_equal => ">=",
+                .tilde => "~",
+                .keyword_and => "and",
+                .keyword_else => "else",
+                .keyword_error => "error",
+                // .keyword_fn => "fn",
+                .keyword_for => "for",
+                .keyword_if => "if",
+                .keyword_or => "or",
+                // .keyword_while => "while",
+                //TODO(tzelon): add missing tags
+                else => "",
+            };
+        }
+
+        pub fn symbol(tag: Tag) []const u8 {
+            return tag.lexeme() orelse switch (tag) {
+                .invalid => "invalid token",
+                .identifier => "an identifier",
+                .string_literal => "a string literal",
+                .eof => "EOF",
+                .number_literal => "a number literal",
+                // .doc_comment, .container_doc_comment => "a document comment",
+                else => unreachable,
+            };
+        }
     };
-
-    pub fn lexeme(tag: Tag) ?[]const u8 {
-        return switch (tag) {
-            .invalid,
-            .identifier,
-            .string_literal,
-            .multiline_string_literal_line,
-            .char_literal,
-            .eof,
-            .builtin,
-            .number_literal,
-            .doc_comment,
-            .container_doc_comment,
-            => null,
-
-            .bang => "!",
-            .equal => "=",
-            .equal_equal => "==",
-            .equal_angle_bracket_right => "=>",
-            .bang_equal => "!=",
-            .l_paren => "(",
-            .r_paren => ")",
-            .semicolon => ";",
-            .percent => "%",
-            .l_brace => "{",
-            .r_brace => "}",
-            .l_bracket => "[",
-            .r_bracket => "]",
-            .dot => ".",
-            .ellipsis2 => "..",
-            .ellipsis3 => "...",
-            .plus => "+",
-            .plus_equal => "+=",
-            .minus => "-",
-            .minus_equal => "-=",
-            .star_star => "**",
-            .colon => ":",
-            .slash => "/",
-            .slash_equal => "/=",
-            .comma => ",",
-            .ampersand => "&",
-            .ampersand_equal => "&=",
-            .question_mark => "?",
-            .angle_bracket_left => "<",
-            .angle_bracket_left_equal => "<=",
-            .angle_bracket_right => ">",
-            .angle_bracket_right_equal => ">=",
-            .tilde => "~",
-            .keyword_and => "and",
-            .keyword_else => "else",
-            .keyword_error => "error",
-            .keyword_fn => "fn",
-            .keyword_for => "for",
-            .keyword_if => "if",
-            .keyword_or => "or",
-            .keyword_while => "while",
-        };
-    }
-
-    pub fn symbol(tag: Tag) []const u8 {
-        return tag.lexeme() orelse switch (tag) {
-            .invalid => "invalid token",
-            .identifier => "an identifier",
-            .string_literal, .multiline_string_literal_line => "a string literal",
-            .char_literal => "a character literal",
-            .eof => "EOF",
-            .builtin => "a builtin function",
-            .number_literal => "a number literal",
-            .doc_comment, .container_doc_comment => "a document comment",
-            else => unreachable,
-        };
-    }
 };
 
 pub const Scanner = struct {

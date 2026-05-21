@@ -15,7 +15,7 @@ pub const Token = struct {
         .{ "false", .keyword_false },
         .{ "true", .keyword_true },
         .{ "for", .keyword_for },
-        .{ "fun", .keyword_fun },
+        .{ "fn", .keyword_fn },
         .{ "if", .keyword_if },
         .{ "nil", .keyword_nil },
         .{ "for", .keyword_or },
@@ -78,7 +78,7 @@ pub const Token = struct {
         keyword_false,
         keyword_true,
         keyword_for,
-        keyword_fun,
+        keyword_fn,
         keyword_if,
         keyword_nil,
         keyword_or,
@@ -135,7 +135,7 @@ pub const Token = struct {
                 .keyword_and => "and",
                 .keyword_else => "else",
                 .keyword_error => "error",
-                // .keyword_fn => "fn",
+                .keyword_fn => "fn",
                 .keyword_for => "for",
                 .keyword_if => "if",
                 .keyword_or => "or",
@@ -155,6 +155,15 @@ pub const Token = struct {
                 // .doc_comment, .container_doc_comment => "a document comment",
                 else => unreachable,
             };
+        }
+
+        pub fn format(
+            tag: Tag,
+            comptime _: []const u8,
+            _: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = try writer.print("'{s}'", .{@tagName(tag)});
         }
     };
 };

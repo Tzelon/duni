@@ -24,7 +24,10 @@ fn traverseTree(self: *AstGen, node: Ast.Node.Index) Allocator.Error!void {
 
     switch (tree_tags[node]) {
         .root => {
-            try self.traverseTree(tree_data[node].lhs);
+            const container_decl = self.tree.containerDeclRoot();
+            for (container_decl.ast.members) |member_node| {
+                try self.traverseTree(member_node);
+            }
         },
         .global_exp => {
             try self.traverseTree(tree_data[node].lhs);
@@ -37,6 +40,11 @@ fn traverseTree(self: *AstGen, node: Ast.Node.Index) Allocator.Error!void {
         .number_literal => {
             std.debug.print("number_literal {any} \n", .{main_token[node]});
         },
-        else => unreachable,
+        .fn_proto => {
+            std.debug.print("fn_proto {any} \n", .{main_token[node]});
+        },
+        else => {
+            std.debug.panic("unhandled Node {any}", .{tree_tags[node]});
+        },
     }
 }

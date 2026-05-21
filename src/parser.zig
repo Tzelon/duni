@@ -2,31 +2,44 @@ const std = @import("std");
 const Token = @import("./scanner.zig").Token;
 const Ast = @import("./ast.zig");
 
+const log = std.log.scoped(.parser);
+
 const Allocator = std.mem.Allocator;
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
+const ExtraIndex = Ast.ExtraIndex;
+const assert = std.debug.assert;
 
 pub const Error = error{ParseError} || Allocator.Error;
 
-const null_node: Node.Index = 0;
-
 pub const Parser = struct {
+    gpa: Allocator,
+    /// source text
     source: [:0]const u8,
+    /// list of AST nodes
     nodes: std.MultiArrayList(Node),
+    /// list of recoverable errors
     errors: std.ArrayListUnmanaged(Ast.Error),
     token_tags: []const Token.Tag,
     token_starts: []const Ast.ByteOffset,
-    gpa: Allocator,
+    /// current token index
     token_index: TokenIndex,
+    /// extra data refereced by AST node. exmaple: function params
+    extra_data: std.ArrayListUnmanaged(u32),
+    /// temp array of nodes
+    scratch: std.ArrayListUnmanaged(Node.Index),
 
     pub fn deinit(self: *Parser) void {
         self.errors.deinit(self.gpa);
         self.nodes.deinit(self.gpa);
-        // self.extra_data.deinit(self.gpa);
-        // self.scratch.deinit(self.gpa);
+        self.extra_data.deinit(self.gpa);
+        self.scratch.deinit(self.gpa);
     }
 
     pub fn parse(self: *Parser) !void {
+
+        // TODO: parse function body
+
         // Root node must be index 0.
         self.nodes.appendAssumeCapacity(.{
             .tag = .root,
@@ -34,22 +47,242 @@ pub const Parser = struct {
             .data = undefined,
         });
 
-        //  parse declarations
-        //  attach them to the root
+        const root_members = try self.parseContainerMembers();
+        const root_decls = try root_members.toSpan(self);
 
-        const root_members = try self.globalexpr();
         if (self.token_tags[self.token_index] != .eof) {
             try self.warnExpected(.eof);
         }
 
-        self.nodes.items(.data)[0] = .{
-            .lhs = root_members,
-            .rhs = undefined,
+        self.nodes.items(.data)[0] = .{ .extra_range = root_decls };
+    }
+
+    fn parseContainerMembers(self: *Parser) Allocator.Error!Members {
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+        while (true) {
+            switch (self.current()) {
+                .keyword_fn => {
+                    const maybe_top_level_decl = try self.expectTopLevelDeclRecoverable();
+                    if (maybe_top_level_decl) |top_level_decl| {
+                        log.info("current {any} \n", .{top_level_decl});
+                        try self.scratch.append(self.gpa, top_level_decl);
+                    }
+                },
+                .eof => {
+                    break;
+                },
+                else => {
+                    try self.warn(.expected_return_type);
+                    _ = self.advance();
+                    continue;
+                },
+            }
+        }
+
+        const items = self.scratch.items[scratch_top..];
+        log.info("current {any} \n", .{items});
+
+        if (items.len <= 2) {
+            return Members{
+                .len = items.len,
+                .data = .{ .opt_node_and_opt_node = .{
+                    if (items.len >= 1) items[0].toOptional() else .none,
+                    if (items.len >= 2) items[1].toOptional() else .none,
+                } },
+
+                // TODO: remove trailing
+                .trailing = false,
+            };
+        } else {
+            return Members{
+                .len = items.len,
+                .data = .{ .extra_range = try self.listToSpan(items) },
+                .trailing = false,
+            };
+        }
+    }
+
+    fn expectTopLevelDeclRecoverable(self: *Parser) error{OutOfMemory}!?Node.Index {
+        return self.expectTopLevelDecl() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => {
+                log.info("ParseError on top_level_decl \n", .{});
+                // self.findNextContainerMember();
+                return null;
+            },
         };
     }
 
-    fn globalexpr(self: *Parser) !Node.Index {
-        return self.addNode(.{ .tag = .global_exp, .main_token = 0, .data = .{ .lhs = try self.expression(), .rhs = undefined } });
+    fn expectTopLevelDecl(self: *Parser) !?Node.Index {
+        switch (self.current()) {
+            .keyword_fn => {
+                return self.funDecl();
+            },
+            else => {
+                log.info("parse error", .{});
+                return error.ParseError;
+                // return self.parsePrecedence(.prec_assignment);
+            },
+        }
+    }
+    /// FnProto <- KEYWORD_fn IDENTIFIER? LPAREN ParamDeclList RPAREN ByteAlign? AddrSpace? LinkSection? CallConv? EXCLAMATIONMARK? TypeExpr
+    fn funDecl(self: *Parser) !?Node.Index {
+        const fn_token = try self.consume(.keyword_fn);
+        // We want the fn proto node to be before its children in the array.
+        const fn_proto_index = try self.reserveNode(.fn_proto);
+        errdefer self.unreserveNode(fn_proto_index);
+
+        _ = try self.consume(.identifier);
+
+        log.info("identifier consumed \n", .{});
+        const params = try self.parseParamDeclList();
+        log.info("params consumed {any} \n", .{params});
+        const return_type_expr = try self.parseTypeExpr();
+        if (return_type_expr == null) {
+            // most likely the user forgot to specify the return type.
+            // Mark return type as invalid and try to continue.
+            try self.warn(.expected_return_type);
+        }
+
+        log.info("return type consumed {any} \n", .{return_type_expr});
+
+        const fn_proto = switch (params) {
+            //TODO: optimize 1 or less params see other comment
+            .zero_or_one => {
+                unreachable;
+            },
+            .multi => |span| self.setNode(fn_proto_index, .{
+                .tag = .fn_proto,
+                .main_token = fn_token,
+                .data = .{ .extra_and_opt_node = .{
+                    try self.addExtra(Node.SubRange{
+                        .start = span.start,
+                        .end = span.end,
+                    }),
+                    .fromOptional(return_type_expr),
+                } },
+            }),
+        };
+
+        log.info("fn_proto created {any} \n", .{fn_proto});
+        log.info("current token {any} \n", .{self.current()});
+
+        switch (self.current()) {
+            .l_brace => {
+                _ = self.advance();
+                return fn_proto;
+            },
+            else => {
+                // Since parseBlock only return error.ParseError on
+                // a missing '}' we can assume this function was
+                // supposed to end here.
+                try self.warn(.expected_semi_or_lbrace);
+                return null;
+            },
+        }
+    }
+
+    /// Block <- LBRACE BlockStatement* RBRACE
+    fn parseBlock(self: *Parser) !?Node.Index {
+        const lbrace = self.consume(.l_brace) orelse return null;
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+        while (true) {
+            if (self.current() == .r_brace) break;
+            log.info("body???");
+        }
+
+        _ = try self.failExpected(.r_brace);
+
+        return try self.addNode(.{
+            .tag = .block,
+            .main_token = lbrace,
+            .data = .{ .extra_range = try self.listToSpan(&.{}) },
+        });
+    }
+
+    /// params list are stored in the extra_data list
+    /// ParamDeclList <- (ParamDecl COMMA)* ParamDecl?
+    /// ParamDecl <- (IDENTIFIER COLON)? ParamType
+    fn parseParamDeclList(self: *Parser) !SmallSpan {
+        _ = try self.consume(.l_paren);
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+        while (true) {
+            if (self.check(.r_paren)) {
+                break;
+            }
+
+            //parse param declaration
+            // TODO: move to expectParamDecl
+            _ = try self.consume(.identifier);
+            _ = try self.consume(.colon);
+
+            const maybe_param = try self.expectTypeExpr();
+            if (maybe_param) |param| {
+                try self.scratch.append(self.gpa, param);
+            }
+            // end
+
+            switch (self.current()) {
+                .comma => self.token_index += 1,
+                .r_paren => {
+                    self.token_index += 1;
+                    break;
+                },
+                .r_brace => return self.failExpected(.r_paren),
+                // Likely just a missing comma; give error but continue parsing.
+                else => try self.warn(.expected_comma_after_param),
+            }
+        }
+
+        const params = self.scratch.items[scratch_top..];
+
+        //TODO: optimize for 1 or less params https://github.com/ziglang/zig/blob/92ae5818d26925af7816fabcaec85236133b9e46/lib/std/zig/Parse.zig#L3840
+        return SmallSpan{ .multi = try self.listToSpan(params) };
+    }
+
+    fn expectTypeExpr(self: *Parser) Error!?Node.Index {
+        const node = try self.parseTypeExpr();
+        if (node == null) {
+            return self.fail(.expected_type_expr);
+        }
+        return node;
+    }
+
+    /// PrimaryTypeExpr
+    ///     <- CHAR_LITERAL
+    ///      / FLOAT
+    ///      / IDENTIFIER
+    ///      / INTEGER
+    ///      / STRINGLITERAL
+    fn parseTypeExpr(self: *Parser) Error!?Node.Index {
+        switch (self.current()) {
+            //TODO: parse optional type
+            // .question_mark => return self.addNode(.{
+            //     .tag = .optional_type,
+            //     .main_token = self.advance(),
+            //     .data = .{
+            //         .lhs = try self.expectTypeExpr(),
+            //         .rhs = undefined,
+            //     },
+            // }),
+
+            //TODO: should I parse a pattern?
+            .identifier => {
+                const main_token = self.advance();
+                return try self.addNode(.{
+                    .tag = .identifier,
+                    .main_token = main_token,
+                    .data = undefined,
+                });
+            },
+            else => return null,
+        }
     }
 
     pub fn expression(self: *Parser) !Node.Index {
@@ -63,7 +296,7 @@ pub const Parser = struct {
                 .token = self.token_index,
             });
 
-            // return null_node;
+            // return null;
         };
 
         var node = try prefixRule(self);
@@ -104,20 +337,22 @@ pub const Parser = struct {
         return self.addNode(.{
             .tag = tag,
             .main_token = main_tk,
-            .data = .{
-                .lhs = lhs,
-                .rhs = rhs,
-            },
+            .data = .{ .node_and_node = .{ lhs, rhs } },
         });
     }
 
+    /// PrefixExpr <- PrefixOp* PrimaryExpr
+    ///
+    /// PrefixOp
+    ///     <- EXCLAMATIONMARK
+    ///      / MINUS
     fn unary(self: *Parser) !Node.Index {
         const tag: Node.Tag = switch (self.token_tags[self.token_index]) {
             .bang => .bool_not,
             .minus => .negation,
             else => unreachable,
         };
-        return self.addNode(.{ .tag = tag, .main_token = self.advance(), .data = .{ .lhs = try self.parsePrecedence(.prec_unary), .rhs = undefined } });
+        return self.addNode(.{ .tag = tag, .main_token = self.advance(), .data = .{ .node = try self.parsePrecedence(.prec_unary) } });
     }
 
     /// example: `(` expression `)`
@@ -125,10 +360,7 @@ pub const Parser = struct {
         return self.addNode(.{
             .tag = .grouped_expression,
             .main_token = self.advance(),
-            .data = .{
-                .lhs = try self.expression(),
-                .rhs = try self.consume(.r_paren),
-            },
+            .data = .{ .node_and_node = .{ try self.expression(), try self.consume(.r_paren) } },
         });
     }
 
@@ -137,16 +369,76 @@ pub const Parser = struct {
         return self.addNode(.{
             .tag = .number_literal,
             .main_token = self.advance(),
-            .data = .{
-                .lhs = undefined,
-                .rhs = undefined,
-            },
+            .data = undefined,
+        });
+    }
+
+    fn string(self: *Parser) !Node.Index {
+        return self.addNode(.{
+            .tag = .string_literal,
+            .main_token = self.advance(),
+            .data = undefined,
         });
     }
 
     fn addNode(self: *Parser, elem: Ast.Node) Allocator.Error!Node.Index {
-        const result = @as(Node.Index, @intCast(self.nodes.len));
+        const result: Node.Index = @enumFromInt(self.nodes.len);
         try self.nodes.append(self.gpa, elem);
+        return result;
+    }
+
+    fn setNode(self: *Parser, i: usize, elem: Ast.Node) Node.Index {
+        self.nodes.set(i, elem);
+        return @enumFromInt(i);
+    }
+
+    /// save a spot in the nodes list
+    fn reserveNode(self: *Parser, tag: Ast.Node.Tag) !usize {
+        try self.nodes.resize(self.gpa, self.nodes.len + 1);
+        self.nodes.items(.tag)[self.nodes.len - 1] = tag;
+        return self.nodes.len - 1;
+    }
+
+    /// remove the spot from the nodes list
+    fn unreserveNode(self: *Parser, node_index: usize) void {
+        if (self.nodes.len == node_index) {
+            self.nodes.resize(self.gpa, self.nodes.len - 1) catch unreachable;
+        } else {
+            // There is zombie node left in the tree, let's make it as inoffensive as possible
+            // (sadly there's no no-op node)
+            self.nodes.items(.tag)[node_index] = .unreachable_literal;
+            self.nodes.items(.main_token)[node_index] = self.token_index;
+        }
+    }
+
+    /// take a list of Node.Index an return SubRange to extra_data
+    fn listToSpan(self: *Parser, list: []const Node.Index) Allocator.Error!Node.SubRange {
+        try self.extra_data.appendSlice(self.gpa, @ptrCast(list));
+
+        return .{
+            .start = @enumFromInt(self.extra_data.items.len - list.len),
+            .end = @enumFromInt(self.extra_data.items.len),
+        };
+    }
+
+    /// append extra data to the extra_data list, can be any struct
+    fn addExtra(self: *Parser, extra: anytype) Allocator.Error!ExtraIndex {
+        const fields = std.meta.fields(@TypeOf(extra));
+        try self.extra_data.ensureUnusedCapacity(self.gpa, fields.len);
+        const result: ExtraIndex = @enumFromInt(self.extra_data.items.len);
+        inline for (fields) |field| {
+            const data: u32 = switch (field.type) {
+                Node.Index,
+                Node.OptionalIndex,
+                // OptionalTokenIndex,
+                ExtraIndex,
+                => @intFromEnum(@field(extra, field.name)),
+                TokenIndex,
+                => @field(extra, field.name),
+                else => @compileError("unexpected field type"),
+            };
+            self.extra_data.appendAssumeCapacity(data);
+        }
         return result;
     }
 
@@ -157,15 +449,19 @@ pub const Parser = struct {
         return result;
     }
 
-    /// consume a token only if the current token matches the type
+    /// return true if the current token has the given tag
+    fn check(self: *Parser, expected_tag: Token.Tag) bool {
+        return self.token_tags[self.token_index] == expected_tag;
+    }
+
+    /// consume the current token only if the current token matches the type
     pub fn consume(self: *Parser, expected_tag: Token.Tag) !TokenIndex {
-        if (self.token_tags[self.token_index] != expected_tag) {
-            return self.failMsg(.{
-                .tag = .expected_token,
-                .token = self.token_index,
-                .extra = .{ .expected_tag = expected_tag },
-            });
+        if (!self.check(expected_tag)) {
+            log.info("failed to consume {}\n", .{expected_tag});
+            return self.failExpected(expected_tag);
         }
+
+        log.info("success to consume {}\n", .{expected_tag});
 
         return self.advance();
     }
@@ -193,7 +489,7 @@ pub const Parser = struct {
             .angle_bracket_right => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
             .angle_bracket_right_equal => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
             // .identifier => comptime ParseRule.init(Parser.variable, null, .prec_none),
-            // .string_literal => comptime ParseRule.init(Parser.string, null, .prec_none),
+            .string_literal => comptime ParseRule.init(Parser.string, null, .prec_none),
             .number_literal => comptime ParseRule.init(Parser.number, null, .prec_none),
             // .keyword_and => comptime ParseRule.init(null, Parser.@"and", .prec_and),
             // TokenType.TOKEN_CLASS => comptime ParseRule.init(null, null, .PREC_NONE),
@@ -201,7 +497,7 @@ pub const Parser = struct {
             // .keyword_false => comptime ParseRule.init(Parser.literal, null, .prec_none),
             // .keyword_true => comptime ParseRule.init(Parser.literal, null, .prec_none),
             .keyword_for => comptime ParseRule.init(null, null, .prec_none),
-            .keyword_fun => comptime ParseRule.init(null, null, .prec_none),
+            .keyword_fn => comptime ParseRule.init(null, null, .prec_none),
             .keyword_if => comptime ParseRule.init(null, null, .prec_none),
             // .keyword_nil => comptime ParseRule.init(Parser.literal, null, .prec_none),
             // .keyword_or => comptime ParseRule.init(null, Parser.@"or", .prec_or),
@@ -221,6 +517,33 @@ pub const Parser = struct {
         return rule;
     }
 
+    /// fail functions return parse error
+    fn fail(self: *Parser, tag: Ast.Error.Tag) error{ ParseError, OutOfMemory } {
+        @branchHint(.cold);
+        return self.failMsg(.{ .tag = tag, .token = self.token_index });
+    }
+
+    fn failExpected(self: *Parser, expected_token: Token.Tag) error{ ParseError, OutOfMemory } {
+        @branchHint(.cold);
+        return self.failMsg(.{
+            .tag = .expected_token,
+            .token = self.token_index,
+            .extra = .{ .expected_tag = expected_token },
+        });
+    }
+
+    fn failMsg(self: *Parser, msg: Ast.Error) error{ ParseError, OutOfMemory } {
+        @branchHint(.cold);
+        try self.warnMsg(msg);
+        return error.ParseError;
+    }
+
+    /// warn functions adds an error to the errors list
+    fn warn(self: *Parser, error_tag: Ast.Error.Tag) error{OutOfMemory}!void {
+        @branchHint(.cold);
+        try self.warnMsg(.{ .tag = error_tag, .token = self.token_index });
+    }
+
     fn warnExpected(self: *Parser, expected_token: Token.Tag) error{OutOfMemory}!void {
         @branchHint(.cold);
         try self.warnMsg(.{
@@ -230,23 +553,16 @@ pub const Parser = struct {
         });
     }
 
-    fn warn(self: *Parser, error_tag: Error.Tag) error{OutOfMemory}!void {
-        @branchHint(.cold);
-        try self.warnMsg(.{ .tag = error_tag, .token = self.token_index });
-    }
-
-    fn failMsg(self: *Parser, msg: Ast.Error) error{ ParseError, OutOfMemory } {
-        @branchHint(.cold);
-        try self.warnMsg(msg);
-        return error.ParseError;
-    }
-
     fn warnMsg(self: *Parser, msg: Ast.Error) !void {
         @branchHint(.cold);
         switch (msg.tag) {
             .expected_comma_after_arg,
+            .expected_return_type,
             .expected_token,
             .expected_expression,
+            .expected_type_expr,
+            .expected_semi_or_lbrace,
+            .expected_comma_after_param,
             => if (msg.token != 0 and !self.tokensOnSameLine(msg.token - 1, msg.token)) {
                 var copy = msg;
                 copy.token_is_prev = true;
@@ -264,6 +580,7 @@ pub const Parser = struct {
         return std.mem.indexOfScalar(u8, self.source[self.token_starts[token1]..self.token_starts[token2]], '\n') == null;
     }
 
+    /// return the current token in the sequence. without **advancing**
     fn current(self: *Parser) Token.Tag {
         return self.token_tags[self.token_index];
     }
@@ -370,6 +687,35 @@ pub const Location = struct {
     line_start: usize,
     line_end: usize,
 };
+
+const SmallSpan = union(enum) {
+    zero_or_one: Node.Index,
+    multi: Node.SubRange,
+};
+
+const Members = struct {
+    len: usize,
+    /// Must be either `.opt_node_and_opt_node` if `len <= 2` or `.extra_range` otherwise.
+    data: Node.Data,
+    trailing: bool,
+
+    fn toSpan(self: Members, parser: *Parser) !Node.SubRange {
+        return switch (self.len) {
+            0 => parser.listToSpan(&.{}),
+            1 => parser.listToSpan(&.{self.data.opt_node_and_opt_node[0].unwrap().?}),
+            2 => parser.listToSpan(&.{ self.data.opt_node_and_opt_node[0].unwrap().?, self.data.opt_node_and_opt_node[1].unwrap().? }),
+            else => self.data.extra_range,
+        };
+    }
+};
+
+fn listToSpan(self: *Parser, list: []const Node.Index) !Node.SubRange {
+    try self.extra_data.appendSlice(self.gpa, list);
+    return Node.SubRange{
+        .start = @as(Node.Index, @intCast(self.extra_data.items.len - list.len)),
+        .end = @as(Node.Index, @intCast(self.extra_data.items.len)),
+    };
+}
 
 test {
     _ = @import("./parser_test.zig");

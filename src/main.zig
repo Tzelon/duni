@@ -1,59 +1,62 @@
 const std = @import("std");
-const AstGen = @import("./AstGen.zig");
-const Ast = @import("./ast.zig");
-const io = std.io;
+// const AstGen = @import("AstGen.zig");
+const Ast = @import("ast.zig");
+const Io = std.Io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
 
-const errout = std.io.getStdErr().writer();
-const stdout = std.io.getStdOut().writer();
-const stdin = std.io.getStdIn().reader();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    const args = try process.argsAlloc(allocator);
-    defer {
-        process.argsFree(allocator, args);
-    }
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len == 1) {
-        try repl(allocator);
+        try repl(io, gpa);
     } else if (args.len == 2) {
-        try runFile(allocator, args[1]);
+        try runFile(io, gpa, args[1]);
     } else {
-        std.debug.print("Usage: zlox [path]\n", .{});
+        std.debug.print("Usage: duni [path]\n", .{});
         process.exit(64);
     }
 }
 
-fn repl(_: Allocator) !void {
-    var buf = std.io.bufferedReader(stdin);
-    var reader = buf.reader();
+fn repl(io: std.Io, _: Allocator) !void {
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    const reader = &stdin_reader.interface;
 
-    var line_buff: [1024]u8 = undefined;
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
     while (true) {
         stdout.print("> ", .{}) catch std.debug.panic("cannot write to stdout", .{});
-        const line = reader.readUntilDelimiterOrEof(&line_buff, '\n') catch {
-            std.debug.panic("cannot read from stdin in repl", .{});
-            break;
-        } orelse {
-            stdout.writeAll("\n") catch std.debug.panic("cannot write to stdout", .{});
-            break;
-        };
-        std.debug.print("{s}", .{line});
-        // _ = try interpret(line);
+
+        while (reader.takeDelimiterExclusive('\n')) |line| {
+            std.debug.print("{s}", .{line});
+            // _ = try interpret(line);
+        } else |err| switch (err) {
+            error.EndOfStream, // stream ended not on a line break
+            error.StreamTooLong, // line could not fit in buffer
+            error.ReadFailed, // caller can check reader implementation for diagnostics
+            => |e| return e,
+        }
     }
 }
 
-fn runFile(allocator: Allocator, path: []const u8) !void {
-    const source = try std.fs.cwd().readFileAllocOptions(allocator, path, std.math.maxInt(u32), null, @alignOf(u8), 0);
+fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
+    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, std.Io.Limit.unlimited, std.mem.Alignment.of(u8), 0);
     defer allocator.free(source);
 
     std.debug.print("source \n {s} :source \n", .{source});
-    const tree = try Ast.parse(allocator, source);
-    try AstGen.generate(allocator, tree);
+    var tree = try Ast.parse(allocator, source);
+    defer tree.deinit(allocator);
+    // try AstGen.generate(allocator, tree);
+
+    for (tree.errors) |err| {
+        std.debug.print("Error: {any}", .{err.tag});
+    }
 }
 
 test "simple test" {}

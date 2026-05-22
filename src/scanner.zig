@@ -174,7 +174,9 @@ pub const Scanner = struct {
     buffer: [:0]const u8,
     index: usize,
     line: usize,
-    prev_tag: Token.Tag = .invalid,
+    /// Whether the previous significant token can end an expression — drives
+    /// automatic newline insertion (see `endExpression`).
+    insert_newline: bool = false,
 
     /// For debugging purposes.
     pub fn dump(self: *Scanner, token: *const Token) void {
@@ -246,11 +248,11 @@ pub const Scanner = struct {
                     continue :state .start;
                 },
                 '\n' => {
-                    if (endExpression(self.prev_tag)) {
+                    if (self.insert_newline) {
                         self.index += 1;
                         result.tag = .newline;
                         result.loc.end = self.index;
-                        self.prev_tag = .newline;
+                        self.insert_newline = false;
                         return result;
                     }
                     self.index += 1;
@@ -670,19 +672,21 @@ pub const Scanner = struct {
         }
 
         result.loc.end = self.index;
-        self.prev_tag = result.tag;
+        self.insert_newline = endExpression(result.tag);
         return result;
     }
 };
 
-// Continuation rule.
-// A line ending in 2 or ) gets terminated; a line ending in +, =, ,, or ( does not — so multi-line expressions works as long as we break after an operator.
-//
-// example:
-// x = 2 +      // ends in '+'  → no terminator → continues
-//     3
-// x = 2        // ends in '2'  → terminator    → new statement
-// + 3
+/// Returns whether `tag` can be the final token of an expression, driving
+/// automatic newline insertion (ASI). A line ending in a value-producing
+/// token (`2`, `)`, ...) is terminated; a line ending in an operator or
+/// opening delimiter (`+`, `=`, `,`, `(`, ...) continues — so multi-line
+/// expressions work as long as the break comes after an operator.
+///
+///     x = 2 +      // ends in '+'  → no terminator → continues
+///         3
+///     x = 2        // ends in '2'  → terminator    → new statement
+///     + 3
 fn endExpression(tag: Token.Tag) bool {
     return switch (tag) {
         .identifier,

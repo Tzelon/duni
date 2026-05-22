@@ -194,52 +194,53 @@ pub const Node = struct {
         root,
         /// Temp Tag
         global_exp,
-        /// `lhs + rhs`. main_token is the `+`.
-        add,
-        /// `lhs - rhs`. main_token is the `-`.
-        sub,
-        /// `lhs * rhs`. main_token is the `*`.
+        /// `lhs * rhs`. The `main_token` field is the `*` token.
         mul,
-        /// `lhs / rhs`. main_token is the `/`.
+        /// `lhs / rhs`. The `main_token` field is the `/` token.
         div,
-        /// `lhs == rhs`. main_token is op.
+        /// `lhs % rhs`. The `main_token` field is the `%` token.
+        mod,
+        /// `lhs + rhs`. The `main_token` field is the `+` token.
+        add,
+        /// `lhs - rhs`. The `main_token` field is the `-` token.
+        sub,
+        /// `lhs == rhs`. The `main_token` field is the `==` token.
         equal_equal,
-        /// `lhs != rhs`. main_token is op.
+        /// `lhs != rhs`. The `main_token` field is the `!=` token.
         bang_equal,
-        /// `lhs < rhs`. main_token is op.
+        /// `lhs < rhs`. The `main_token` field is the `<` token.
         less_than,
-        /// `lhs > rhs`. main_token is op.
+        /// `lhs > rhs`. The `main_token` field is the `>` token.
         greater_than,
-        /// `lhs <= rhs`. main_token is op.
+        /// `lhs <= rhs`. The `main_token` field is the `<=` token.
         less_or_equal,
-        /// `lhs >= rhs`. main_token is op.
+        /// `lhs >= rhs`. The `main_token` field is the `>=` token.
         greater_or_equal,
-        /// `lhs *= rhs`. main_token is op.
-        assign_mul,
-        /// `lhs /= rhs`. main_token is op.
-        assign_div,
-        /// `lhs %= rhs`. main_token is op.
-        assign_mod,
-        /// `lhs += rhs`. main_token is op.
-        assign_add,
-        /// `lhs -= rhs`. main_token is op.
-        assign_sub,
-        /// `op lhs`. rhs unused. main_token is op.
+        /// `lhs = rhs`. The `main_token` field is the `=` token.
+        bind,
+        /// `!expr`. The `main_token` field is the `!` token.
         bool_not,
-        /// `op lhs`. rhs unused. main_token is op.
+        /// `-expr`. The `main_token` field is the `-` token.
         negation,
-        /// `(lhs)`. main_token is the `(`; rhs is the token index of the `)`.
+        /// `(expr)`.
+        ///
+        /// The `data` field is a `.node_and_token`:
+        ///   1. a `Node.Index` to the sub-expression
+        ///   2. a `TokenIndex` to the `)` token.
+        ///
+        /// The `main_token` field is the `(` token.
         grouped_expression,
-        /// Both lhs and rhs unused.
+        /// The `data` field is unused.
         number_literal,
-        /// Both lhs and rhs unused.
+        /// The `data` field is unused.
         string_literal,
-        /// Both lhs and rhs unused.
+        /// The `data` field is unused.
         unreachable_literal,
-        /// Both lhs and rhs unused.
-        /// Most identifiers will not have explicit AST nodes, however for expressions
-        /// which could be one of many different kinds of AST nodes, there will be an
-        /// identifier AST node for it.
+        /// The `data` field is unused.
+        ///
+        /// Most identifiers will not have explicit AST nodes, however for
+        /// expressions which could be one of many different kinds of AST nodes,
+        /// there will be an identifier AST node for it.
         identifier,
         /// `fn (a: b, c: d) return_type`.
         ///
@@ -276,6 +277,7 @@ pub const Node = struct {
         node_and_node: struct { Index, Index },
         node_and_token: struct { Index, TokenIndex },
         opt_node_and_opt_node: struct { OptionalIndex, OptionalIndex },
+        opt_node_and_node: struct { OptionalIndex, Index },
         extra_and_opt_node: struct { ExtraIndex, OptionalIndex },
         extra_range: SubRange,
     };

@@ -391,6 +391,24 @@ pub const Parser = struct {
         });
     }
 
+    fn variable(self: *Parser) !Node.Index {
+        _ = self.advance();
+        const equal_token = try self.consume(.equal);
+        const initializer = try self.expression();
+
+        return self.addNode(.{
+            .tag = .bind,
+            .main_token = equal_token,
+            .data = .{
+                .opt_node_and_node = .{
+                    // Empty space type expression, if we ever need it.
+                    Node.OptionalIndex.none,
+                    initializer,
+                },
+            },
+        });
+    }
+
     // node helpers
 
     fn nodeMainToken(self: *const Parser, node: Node.Index) TokenIndex {
@@ -480,7 +498,7 @@ pub const Parser = struct {
             .angle_bracket_left_equal => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
             .angle_bracket_right => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
             .angle_bracket_right_equal => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
-            // .identifier => comptime ParseRule.init(Parser.variable, null, .prec_none),
+            .identifier => comptime ParseRule.init(Parser.variable, null, .prec_none),
             .string_literal => comptime ParseRule.init(Parser.string, null, .prec_none),
             .number_literal => comptime ParseRule.init(Parser.number, null, .prec_none),
             // .keyword_and => comptime ParseRule.init(null, Parser.@"and", .prec_and),
@@ -502,6 +520,7 @@ pub const Parser = struct {
             .keyword_error => comptime ParseRule.init(null, null, .prec_none),
             .eof => comptime ParseRule.init(null, null, .prec_none),
             else => {
+                log.err("no rule for token {}", .{tag});
                 unreachable;
             },
         };

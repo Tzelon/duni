@@ -63,7 +63,7 @@ fn visit(self: *AstPrinter, node: Node.Index) void {
             if (ret.unwrap()) |ret_node| self.visit(ret_node);
         },
         // node_and_node: lhs + rhs.
-        .add, .sub, .mul, .div, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_mul, .assign_div, .assign_mod, .assign_add, .assign_sub => {
+        .add, .sub, .mul, .div, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bind, .mod => {
             const lhs, const rhs = datas[i].node_and_node;
             self.visit(lhs);
             self.visit(rhs);

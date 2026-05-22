@@ -1,6 +1,7 @@
 const std = @import("std");
 // const AstGen = @import("AstGen.zig");
 const Ast = @import("ast.zig");
+const AstPrinter = @import("ast_printer.zig");
 const Io = std.Io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
@@ -53,6 +54,9 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     var tree = try Ast.parse(allocator, source);
     defer tree.deinit(allocator);
     // try AstGen.generate(allocator, tree);
+
+    std.debug.print("AST:\n", .{});
+    AstPrinter.print(&tree);
 
     for (tree.errors) |err| {
         std.debug.print("Error: {any}", .{err.tag});

@@ -118,34 +118,34 @@ pub const Parser = struct {
     fn expectTopLevelDecl(self: *Parser) !?Node.Index {
         switch (self.current()) {
             .keyword_fn => {
-                return self.funDecl();
+                return self.function();
             },
             else => {
-                log.info("parse error", .{});
+                try self.warn(.expected_fn);
                 return error.ParseError;
-                // return self.parsePrecedence(.prec_assignment);
             },
         }
     }
-    /// FnProto <- KEYWORD_fn IDENTIFIER? LPAREN ParamDeclList RPAREN ByteAlign? AddrSpace? LinkSection? CallConv? EXCLAMATIONMARK? TypeExpr
-    fn funDecl(self: *Parser) !?Node.Index {
+
+    /// FnProto <- KEYWORD_fn IDENTIFIER? LPAREN ParamDeclList RPAREN TypeExpr
+    fn function(self: *Parser) !?Node.Index {
         const fn_token = try self.consume(.keyword_fn);
         // We want the fn proto node to be before its children in the array.
         const fn_proto_index = try self.reserveNode(.fn_proto);
         errdefer self.unreserveNode(fn_proto_index);
 
         _ = try self.consume(.identifier);
-
         log.info("identifier consumed \n", .{});
-        const params = try self.parseParamDeclList();
+
+        const params = try self.functionParams();
         log.info("params consumed {any} \n", .{params});
+
         const return_type_expr = try self.parseTypeExpr();
         if (return_type_expr == null) {
             // most likely the user forgot to specify the return type.
             // Mark return type as invalid and try to continue.
             try self.warn(.expected_return_type);
         }
-
         log.info("return type consumed {any} \n", .{return_type_expr});
 
         const fn_proto = switch (params) {
@@ -167,12 +167,22 @@ pub const Parser = struct {
         };
 
         log.info("fn_proto created {any} \n", .{fn_proto});
-        log.info("current token {any} \n", .{self.current()});
 
         switch (self.current()) {
             .l_brace => {
-                _ = self.advance();
-                return fn_proto;
+                const fn_decl_index = try self.reserveNode(.fn_decl);
+                errdefer self.unreserveNode(fn_decl_index);
+
+                // parse block
+                const body_block = try self.block();
+                return self.setNode(fn_decl_index, .{
+                    .tag = .fn_decl,
+                    .main_token = self.nodeMainToken(fn_proto),
+                    .data = .{ .node_and_node = .{
+                        fn_proto,
+                        body_block.?,
+                    } },
+                });
             },
             else => {
                 // Since parseBlock only return error.ParseError on
@@ -185,29 +195,32 @@ pub const Parser = struct {
     }
 
     /// Block <- LBRACE BlockStatement* RBRACE
-    fn parseBlock(self: *Parser) !?Node.Index {
-        const lbrace = self.consume(.l_brace) orelse return null;
+    fn block(self: *Parser) !?Node.Index {
+        const lbrace = self.consume(.l_brace) catch return null;
         const scratch_top = self.scratch.items.len;
         defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
+        // parse expressions
         while (true) {
-            if (self.current() == .r_brace) break;
-            log.info("body???");
+            if (self.check(.r_brace)) break;
+            const expr = try self.expression();
+            try self.scratch.append(self.gpa, expr);
         }
 
-        _ = try self.failExpected(.r_brace);
+        _ = try self.consume(.r_brace);
 
+        const expressions = self.scratch.items[scratch_top..];
         return try self.addNode(.{
             .tag = .block,
             .main_token = lbrace,
-            .data = .{ .extra_range = try self.listToSpan(&.{}) },
+            .data = .{ .extra_range = try self.listToSpan(expressions) },
         });
     }
 
     /// params list are stored in the extra_data list
     /// ParamDeclList <- (ParamDecl COMMA)* ParamDecl?
     /// ParamDecl <- (IDENTIFIER COLON)? ParamType
-    fn parseParamDeclList(self: *Parser) !SmallSpan {
+    fn functionParams(self: *Parser) !SmallSpan {
         _ = try self.consume(.l_paren);
         const scratch_top = self.scratch.items.len;
         defer self.scratch.shrinkRetainingCapacity(scratch_top);
@@ -218,9 +231,7 @@ pub const Parser = struct {
             }
 
             //parse param declaration
-            // TODO: move to expectParamDecl
             _ = try self.consume(.identifier);
-            _ = try self.consume(.colon);
 
             const maybe_param = try self.expectTypeExpr();
             if (maybe_param) |param| {
@@ -255,12 +266,14 @@ pub const Parser = struct {
     }
 
     /// PrimaryTypeExpr
-    ///     <- CHAR_LITERAL
-    ///      / FLOAT
-    ///      / IDENTIFIER
-    ///      / INTEGER
-    ///      / STRINGLITERAL
+    ///     <- COLON CHAR_LITERAL
+    ///      / COLON FLOAT
+    ///      / COLON IDENTIFIER
+    ///      / COLON INTEGER
+    ///      / COLON STRINGLITERAL
     fn parseTypeExpr(self: *Parser) Error!?Node.Index {
+        _ = try self.consume(.colon);
+
         switch (self.current()) {
             //TODO: parse optional type
             // .question_mark => return self.addNode(.{
@@ -285,7 +298,8 @@ pub const Parser = struct {
         }
     }
 
-    pub fn expression(self: *Parser) !Node.Index {
+    fn expression(self: *Parser) !Node.Index {
+        log.info("parse expression", .{});
         return try self.parsePrecedence(.prec_assignment);
     }
 
@@ -295,8 +309,6 @@ pub const Parser = struct {
                 .tag = .expected_expression,
                 .token = self.token_index,
             });
-
-            // return null;
         };
 
         var node = try prefixRule(self);
@@ -307,8 +319,6 @@ pub const Parser = struct {
                     .tag = .expected_expression,
                     .token = self.token_index,
                 });
-
-                // return node;
             };
 
             node = try infixRule(self, node);
@@ -360,7 +370,7 @@ pub const Parser = struct {
         return self.addNode(.{
             .tag = .grouped_expression,
             .main_token = self.advance(),
-            .data = .{ .node_and_node = .{ try self.expression(), try self.consume(.r_paren) } },
+            .data = .{ .node_and_token = .{ try self.expression(), try self.consume(.r_paren) } },
         });
     }
 
@@ -379,6 +389,12 @@ pub const Parser = struct {
             .main_token = self.advance(),
             .data = undefined,
         });
+    }
+
+    // node helpers
+
+    fn nodeMainToken(self: *const Parser, node: Node.Index) TokenIndex {
+        return self.nodes.items(.main_token)[@intFromEnum(node)];
     }
 
     fn addNode(self: *Parser, elem: Ast.Node) Allocator.Error!Node.Index {
@@ -440,30 +456,6 @@ pub const Parser = struct {
             self.extra_data.appendAssumeCapacity(data);
         }
         return result;
-    }
-
-    /// return the current token position and move to the next
-    fn advance(self: *Parser) TokenIndex {
-        const result = self.token_index;
-        self.token_index += 1;
-        return result;
-    }
-
-    /// return true if the current token has the given tag
-    fn check(self: *Parser, expected_tag: Token.Tag) bool {
-        return self.token_tags[self.token_index] == expected_tag;
-    }
-
-    /// consume the current token only if the current token matches the type
-    pub fn consume(self: *Parser, expected_tag: Token.Tag) !TokenIndex {
-        if (!self.check(expected_tag)) {
-            log.info("failed to consume {}\n", .{expected_tag});
-            return self.failExpected(expected_tag);
-        }
-
-        log.info("success to consume {}\n", .{expected_tag});
-
-        return self.advance();
     }
 
     fn getRule(self: *Parser, tag: Token.Tag) ParseRule {
@@ -563,6 +555,7 @@ pub const Parser = struct {
             .expected_type_expr,
             .expected_semi_or_lbrace,
             .expected_comma_after_param,
+            .expected_fn,
             => if (msg.token != 0 and !self.tokensOnSameLine(msg.token - 1, msg.token)) {
                 var copy = msg;
                 copy.token_is_prev = true;
@@ -585,8 +578,33 @@ pub const Parser = struct {
         return self.token_tags[self.token_index];
     }
 
+    /// return the previous token in the sequence. without **advancing**
     fn previous(self: *Parser) Token.Tag {
         return self.token_tags[self.token_index - 1];
+    }
+
+    /// return the current token position and move to the next
+    fn advance(self: *Parser) TokenIndex {
+        const result = self.token_index;
+        self.token_index += 1;
+        return result;
+    }
+
+    /// return true if the current token has the given tag
+    fn check(self: *Parser, expected_tag: Token.Tag) bool {
+        return self.token_tags[self.token_index] == expected_tag;
+    }
+
+    /// consume the current token only if the current token matches the type
+    fn consume(self: *Parser, expected_tag: Token.Tag) !TokenIndex {
+        if (!self.check(expected_tag)) {
+            log.info("failed to consume {}\n", .{expected_tag});
+            return self.failExpected(expected_tag);
+        }
+
+        log.info("success to consume {}\n", .{expected_tag});
+
+        return self.advance();
     }
 
     // Public Helpers
@@ -615,6 +633,7 @@ pub const Parser = struct {
             },
         }
     }
+
     pub fn tokenLocation(self: *Parser, start_offset: Ast.ByteOffset, token_index: TokenIndex) Location {
         var loc = Location{
             .line = 0,
@@ -654,8 +673,8 @@ pub const Parser = struct {
     }
 };
 
-const ParsePrefixFn = *const fn (parser: *Parser) anyerror!Node.Index;
-const ParseInfixFn = *const fn (parser: *Parser, lhs: Node.Index) anyerror!Node.Index;
+const ParsePrefixFn = *const fn (parser: *Parser) Error!Node.Index;
+const ParseInfixFn = *const fn (parser: *Parser, lhs: Node.Index) Error!Node.Index;
 
 const ParseRule = struct {
     prefix: ?ParsePrefixFn,

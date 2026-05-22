@@ -63,10 +63,16 @@ fn visit(self: *AstPrinter, node: Node.Index) void {
             if (ret.unwrap()) |ret_node| self.visit(ret_node);
         },
         // node_and_node: lhs + rhs.
-        .add, .sub, .mul, .div, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bind, .mod => {
+        .add, .sub, .mul, .div, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .mod => {
             const lhs, const rhs = datas[i].node_and_node;
             self.visit(lhs);
             self.visit(rhs);
+        },
+        // opt_node_and_node: optional assignment target + initializer.
+        .bind => {
+            const target, const initializer = datas[i].opt_node_and_node;
+            if (target.unwrap()) |target_node| self.visit(target_node);
+            self.visit(initializer);
         },
         // node_and_token: inner expression + the `)` token (not a node).
         .grouped_expression => {

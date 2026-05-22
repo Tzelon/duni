@@ -298,7 +298,7 @@ pub const Error = struct {
     token: TokenIndex,
     extra: union { none: void, expected_tag: Token.Tag } = .{ .none = {} },
 
-    pub const Tag = enum { expected_return_type, expected_comma_after_arg, expected_token, expected_expression, expected_semi_or_lbrace, expected_type_expr, expected_comma_after_param, expected_fn };
+    pub const Tag = enum { expected_return_type, expected_comma_after_arg, expected_token, expected_expression, expected_semi_or_lbrace, expected_type_expr, expected_comma_after_param, expected_fn, expected_newline };
 };
 
 /// Fully assembled AST node information.

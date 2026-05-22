@@ -28,6 +28,8 @@ pub const Token = struct {
     }
 
     pub const Tag = enum {
+        // expression terminator
+        newline,
 
         // Single-character tokens.
         l_bracket,
@@ -172,6 +174,7 @@ pub const Scanner = struct {
     buffer: [:0]const u8,
     index: usize,
     line: usize,
+    prev_tag: Token.Tag = .invalid,
 
     /// For debugging purposes.
     pub fn dump(self: *Scanner, token: *const Token) void {
@@ -237,7 +240,19 @@ pub const Scanner = struct {
                         continue :state .invalid;
                     }
                 },
-                ' ', '\n', '\t', '\r' => {
+                ' ', '\t', '\r' => {
+                    self.index += 1;
+                    result.loc.start = self.index;
+                    continue :state .start;
+                },
+                '\n' => {
+                    if (endExpression(self.prev_tag)) {
+                        self.index += 1;
+                        result.tag = .newline;
+                        result.loc.end = self.index;
+                        self.prev_tag = .newline;
+                        return result;
+                    }
                     self.index += 1;
                     result.loc.start = self.index;
                     continue :state .start;
@@ -655,6 +670,31 @@ pub const Scanner = struct {
         }
 
         result.loc.end = self.index;
+        self.prev_tag = result.tag;
         return result;
     }
 };
+
+// Continuation rule.
+// A line ending in 2 or ) gets terminated; a line ending in +, =, ,, or ( does not — so multi-line expressions works as long as we break after an operator.
+//
+// example:
+// x = 2 +      // ends in '+'  → no terminator → continues
+//     3
+// x = 2        // ends in '2'  → terminator    → new statement
+// + 3
+fn endExpression(tag: Token.Tag) bool {
+    return switch (tag) {
+        .identifier,
+        .number_literal,
+        .string_literal,
+        .keyword_true,
+        .keyword_false,
+        .keyword_nil,
+        .r_paren,
+        .r_bracket,
+        .r_brace,
+        => true,
+        else => false, // operators, `,` `:` `(` `{`, `fn` `if` ... → line continues
+    };
+}

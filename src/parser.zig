@@ -70,6 +70,9 @@ pub const Parser = struct {
                         try self.scratch.append(self.gpa, top_level_decl);
                     }
                 },
+                .newline => {
+                    _ = self.advance();
+                },
                 .eof => {
                     break;
                 },
@@ -205,6 +208,7 @@ pub const Parser = struct {
             if (self.check(.r_brace)) break;
             const expr = try self.expression();
             try self.scratch.append(self.gpa, expr);
+            try self.expectTerminator();
         }
 
         _ = try self.consume(.r_brace);
@@ -519,6 +523,7 @@ pub const Parser = struct {
             // TokenType.TOKEN_WHILE => comptime ParseRule.init(null, null, .PREC_NONE),
             .keyword_error => comptime ParseRule.init(null, null, .prec_none),
             .eof => comptime ParseRule.init(null, null, .prec_none),
+            .newline => comptime ParseRule.init(null, null, .prec_none),
             else => {
                 log.err("no rule for token {}", .{tag});
                 unreachable;
@@ -575,6 +580,7 @@ pub const Parser = struct {
             .expected_semi_or_lbrace,
             .expected_comma_after_param,
             .expected_fn,
+            .expected_newline,
             => if (msg.token != 0 and !self.tokensOnSameLine(msg.token - 1, msg.token)) {
                 var copy = msg;
                 copy.token_is_prev = true;
@@ -624,6 +630,14 @@ pub const Parser = struct {
         log.info("success to consume {}\n", .{expected_tag});
 
         return self.advance();
+    }
+
+    fn expectTerminator(self: *Parser) !void {
+        switch (self.current()) {
+            .newline => _ = self.advance(),
+            .r_brace, .eof => {}, // implicit terminator
+            else => try self.warn(.expected_newline), // recoverable
+        }
     }
 
     // Public Helpers

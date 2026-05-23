@@ -68,11 +68,24 @@ fn visit(self: *AstPrinter, node: Node.Index) void {
             self.visit(lhs);
             self.visit(rhs);
         },
-        // opt_node_and_node: optional assignment target + initializer.
+        // node_and_node: assignment target + initializer.
         .bind => {
-            const target, const initializer = datas[i].opt_node_and_node;
-            if (target.unwrap()) |target_node| self.visit(target_node);
+            const target, const initializer = datas[i].node_and_node;
+            self.visit(target);
             self.visit(initializer);
+        },
+        // node_and_extra: callee + SubRange of arguments in extra_data.
+        .call => {
+            const callee, const extra = datas[i].node_and_extra;
+            self.visit(callee);
+            const base = @intFromEnum(extra);
+            const args: Node.SubRange = .{
+                .start = @enumFromInt(tree.extra_data[base]),
+                .end = @enumFromInt(tree.extra_data[base + 1]),
+            };
+            for (self.extraDataSlice(args)) |arg| {
+                self.visit(arg);
+            }
         },
         // node_and_token: inner expression + the `)` token (not a node).
         .grouped_expression => {

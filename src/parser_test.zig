@@ -1,77 +1,86 @@
+//! Tests for the parser. The parser is not constructed directly — it is
+//! scratch state built inside `Ast.parse` — so these tests drive it through
+//! `Ast.parse(gpa, source)` and assert on the resulting tree.
+//!
+//! Note: `Ast.parse` only fails on OOM. Parse errors (recoverable *and* fatal)
+//! are collected into `tree.errors`, so error tests assert on that slice.
+//! Expressions only parse inside `fn` bodies, so inputs are full declarations.
+
 const std = @import("std");
-const Parser = @import("./parser.zig").Parser;
-const Error = @import("./parser.zig").Error.Tag;
-const mem = std.mem;
-const print = std.debug.print;
-const io = std.io;
-const maxInt = std.math.maxInt;
+const Ast = @import("ast.zig");
+const ErrorTag = Ast.Error.Tag;
 
-test "explode: missing expresion" {
-    try testExplode(
-        \\ 4 +
-    , error.ParseError);
+const gpa = std.testing.allocator;
+
+/// Assert `source` parses with no recoverable errors.
+fn expectOk(source: [:0]const u8) !void {
+    var tree = try Ast.parse(gpa, source);
+    defer tree.deinit(gpa);
+    if (tree.errors.len != 0) {
+        std.debug.print("unexpected errors:\n", .{});
+        for (tree.errors) |e| std.debug.print("  {s}\n", .{@tagName(e.tag)});
+        return error.UnexpectedParseError;
+    }
 }
 
-test "explode: missing l_paren" {
-    try testExplode(
-        \\ (4 
-        \\   + 
-        \\  2
-    , error.ParseError);
-}
+/// Assert `source` produces exactly `expected` recoverable errors, in order.
+fn expectErrors(source: [:0]const u8, expected: []const ErrorTag) !void {
+    var tree = try Ast.parse(gpa, source);
+    defer tree.deinit(gpa);
 
-// TODO: we should test here recoverable errors
-test "recovery: non-associative operators" {
-    // try testError(
-    //     \\    4 +
-    // , &[_]Error{
-    //     .expected_expression,
-    // });
-}
-
-var fixed_buffer_mem: [100 * 1024]u8 = undefined;
-
-fn testError(source: [:0]const u8, expected_errors: []const Error) !void {
-    var parser = try Parser.init(source, std.testing.allocator);
-    try parser.parse();
-    defer parser.deinit();
-    const errors = try parser.errors.toOwnedSlice(std.testing.allocator);
-    defer std.testing.allocator.free(errors);
-
-    std.testing.expectEqual(expected_errors.len, errors.len) catch |err| {
-        std.debug.print("errors found: {any}\n", .{errors});
+    std.testing.expectEqual(expected.len, tree.errors.len) catch |err| {
+        std.debug.print("errors found:\n", .{});
+        for (tree.errors) |e| std.debug.print("  {s}\n", .{@tagName(e.tag)});
         return err;
     };
-    for (expected_errors, 0..) |expected, i| {
-        try std.testing.expectEqual(expected, errors[i].tag);
+    for (expected, tree.errors) |want, got| {
+        try std.testing.expectEqual(want, got.tag);
     }
 }
 
-fn testExplode(source: [:0]const u8, expected_error: anyerror) !void {
-    var parser = try Parser.init(source, std.testing.allocator);
-    try std.testing.expectError(expected_error, parser.parse());
-    try printErrors(&parser);
-
-    defer parser.deinit();
+test "ok: function with assignments" {
+    try expectOk(
+        \\fn add(x: int, y: int): int {
+        \\  x = 2
+        \\  y = 4
+        \\}
+    );
 }
 
-fn printErrors(parser: *Parser) !void {
-    const stderr = io.getStdErr().writer();
-    const errors = try parser.errors.toOwnedSlice(std.testing.allocator);
-    defer std.testing.allocator.free(errors);
+test "ok: arithmetic precedence" {
+    try expectOk(
+        \\fn main(): int {
+        \\  z = 1 + 2 * 3
+        \\}
+    );
+}
 
-    for (errors) |parse_error| {
-        const loc = parser.tokenLocation(0, parse_error.token);
-        try stderr.print("(memory buffer):{d}:{d}: error: ", .{ loc.line + 1, loc.column + 1 });
-        try parser.renderError(parse_error, stderr);
-        try stderr.print("\n{s}\n", .{parser.source[loc.line_start..loc.line_end]});
-        {
-            var i: usize = 0;
-            while (i < loc.column) : (i += 1) {
-                try stderr.writeAll(" ");
-            }
-            try stderr.writeAll("^");
-        }
-        try stderr.writeAll("\n");
-    }
+test "ok: grouped and unary expressions" {
+    try expectOk(
+        \\fn main(): int {
+        \\  z = -(1 + 2)
+        \\}
+    );
+}
+
+// The trailing `.expected_return_type` in the error cases below is the
+// recovery cascade: once the in-body error aborts the declaration, the leftover
+// `}` is re-scanned at container level and hits the catch-all `else` branch in
+// `parseContainerMembers`. Pinning it documents current behavior; tighten these
+// once container-level recovery resyncs past stray tokens.
+
+test "error: missing expression after operator" {
+    try expectErrors(
+        \\fn main(): int {
+        \\  z = 4 +
+        \\}
+    , &.{ .expected_expression, .expected_return_type });
+}
+
+test "error: unclosed grouping" {
+    try expectErrors(
+        \\fn main(): int {
+        \\  z = (4 + 2
+        \\}
+    , &.{ .expected_token, .expected_return_type });
 }

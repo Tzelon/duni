@@ -1,4 +1,7 @@
 fn add(x: int, y: int): int {
- x = 2
- y = 4
+	foo()
+	foo(x, 5 + 2, y * 3)
+	a + foo()
+	f()(x)
+	f(g())
 }

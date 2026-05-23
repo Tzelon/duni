@@ -130,6 +130,30 @@ pub const Parser = struct {
         }
     }
 
+    fn finishAssignExpr(self: *Parser, lhs: Node.Index) !Node.Index {
+        const tag = assignOpNode(self.current()) orelse return lhs;
+        return self.addNode(.{
+            .tag = tag,
+            .main_token = self.advance(),
+            .data = .{ .node_and_node = .{
+                lhs,
+                try self.expression(),
+            } },
+        });
+    }
+
+    fn assignOpNode(tok: Token.Tag) ?Node.Tag {
+        return switch (tok) {
+            // .asterisk_equal => .assign_mul,
+            // .slash_equal => .assign_div,
+            // .percent_equal => .assign_mod,
+            // .plus_equal => .assign_add,
+            // .minus_equal => .assign_sub,
+            .equal => .bind,
+            else => null,
+        };
+    }
+
     /// FnProto <- KEYWORD_fn IDENTIFIER? LPAREN ParamDeclList RPAREN TypeExpr
     fn function(self: *Parser) !?Node.Index {
         const fn_token = try self.consume(.keyword_fn);
@@ -206,9 +230,8 @@ pub const Parser = struct {
         // parse expressions
         while (true) {
             if (self.check(.r_brace)) break;
-            const expr = try self.expression();
+            const expr = try self.expectExpr();
             try self.scratch.append(self.gpa, expr);
-            try self.expectTerminator();
         }
 
         _ = try self.consume(.r_brace);
@@ -221,6 +244,43 @@ pub const Parser = struct {
         });
     }
 
+    fn expectExpr(self: *Parser) !Node.Index {
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+        // parse the lhs, allow 1 expr not comma separated between expr is allowed
+        const lhs = try self.expression();
+        try self.scratch.append(self.gpa, lhs);
+
+        const equal_token = self.eat(.equal) orelse {
+            _ = self.scratch.items[scratch_top];
+            switch (self.nodeTag(lhs)) {
+                // A good place to recover from mispelling `==` instead of `=`
+                else => {},
+            }
+
+            // special assignment like  x += 1.
+            const expr = try self.finishAssignExpr(lhs);
+            try self.expectTerminator();
+            return expr;
+        };
+
+        // assignment
+        const rhs = try self.expression();
+        try self.expectTerminator();
+
+        const expr = try self.addNode(.{
+            .tag = .bind,
+            .main_token = equal_token,
+            .data = .{ .node_and_node = .{
+                lhs,
+                rhs,
+            } },
+        });
+
+        return expr;
+    }
+
     /// params list are stored in the extra_data list
     /// ParamDeclList <- (ParamDecl COMMA)* ParamDecl?
     /// ParamDecl <- (IDENTIFIER COLON)? ParamType
@@ -231,6 +291,7 @@ pub const Parser = struct {
 
         while (true) {
             if (self.check(.r_paren)) {
+                _ = self.advance();
                 break;
             }
 
@@ -303,12 +364,12 @@ pub const Parser = struct {
     }
 
     fn expression(self: *Parser) !Node.Index {
-        log.info("parse expression", .{});
-        return try self.parsePrecedence(.prec_assignment);
+        return self.parsePrecedence(.prec_assignment);
     }
 
     fn parsePrecedence(self: *Parser, precedence: Precedence) !Node.Index {
         const prefixRule = self.getRule(self.current()).prefix orelse {
+            // no expression starting here
             return self.failMsg(.{
                 .tag = .expected_expression,
                 .token = self.token_index,
@@ -319,10 +380,8 @@ pub const Parser = struct {
 
         while (@intFromEnum(precedence) <= @intFromEnum(self.getRule(self.current()).precedence)) {
             const infixRule = self.getRule(self.current()).infix orelse {
-                return self.failMsg(.{
-                    .tag = .expected_expression,
-                    .token = self.token_index,
-                });
+                try self.warn(.expected_expression);
+                return node;
             };
 
             node = try infixRule(self, node);
@@ -378,6 +437,40 @@ pub const Parser = struct {
         });
     }
 
+    /// example: `foo()`
+    fn call(self: *Parser, lhs: Node.Index) !Node.Index {
+        const lparen = self.advance();
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+        if (!self.check(.r_paren)) {
+            while (true) {
+                const arg = try self.expression();
+                try self.scratch.append(self.gpa, arg);
+                switch (self.current()) {
+                    .comma => _ = self.advance(),
+                    .r_paren => break,
+                    .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+                    // Likely just a missing comma; give error but continue parsing.
+                    else => try self.warn(.expected_comma_after_arg),
+                }
+            }
+        }
+
+        _ = try self.consume(.r_paren);
+
+        const args = self.scratch.items[scratch_top..];
+
+        return try self.addNode(.{
+            .tag = .call,
+            .main_token = lparen,
+            .data = .{ .node_and_extra = .{
+                lhs,
+                try self.addExtra(try self.listToSpan(args)),
+            } },
+        });
+    }
+
     /// example: 47
     fn number(self: *Parser) !Node.Index {
         return self.addNode(.{
@@ -395,26 +488,19 @@ pub const Parser = struct {
         });
     }
 
-    fn variable(self: *Parser) !Node.Index {
-        _ = self.advance();
-        const equal_token = try self.consume(.equal);
-        const initializer = try self.expression();
-
+    fn identifier(self: *Parser) !Node.Index {
         return self.addNode(.{
-            .tag = .bind,
-            .main_token = equal_token,
-            .data = .{
-                .opt_node_and_node = .{
-                    // Empty space type expression, if we ever need it.
-                    Node.OptionalIndex.none,
-                    initializer,
-                },
-            },
+            .tag = .identifier,
+            .main_token = self.advance(),
+            .data = undefined,
         });
     }
 
     // node helpers
 
+    fn nodeTag(self: *const Parser, node: Node.Index) Node.Tag {
+        return self.nodes.items(.tag)[@intFromEnum(node)];
+    }
     fn nodeMainToken(self: *const Parser, node: Node.Index) TokenIndex {
         return self.nodes.items(.main_token)[@intFromEnum(node)];
     }
@@ -483,7 +569,7 @@ pub const Parser = struct {
     fn getRule(self: *Parser, tag: Token.Tag) ParseRule {
         _ = self;
         const rule = switch (tag) {
-            .l_paren => comptime ParseRule.init(Parser.grouping, null, .prec_call),
+            .l_paren => comptime ParseRule.init(Parser.grouping, Parser.call, .prec_call),
             .r_paren => comptime ParseRule.init(null, null, .prec_none),
             .l_brace => comptime ParseRule.init(null, null, .prec_none),
             .r_brace => comptime ParseRule.init(null, null, .prec_none),
@@ -502,7 +588,7 @@ pub const Parser = struct {
             .angle_bracket_left_equal => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
             .angle_bracket_right => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
             .angle_bracket_right_equal => comptime ParseRule.init(null, Parser.binary, .prec_comparison),
-            .identifier => comptime ParseRule.init(Parser.variable, null, .prec_none),
+            .identifier => comptime ParseRule.init(Parser.identifier, null, .prec_none),
             .string_literal => comptime ParseRule.init(Parser.string, null, .prec_none),
             .number_literal => comptime ParseRule.init(Parser.number, null, .prec_none),
             // .keyword_and => comptime ParseRule.init(null, Parser.@"and", .prec_and),
@@ -618,6 +704,11 @@ pub const Parser = struct {
     /// return true if the current token has the given tag
     fn check(self: *Parser, expected_tag: Token.Tag) bool {
         return self.token_tags[self.token_index] == expected_tag;
+    }
+
+    /// eats the token or return null
+    fn eat(self: *Parser, expected_tag: Token.Tag) ?TokenIndex {
+        return if (self.check(expected_tag)) self.advance() else null;
     }
 
     /// consume the current token only if the current token matches the type
@@ -767,8 +858,4 @@ fn listToSpan(self: *Parser, list: []const Node.Index) !Node.SubRange {
         .start = @as(Node.Index, @intCast(self.extra_data.items.len - list.len)),
         .end = @as(Node.Index, @intCast(self.extra_data.items.len)),
     };
-}
-
-test {
-    _ = @import("./parser_test.zig");
 }

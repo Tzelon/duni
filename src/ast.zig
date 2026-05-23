@@ -268,6 +268,15 @@ pub const Node = struct {
         ///
         /// The `main_token` field is the `{` token.
         block,
+        /// `a(b, c, d)`.
+        ///
+        /// The `data` field is a `.node_and_extra`:
+        ///   1. a `Node.Index` to the function expression.
+        ///   2. a `ExtraIndex` to a `SubRange` that stores a `Node.Index` for
+        ///      each argument.
+        ///
+        /// The `main_token` field is the `(` token.
+        call,
     };
 
     /// some nodes have lhs and rhs data attached to them.
@@ -276,6 +285,7 @@ pub const Node = struct {
         token: TokenIndex,
         node_and_node: struct { Index, Index },
         node_and_token: struct { Index, TokenIndex },
+        node_and_extra: struct { Index, ExtraIndex },
         opt_node_and_opt_node: struct { OptionalIndex, OptionalIndex },
         opt_node_and_node: struct { OptionalIndex, Index },
         extra_and_opt_node: struct { ExtraIndex, OptionalIndex },
@@ -298,7 +308,17 @@ pub const Error = struct {
     token: TokenIndex,
     extra: union { none: void, expected_tag: Token.Tag } = .{ .none = {} },
 
-    pub const Tag = enum { expected_return_type, expected_comma_after_arg, expected_token, expected_expression, expected_semi_or_lbrace, expected_type_expr, expected_comma_after_param, expected_fn, expected_newline };
+    pub const Tag = enum {
+        expected_return_type,
+        expected_comma_after_arg,
+        expected_token,
+        expected_expression,
+        expected_semi_or_lbrace,
+        expected_type_expr,
+        expected_comma_after_param,
+        expected_fn,
+        expected_newline,
+    };
 };
 
 /// Fully assembled AST node information.

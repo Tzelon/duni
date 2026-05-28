@@ -230,7 +230,7 @@ pub const Parser = struct {
         // parse expressions
         while (true) {
             if (self.check(.r_brace)) break;
-            const expr = try self.expectExpr();
+            const expr = try self.expectExprRecoverable() orelse break;
             try self.scratch.append(self.gpa, expr);
         }
 
@@ -242,6 +242,25 @@ pub const Parser = struct {
             .main_token = lbrace,
             .data = .{ .extra_range = try self.listToSpan(expressions) },
         });
+    }
+
+    /// If a parse error occurs, reports an error, but then finds the next expression
+    /// and returns that one instead. If a parse error occurs but there is no following
+    /// expression, returns null.
+    fn expectExprRecoverable(self: *Parser) Error!?Node.Index {
+        while (true) {
+            return self.expectExpr() catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.ParseError => {
+                    self.findNextExpr(); // Try to skip to the next statement.
+                    switch (self.current()) {
+                        .r_brace => return null,
+                        .eof => return error.ParseError,
+                        else => continue,
+                    }
+                },
+            };
+        }
     }
 
     fn expectExpr(self: *Parser) !Node.Index {
@@ -728,6 +747,33 @@ pub const Parser = struct {
             .newline => _ = self.advance(),
             .r_brace, .eof => {}, // implicit terminator
             else => try self.warn(.expected_newline), // recoverable
+        }
+    }
+
+    fn findNextExpr(self: *Parser) void {
+        var level: u32 = 0;
+        while (true) {
+            _ = self.advance();
+            switch (self.previous()) {
+                .l_brace => level += 1,
+                .r_brace => {
+                    if (level == 0) {
+                        self.token_index -= 1;
+                        return;
+                    }
+                    level -= 1;
+                },
+                .newline => {
+                    if (level == 0) {
+                        return;
+                    }
+                },
+                .eof => {
+                    self.token_index -= 1;
+                    return;
+                },
+                else => {},
+            }
         }
     }
 

@@ -63,18 +63,12 @@ test "ok: grouped and unary expressions" {
     );
 }
 
-// The trailing `.expected_return_type` in the error cases below is the
-// recovery cascade: once the in-body error aborts the declaration, the leftover
-// `}` is re-scanned at container level and hits the catch-all `else` branch in
-// `parseContainerMembers`. Pinning it documents current behavior; tighten these
-// once container-level recovery resyncs past stray tokens.
-
 test "error: missing expression after operator" {
     try expectErrors(
         \\fn main(): int {
         \\  z = 4 +
         \\}
-    , &.{ .expected_expression, .expected_return_type });
+    , &.{.expected_expression});
 }
 
 test "error: unclosed grouping" {
@@ -82,5 +76,85 @@ test "error: unclosed grouping" {
         \\fn main(): int {
         \\  z = (4 + 2
         \\}
-    , &.{ .expected_token, .expected_return_type });
+    , &.{.expected_token});
+}
+
+test "ok: bare identifier statement" {
+    try expectOk(
+        \\fn main(): int {
+        \\  x
+        \\}
+    );
+}
+
+test "ok: call with no arguments" {
+    try expectOk(
+        \\fn main(): int {
+        \\  foo()
+        \\}
+    );
+}
+
+test "ok: call with multiple argument expressions" {
+    try expectOk(
+        \\fn add(x: int, y: int): int {
+        \\  foo(x, 5 + 2, y * 3)
+        \\}
+    );
+}
+
+test "ok: call inside binary expression" {
+    try expectOk(
+        \\fn main(): int {
+        \\  a + foo()
+        \\}
+    );
+}
+
+test "ok: chained call on call result" {
+    try expectOk(
+        \\fn main(): int {
+        \\  f()(x)
+        \\}
+    );
+}
+
+test "ok: nested call as argument" {
+    try expectOk(
+        \\fn main(): int {
+        \\  f(g())
+        \\}
+    );
+}
+
+test "ok: assignment of call result" {
+    try expectOk(
+        \\fn main(): int {
+        \\  z = foo(1, 2)
+        \\}
+    );
+}
+
+test "error: missing comma between arguments" {
+    try expectErrors(
+        \\fn main(): int {
+        \\  foo(1 2)
+        \\}
+    , &.{.expected_comma_after_arg});
+}
+
+test "error: unclosed call argument list" {
+    try expectErrors(
+        \\fn main(): int {
+        \\  foo(1, 2
+        \\}
+    , &.{ .expected_comma_after_arg, .expected_expression });
+}
+
+test "error: missing argument after comma" {
+    try expectErrors(
+        \\fn main(): int {
+        \\  foo(1,)
+        \\}
+    , &.{.expected_expression});
 }

@@ -21,13 +21,31 @@ nodes: NodeList.Slice,
 extra_data: []u32,
 errors: []const Error,
 
-pub const TokenIndex = u32;
 pub const ByteOffset = u32;
 
+/// Index into `tokens`.
+pub const TokenIndex = u32;
 pub const TokenList = std.MultiArrayList(struct {
     tag: Token.Tag,
     start: ByteOffset,
 });
+/// Index into `tokens`, or null.
+pub const OptionalTokenIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn unwrap(oti: OptionalTokenIndex) ?TokenIndex {
+        return if (oti == .none) null else @intFromEnum(oti);
+    }
+
+    pub fn fromToken(ti: TokenIndex) OptionalTokenIndex {
+        return @enumFromInt(ti);
+    }
+
+    pub fn fromOptional(oti: ?TokenIndex) OptionalTokenIndex {
+        return if (oti) |ti| @enumFromInt(ti) else .none;
+    }
+};
 
 pub const NodeList = std.MultiArrayList(Node);
 
@@ -91,7 +109,50 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
     };
 }
 
-pub fn containerDeclRoot(tree: Ast) Full.ContainerDecl {
+pub fn tokenSlice(tree: Ast, token_index: TokenIndex) []const u8 {
+    const token_tag = tree.tokenTag(token_index);
+
+    // Many tokens can be determined entirely by their tag.
+    if (token_tag.lexeme()) |lexeme| {
+        return lexeme;
+    }
+
+    // For some tokens, re-tokenization is needed to find the end.
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = tree.source,
+        .index = tree.tokenStart(token_index),
+    };
+    const token = tokenizer.next();
+    assert(token.tag == token_tag);
+    return tree.source[token.loc.start..token.loc.end];
+}
+
+pub fn extraDataSlice(tree: Ast, range: Node.SubRange, comptime T: type) []const T {
+    return @ptrCast(tree.extra_data[@intFromEnum(range.start)..@intFromEnum(range.end)]);
+}
+
+pub fn extraDataSliceWithLen(tree: Ast, start: ExtraIndex, len: u32, comptime T: type) []const T {
+    return @ptrCast(tree.extra_data[@intFromEnum(start)..][0..len]);
+}
+
+pub fn extraData(tree: Ast, index: ExtraIndex, comptime T: type) T {
+    const info = @typeInfo(T).@"struct";
+    var result: T = undefined;
+    inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
+        @field(result, field_name) = switch (field_type) {
+            Node.Index,
+            Node.OptionalIndex,
+            OptionalTokenIndex,
+            ExtraIndex,
+            => @enumFromInt(tree.extra_data[@intFromEnum(index) + i]),
+            TokenIndex => tree.extra_data[@intFromEnum(index) + i],
+            else => @compileError("unexpected field type: " ++ @typeName(field_type)),
+        };
+    }
+    return result;
+}
+
+pub fn containerDeclRoot(tree: Ast) full.ContainerDecl {
     return .{
         .layout_token = null,
         .ast = .{
@@ -101,6 +162,14 @@ pub fn containerDeclRoot(tree: Ast) Full.ContainerDecl {
             .arg = 0,
         },
     };
+}
+
+pub fn nodeTag(self: *const Ast, node: Node.Index) Node.Tag {
+    return self.nodes.items(.tag)[@intFromEnum(node)];
+}
+
+pub fn nodeData(self: *const Ast, node: Node.Index) Node.Data {
+    return self.nodes.items(.data)[@intFromEnum(node)];
 }
 
 pub fn rootDecls(tree: Ast) []const Node.Index {
@@ -292,6 +361,11 @@ pub const Node = struct {
         extra_range: SubRange,
     };
 
+    pub const FnProto = struct {
+        params_start: ExtraIndex,
+        params_end: ExtraIndex,
+    };
+
     pub const SubRange = struct {
         /// Index into extra_data.
         start: ExtraIndex,
@@ -321,9 +395,83 @@ pub const Error = struct {
     };
 };
 
+pub fn fnProto(tree: Ast, node: Node.Index) full.FnProto {
+    assert(tree.nodeTag(node) == .fn_proto);
+    const extra_index, const return_type = tree.nodeData(node).extra_and_opt_node;
+    const extra = tree.extraData(extra_index, Node.FnProto);
+    const params = tree.extraDataSlice(.{ .start = extra.params_start, .end = extra.params_end }, Node.Index);
+    return tree.fullFnProtoComponents(.{
+        .proto_node = node,
+        .fn_token = tree.nodeMainToken(node),
+        .return_type = return_type,
+        .params = params,
+        .align_expr = extra.align_expr,
+        .addrspace_expr = extra.addrspace_expr,
+        .section_expr = extra.section_expr,
+        .callconv_expr = extra.callconv_expr,
+    });
+}
+
+pub fn fullFnProto(tree: Ast, buffer: *[1]Ast.Node.Index, node: Node.Index) ?full.FnProto {
+    return switch (tree.nodeTag(node)) {
+        .fn_proto => tree.fnProto(node),
+        .fn_decl => tree.fullFnProto(buffer, tree.nodeData(node).node_and_node[0]),
+        else => null,
+    };
+}
+
+fn fullFnProtoComponents(tree: Ast, info: full.FnProto.Components) full.FnProto {
+    var result: full.FnProto = .{
+        .ast = info,
+        .name_token = null,
+        .lparen = undefined,
+    };
+    // zig https://codeberg.org/ziglang/zig/src/commit/9c79c784acff94a76fe931a422ef6fecbbb3066b/lib/std/zig/Ast.zig#L2082
+    // if we ever want to add prefix keyword to a function
+    // var i = info.fn_token;
+    // while (i > 0) {
+    //     i -= 1;
+    //     switch (tree.tokenTag(i)) {
+    //         .keyword_extern,
+    //         .keyword_export,
+    //         => result.extern_export_inline_token = i,
+    //         .keyword_pub => result.visib_token = i,
+    //         .string_literal => result.lib_name = i,
+    //         else => break,
+    //     }
+    // }
+    const after_fn_token = info.fn_token + 1;
+    if (tree.tokenTag(after_fn_token) == .identifier) {
+        result.name_token = after_fn_token;
+        result.lparen = after_fn_token + 1;
+    } else {
+        result.lparen = after_fn_token;
+    }
+    assert(tree.tokenTag(result.lparen) == .l_paren);
+
+    return result;
+}
+
 /// Fully assembled AST node information.
 /// fetch extra_data when needed
-const Full = struct {
+const full = struct {
+    pub const FnProto = struct {
+        name_token: ?TokenIndex,
+        lparen: TokenIndex,
+        ast: Components,
+
+        pub const Components = struct {
+            proto_node: Node.Index,
+            fn_token: TokenIndex,
+            return_type: Node.OptionalIndex,
+            params: []const Node.Index,
+        };
+
+        pub const Param = struct {
+            name_token: ?TokenIndex,
+            type_expr: ?Node.Index,
+        };
+    };
     pub const ContainerDecl = struct {
         layout_token: ?TokenIndex,
         ast: Components,

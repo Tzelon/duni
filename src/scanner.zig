@@ -45,26 +45,34 @@ pub const Scanner = struct {
                         continue :state .invalid;
                     }
                 },
+                // ignore white space
+                ' ', '\t', '\r' => {
+                    self.index += 1;
+                    result.loc.start = self.index;
+                    continue :state .start;
+                },
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;
                     continue :state .number;
+                },
+                '-' => {
+                    self.index += 1;
+                    result.tag = .minus;
                 },
                 else => continue :state .invalid,
             },
             .indentifier => unreachable,
             .number => switch (self.buffer[self.index]) {
                 '.' => continue :state .number_dot,
-
                 // digit separator (1_000_000)
                 '_',
+                // zig fmt: off
                 // hex digit + suffix letters
-                'a'...'d',
-                'A'...'D',
-                'f'...'o',
-                'F'...'O',
-                'q'...'z',
-                'Q'...'Z',
+                'a'...'d', 'A'...'D',
+                'f'...'o', 'F'...'O',
+                'q'...'z', 'Q'...'Z',
+                // zig fmt: on
                 // digit
                 '0'...'9',
                 => {
@@ -86,9 +94,19 @@ pub const Scanner = struct {
                     else => continue :state .number,
                 }
             },
-            // field access
+            // float or field access
             .number_dot => {
-                unreachable;
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
+                        self.index += 1;
+                        continue :state .float;
+                    },
+                    'e', 'E', 'p', 'P' => {
+                        continue :state .float_exponent;
+                    },
+                    else => self.index -= 1, // parse the dot as field access
+                }
             },
             .float => switch (self.buffer[self.index]) {
                 '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
@@ -183,6 +201,7 @@ test "tokenizer" {
     try expectToken("1_000_000", &.{.number_literal});
     try expectToken("0xDEAD_BEEF", &.{.number_literal});
     try expectToken("1e10", &.{.number_literal});
+    try expectToken("-2", &.{ .minus, .number_literal });
     try expectToken("1e-5", &.{.number_literal});
-    // try expectToken("3.14", &.{.number_literal});
+    try expectToken("3.14", &.{.number_literal});
 }

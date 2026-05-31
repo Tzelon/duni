@@ -29,6 +29,7 @@ pub const Inst = struct {
     pub const Tag = enum(u8) {
         /// An integer literal. Uses the `int` union field.
         int,
+        float,
         // cmp_neq,
         // cmp_eq,
         // add,
@@ -117,8 +118,19 @@ pub const Inst = struct {
         /// Offset from Decl AST node index.
         node: Ast.Node.Offset,
         int: u64,
+        float: f64,
     };
 };
+
+pub fn dump(dir: *const Dir) void {
+    const tags = dir.instructions.items(.tag);
+    const datas = dir.instructions.items(.data);
+
+    for (tags, datas, 0..) |tag, data, i| switch (tag) {
+        .int => std.debug.print("%{d} = int {d}\n", .{ i, data.int }),
+        .float => std.debug.print("%{d} = float {d}\n", .{ i, data.float }),
+    };
+}
 
 pub fn deinit(code: *Dir, gpa: Allocator) void {
     code.instructions.deinit(gpa);

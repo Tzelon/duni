@@ -6,6 +6,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Hash = std.hash.Wyhash;
 
+const Dir = @import("../Dir.zig");
+
 // List of all constant items
 items: std.MultiArrayList(Item) = .empty,
 // A map to check if an item is already exists
@@ -17,7 +19,7 @@ pub const Item = struct {
     data: u32,
 };
 
-/// Represents an index into `map`. It represents the canonical index
+/// Represents an index into `items`. It represents the canonical index
 /// of a `Value` within this `InternPool`. The values are typed.
 /// Two values which have the same type can be equality compared simply
 /// by checking if their indexes are equal, provided they are both in
@@ -25,18 +27,11 @@ pub const Item = struct {
 /// When adding a tag to this enum, consider adding a corresponding entry to
 /// `primitives` in AstGen.zig.
 pub const Index = enum(u32) {
-    comptime_number_type,
+    number_type,
 
     /// Used by Air/Sema only.
     none = std.math.maxInt(u32),
     _,
-};
-
-/// This data structure is used by the Zig language code generation and
-/// therefore must be kept in sync with the compiler implementation.
-pub const Signedness = enum(u1) {
-    signed,
-    unsigned,
 };
 
 pub const Key = union(enum) {
@@ -47,7 +42,7 @@ pub const Key = union(enum) {
     /// implement logic that only wants to deal with types because the logic can
     /// ignore all simple values. Note that technically, types are values.
     pub const SimpleType = enum(u32) {
-        comptime_number = @intFromEnum(Index.comptime_number_type),
+        comptime_number = @intFromEnum(Index.number_type),
     };
 
     pub const Number = struct {
@@ -71,6 +66,21 @@ pub const Key = union(enum) {
         };
     }
 };
+
+pub fn init(ip: *InternPool, gpa: Allocator, io: Io) !void {
+    errdefer ip.deinit(gpa, io);
+    // This inserts all the statically-known values into the intern pool in the
+    // order expected.
+    for (&static_keys, 0..) |key, key_index| switch (@as(Index, @enumFromInt(key_index))) {
+        else => |expected_index| assert(try ip.get(gpa, io, key) == expected_index),
+    };
+
+    if (std.debug.runtime_safety) {
+        // Sanity check.
+        // assert(ip.indexToKey(.bool_true).simple_value == .true);
+        // assert(ip.indexToKey(.bool_false).simple_value == .false);
+    }
+}
 
 pub fn get(ip: *InternPool, gpa: Allocator, io: Io, key: Key) Allocator.Error!Index {
     _ = io;
@@ -110,7 +120,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
     };
 }
 
-pub fn deinit(ip: *InternPool, gpa: Allocator) void {
+pub fn deinit(ip: *InternPool, gpa: Allocator, io: std.Io) void {
+    _ = io;
     ip.items.deinit(gpa);
     ip.map.deinit(gpa);
 }
@@ -140,19 +151,30 @@ const Adapter = struct {
     }
 };
 
+/// How many items in the InternPool are statically known.
+/// This is specified with an integer literal and a corresponding comptime
+/// assert below to break an unfortunate and arguably incorrect dependency loop
+/// when compiling.
+pub const static_len = Dir.Inst.Ref.static_len;
+
 pub const Tag = enum(u8) {
     /// A type that can be represented with only an enum tag.
     simple_type,
 };
 
-test "same key returns same index" {
+pub const static_keys: [static_len]Key = .{
+    .{ .simple_type = .comptime_number },
+};
+
+test "InternPool same key returns same index" {
     const gpa = std.testing.allocator;
-    var pl: InternPool = InternPool{};
+    const io = std.testing.io;
 
-    const a = try pl.get(gpa, std.testing.io, .{ .simple_type = .comptime_number });
-    const b = try pl.get(gpa, std.testing.io, .{ .simple_type = .comptime_number });
-    try std.testing.expectEqual(a, b);
-    try std.testing.expectEqual(@as(usize, 1), pl.items.len);
+    var ip: InternPool = .{};
+    try ip.init(gpa, io);
+    defer ip.deinit(gpa, io);
 
-    pl.deinit(gpa);
+    const a = try ip.get(gpa, std.testing.io, .{ .simple_type = .comptime_number });
+    const b = try ip.get(gpa, std.testing.io, .{ .simple_type = .comptime_number });
+    try std.testing.expect(a == b);
 }

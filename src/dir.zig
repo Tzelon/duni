@@ -73,6 +73,7 @@ pub const Inst = struct {
     /// The tag type is specified so that it is safe to bitcast between `[]u32`
     /// and `[]Ref`.
     pub const Ref = enum(u32) {
+        number_type,
         /// This Ref does not correspond to any DIR instruction or constant
         /// value and may instead be used as a sentinel to indicate null.
         none = std.math.maxInt(u32),

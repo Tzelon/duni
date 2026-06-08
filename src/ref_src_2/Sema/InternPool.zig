@@ -3,6 +3,7 @@ const InternPool = @This();
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const Hash = std.hash.Wyhash;
 
 const Dir = @import("../Dir.zig");
@@ -35,13 +36,23 @@ pub const Index = enum(u32) {
 
 pub const Key = union(enum) {
     simple_type: SimpleType,
-    number: u32,
+    // number: Key.Number,
 
     /// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
     /// implement logic that only wants to deal with types because the logic can
     /// ignore all simple values. Note that technically, types are values.
     pub const SimpleType = enum(u32) {
         comptime_number = @intFromEnum(Index.number_type),
+    };
+
+    pub const Number = struct {
+        ty: Index,
+        storage: Storage,
+
+        pub const Storage = union(enum) {
+            u64: u64,
+            i64: i64,
+        };
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
@@ -52,17 +63,16 @@ pub const Key = union(enum) {
 
         return switch (key) {
             .simple_type => |x| Hash.hash(seed, asBytes(&x)),
-            .number => |n| Hash.hash(seed, asBytes(&n)),
         };
     }
 };
 
-pub fn init(ip: *InternPool, gpa: Allocator) !void {
-    errdefer ip.deinit(gpa);
+pub fn init(ip: *InternPool, gpa: Allocator, io: Io) !void {
+    errdefer ip.deinit(gpa, io);
     // This inserts all the statically-known values into the intern pool in the
     // order expected.
     for (&static_keys, 0..) |key, key_index| switch (@as(Index, @enumFromInt(key_index))) {
-        else => |expected_index| assert(try ip.get(gpa, key) == expected_index),
+        else => |expected_index| assert(try ip.get(gpa, io, key) == expected_index),
     };
 
     if (std.debug.runtime_safety) {
@@ -72,7 +82,8 @@ pub fn init(ip: *InternPool, gpa: Allocator) !void {
     }
 }
 
-pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
+pub fn get(ip: *InternPool, gpa: Allocator, io: Io, key: Key) Allocator.Error!Index {
+    _ = io;
     const ctx: Context = .{ .ip = ip };
     const adapter: Adapter = .{ .ip = ip };
 
@@ -89,9 +100,10 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
                 .data = 0, // avoid writing `undefined` bits to a file
             });
         },
-        .number => |number| {
-            ip.items.appendAssumeCapacity(.{ .tag = .number_32, .data = number });
-        },
+        //TODO(tzelon): zig InternPool.zig line:7491
+        // .number => |number| {
+        //
+        // }
     }
 
     gop.key_ptr.* = new_index;
@@ -101,18 +113,15 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
 pub fn indexToKey(ip: *const InternPool, index: Index) Key {
     assert(index != .none);
     const tag = ip.items.items(.tag)[@intFromEnum(index)];
-    const data = ip.items.items(.data)[@intFromEnum(index)];
+    _ = ip.items.items(.data)[@intFromEnum(index)];
 
     return switch (tag) {
         .simple_type => .{ .simple_type = @enumFromInt(@intFromEnum(index)) },
-        .number_32 => .{ .number = data },
     };
 }
 
-pub fn deinit(
-    ip: *InternPool,
-    gpa: Allocator,
-) void {
+pub fn deinit(ip: *InternPool, gpa: Allocator, io: std.Io) void {
+    _ = io;
     ip.items.deinit(gpa);
     ip.map.deinit(gpa);
 }
@@ -151,34 +160,21 @@ pub const static_len = Dir.Inst.Ref.static_len;
 pub const Tag = enum(u8) {
     /// A type that can be represented with only an enum tag.
     simple_type,
-
-    number_32,
 };
 
-pub const static_keys: [static_len]Key = .{.{ .simple_type = .comptime_number }};
+pub const static_keys: [static_len]Key = .{
+    .{ .simple_type = .comptime_number },
+};
 
 test "InternPool same key returns same index" {
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
 
     var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
+    try ip.init(gpa, io);
+    defer ip.deinit(gpa, io);
 
-    const a = try ip.get(gpa, .{ .simple_type = .comptime_number });
-    const b = try ip.get(gpa, .{ .simple_type = .comptime_number });
+    const a = try ip.get(gpa, std.testing.io, .{ .simple_type = .comptime_number });
+    const b = try ip.get(gpa, std.testing.io, .{ .simple_type = .comptime_number });
     try std.testing.expect(a == b);
-}
-
-test "InternPool same key returns not the same index" {
-    const gpa = std.testing.allocator;
-
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    const a = try ip.get(gpa, .{ .number = 42 });
-    const b = try ip.get(gpa, .{ .number = 42 });
-    const c = try ip.get(gpa, .{ .number = 43 });
-    try std.testing.expect(a == b);
-    try std.testing.expect(a != c);
 }

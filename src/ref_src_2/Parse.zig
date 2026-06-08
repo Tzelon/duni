@@ -6,11 +6,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
-const Token = @import("./scanner.zig").Token;
-
-const Ast = @import("./Ast.zig");
+const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
+const ExtraIndex = Ast.ExtraIndex;
+
+const Token = @import("scanner.zig").Token;
 
 const log = std.log.scoped(.parser);
 
@@ -19,19 +20,14 @@ pub const Error = error{ParseError} || Allocator.Error;
 gpa: Allocator,
 /// source text
 source: [:0]const u8,
-
-// scanner tokens
 tokens: Ast.TokenList.Slice,
 /// current token index
 token_index: TokenIndex,
-
-/// list of AST nodes
-nodes: std.MultiArrayList(Node),
-/// extra data referenced by AST node. example: function params
-extra_data: std.ArrayList(u32),
 /// list of recoverable errors
 errors: std.ArrayList(Ast.Error),
-
+nodes: Ast.NodeList,
+/// extra data referenced by AST node. example: function params
+extra_data: std.ArrayList(u32),
 /// temp array of nodes
 scratch: std.ArrayList(Node.Index),
 
@@ -45,11 +41,12 @@ pub fn parseRoot(p: *Parse) !void {
 
     const exps = try p.parseExpression();
 
+    // const root_decls = try root_members.toSpan(p);
+
     if (p.tokenTag(p.token_index) != .eof) {
         try p.warnExpected(.eof);
     }
 
-    // add the list of expressions to the root node
     p.nodes.items(.data)[0] = .{ .node = exps };
 }
 

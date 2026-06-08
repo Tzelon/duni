@@ -27,7 +27,16 @@ pub const Inst = struct {
     data: Data,
 
     pub const Tag = enum(u8) {
+        /// An integer literal. Uses the `int` union field.
         int,
+        float,
+        // cmp_neq,
+        // cmp_eq,
+        // add,
+        // sub,
+        // mul,
+        // div,
+        // mod_rem,
     };
 
     /// The position of a DIR instruction within the `Dir` instructions array.
@@ -92,11 +101,41 @@ pub const Inst = struct {
     /// this union. `Tag` determines which union field is active, as well as
     /// how to interpret the data within.
     pub const Data = union {
+        /// Used for unary operators, with an AST node source location.
+        un_node: struct {
+            /// Offset from Decl AST node index.
+            src_node: Ast.Node.Offset,
+            /// The meaning of this operand depends on the corresponding `Tag`.
+            operand: Ref,
+        },
+        pl_node: struct {
+            /// Offset from Decl AST node index.
+            /// `Tag` determines which kind of AST node this points to.
+            src_node: Ast.Node.Offset,
+            /// index into extra.
+            /// `Tag` determines what lives there.
+            payload_index: u32,
+        },
+        /// Offset from Decl AST node index.
+        node: Ast.Node.Offset,
         int: u64,
+        float: f64,
     };
 };
 
+pub fn dump(dir: *const Dir) void {
+    const tags = dir.instructions.items(.tag);
+    const datas = dir.instructions.items(.data);
+
+    for (tags, datas, 0..) |tag, data, i| switch (tag) {
+        .int => std.debug.print("%{d} = int {d}\n", .{ i, data.int }),
+        .float => std.debug.print("%{d} = float {d}\n", .{ i, data.float }),
+    };
+}
+
 pub fn deinit(code: *Dir, gpa: Allocator) void {
     code.instructions.deinit(gpa);
+    // gpa.free(code.string_bytes);
+    // gpa.free(code.extra);
     code.* = undefined;
 }

@@ -29,16 +29,12 @@ fn visit(self: *Print, node: Node.Index) !void {
     const main_token = main_tokens[i];
 
     try self.w.splatByteAll(' ', self.indent * 2);
-    if (tag == .root) {
-        try self.w.print("root\n", .{});
-    } else {
-        try self.w.print("{s} (token {d} .{s} \"{s}\")\n", .{
-            @tagName(tag),
-            main_token,
-            @tagName(token_tags[main_token]),
-            tree.tokenSlice(main_token),
-        });
-    }
+    try self.w.print("{s} (token {d} .{s} \"{s}\")\n", .{
+        @tagName(tag),
+        main_token,
+        @tagName(token_tags[main_token]),
+        tokenSlice(tree, main_token),
+    });
 
     self.indent += 1;
     defer self.indent -= 1;
@@ -47,5 +43,16 @@ fn visit(self: *Print, node: Node.Index) !void {
         // node: single child expression.
         .root => try self.visit(datas[i].node),
         .number_literal => {},
+        else => std.debug.panic("AstPrint: unhandled tag .{s}", .{@tagName(tag)}),
     }
+}
+
+/// Recover the source text for a token by re-scanning from its start offset.
+fn tokenSlice(tree: *const Ast, ti: Ast.TokenIndex) []const u8 {
+    const Scanner = @import("../scanner.zig").Scanner;
+    const start: usize = tree.tokens.items(.start)[ti];
+    var scanner = Scanner.init(tree.source);
+    scanner.index = start;
+    const tok = scanner.next();
+    return tree.source[start..tok.loc.end];
 }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const AstGen = @import("AstGen.zig");
+// const AstGen = @import("AstGen.zig");
 const Ast = @import("ast.zig");
 const Io = std.Io;
 const process = std.process;
@@ -52,7 +52,7 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     std.debug.print("source \n {s} :source \n", .{source});
     var tree = try Ast.parse(allocator, source);
     defer tree.deinit(allocator);
-    try AstGen.generate(allocator, tree);
+    // try AstGen.generate(allocator, tree);
 
     std.debug.print("AST:\n", .{});
 
@@ -60,3 +60,5 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
         std.debug.print("Error: {any}", .{err.tag});
     }
 }
+
+test "simple test" {}

@@ -1,8 +1,9 @@
 const std = @import("std");
 const AstGen = @import("AstGen.zig");
-const Ast = @import("ast.zig");
+const Ast = @import("Ast.zig");
 const Sema = @import("Sema.zig");
 const InternPool = @import("Sema/InternPool.zig");
+const WatGen = @import("WatGen.zig");
 const Io = std.Io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
@@ -69,4 +70,10 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     for (tree.errors) |err| {
         std.debug.print("Error: {any}", .{err.tag});
     }
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    try WatGen.emit(allocator, &air, &ip, stdout);
+    try stdout.flush();
 }

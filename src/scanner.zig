@@ -51,6 +51,11 @@ pub const Scanner = struct {
                     result.loc.start = self.index;
                     continue :state .start;
                 },
+                '\n' => {
+                    self.index += 1;
+                    self.line += 1;
+                    continue :state .start;
+                },
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;

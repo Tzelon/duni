@@ -61,9 +61,29 @@ pub const Scanner = struct {
                     self.index += 1;
                     continue :state .number;
                 },
-                '-' => {
+                '(' => {
+                    result.tag = .l_paren;
                     self.index += 1;
+                },
+                ')' => {
+                    result.tag = .r_paren;
+                    self.index += 1;
+                },
+                '+' => {
+                    result.tag = .plus;
+                    self.index += 1;
+                },
+                '-' => {
                     result.tag = .minus;
+                    self.index += 1;
+                },
+                '*' => {
+                    result.tag = .star;
+                    self.index += 1;
+                },
+                '/' => {
+                    result.tag = .slash;
+                    self.index += 1;
                 },
                 else => continue :state .invalid,
             },
@@ -166,8 +186,12 @@ pub const Token = struct {
         equal,
         plus,
         minus,
-        asterisk,
+        star,
         slash,
+
+        // Single-character tokens.
+        l_paren,
+        r_paren,
 
         // End
         invalid,
@@ -184,7 +208,7 @@ pub const Token = struct {
                 .equal => "=",
                 .plus => "+",
                 .minus => "-",
-                .asterisk => "*",
+                .star => "*",
                 .slash => "/",
             };
         }
@@ -209,4 +233,5 @@ test "tokenizer" {
     try expectToken("-2", &.{ .minus, .number_literal });
     try expectToken("1e-5", &.{.number_literal});
     try expectToken("3.14", &.{.number_literal});
+    try expectToken("1 * (2 + 3) / 5 - 2", &.{ .number_literal, .star, .l_paren, .number_literal, .plus, .number_literal, .r_paren, .slash, .number_literal, .minus, .number_literal });
 }

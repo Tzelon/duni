@@ -18,5 +18,5 @@ test "basic add functionality" {
 }
 
 comptime {
-    _ = @import("Sema/InternPool.zig");
+    _ = @import("Sema.zig");
 }

@@ -1,6 +1,8 @@
 const std = @import("std");
 const AstGen = @import("AstGen.zig");
 const Ast = @import("ast.zig");
+const Sema = @import("Sema.zig");
+const InternPool = @import("Sema/InternPool.zig");
 const Io = std.Io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
@@ -50,11 +52,19 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     defer allocator.free(source);
 
     std.debug.print("source \n {s} :source \n", .{source});
+
     var tree = try Ast.parse(allocator, source);
     defer tree.deinit(allocator);
-    try AstGen.generate(allocator, tree);
 
-    std.debug.print("AST:\n", .{});
+    var dir = try AstGen.generate(allocator, tree);
+    defer dir.deinit(allocator);
+
+    var ip: InternPool = .{};
+    try ip.init(allocator);
+    defer ip.deinit(allocator);
+
+    var air = try Sema.analyze(allocator, dir, &ip);
+    defer air.deinit(allocator);
 
     for (tree.errors) |err| {
         std.debug.print("Error: {any}", .{err.tag});

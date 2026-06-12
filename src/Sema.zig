@@ -28,7 +28,7 @@ code: Dir,
 
 pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     var sema = Sema{ .gpa = gpa, .code = code };
-    sema.deinit();
+    defer sema.deinit();
 
     try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
 
@@ -44,6 +44,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
                 .data = .{ .un_op = ref },
             });
         },
+        // else => unreachable,
     };
 
     return .{ .instructions = sema.instructions.toOwnedSlice() };
@@ -52,4 +53,29 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 pub fn deinit(sema: *Sema) void {
     sema.instructions.deinit(sema.gpa);
     sema.* = undefined;
+}
+
+test "analyze int literal" {
+    const gpa = std.testing.allocator;
+
+    var insts: std.MultiArrayList(Dir.Inst) = .{};
+    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 42 } });
+    var dir = Dir{ .instructions = insts.toOwnedSlice() };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var air = try Sema.analyze(gpa, dir, &ip);
+    defer air.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), air.instructions.len);
+
+    const tags = air.instructions.items(.tag);
+    const datas = air.instructions.items(.data);
+    try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
+
+    const ip_index = datas[0].un_op.toInterned().?;
+    try std.testing.expectEqual(InternPool.Key{ .number = 42 }, ip.indexToKey(ip_index));
 }

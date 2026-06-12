@@ -210,6 +210,8 @@ pub const Token = struct {
                 .minus => "-",
                 .star => "*",
                 .slash => "/",
+                .l_paren => "(",
+                .r_paren => ")",
             };
         }
     };

@@ -18,7 +18,7 @@ const Dir = @import("Dir.zig");
 
 const Air = @import("Sema/Air.zig");
 
-const InternPool = @import("Sema/InternPool.zig");
+const InternPool = @import("InternPool.zig");
 
 gpa: Allocator,
 

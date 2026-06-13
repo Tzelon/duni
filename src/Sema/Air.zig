@@ -10,7 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 
-const InternPool = @import("InternPool.zig");
+const InternPool = @import("../InternPool.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
 

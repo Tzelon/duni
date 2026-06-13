@@ -5,12 +5,25 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Hash = std.hash.Wyhash;
 
-const Dir = @import("../Dir.zig");
+const Dir = @import("Dir.zig");
+
+const string = @import("string.zig");
+const NullTerminatedString = string.NullTerminatedString;
 
 // List of all constant items
 items: std.MultiArrayList(Item) = .empty,
 // A map to check if an item is already exists
 map: std.hash_map.HashMapUnmanaged(Index, void, Context, std.hash_map.default_max_load_percentage) = .empty,
+
+// parameter names, struct field names, enum tag names
+extra: std.ArrayList(u32) = .empty,
+
+// Flat byte buffer. Each interned string is followed by a 0 terminator.
+string_bytes: std.ArrayListUnmanaged(u8) = .empty,
+// Offset table. Entry `i` is the start of string `i` inside `string_bytes`.
+strings: std.ArrayListUnmanaged(u32) = .empty,
+// A map to check if a string is already exists
+string_map: std.hash_map.HashMapUnmanaged(NullTerminatedString, void, NullTerminatedString.Context, std.hash_map.default_max_load_percentage) = .empty,
 
 pub const Item = struct {
     tag: Tag,
@@ -59,6 +72,16 @@ pub const Key = union(enum) {
 
 pub fn init(ip: *InternPool, gpa: Allocator) !void {
     errdefer ip.deinit(gpa);
+
+    // Seed the string offsets table, then pre-intern "" at index 0.
+    try ip.strings.append(gpa, 0);
+    const empty_str = try ip.getString(gpa, "");
+    assert(empty_str == .empty);
+
+    for (&string.static_strings, 0..) |slice, expected_index| {
+        assert(try ip.getString(gpa, slice) == @as(NullTerminatedString, @enumFromInt(expected_index)));
+    }
+
     // This inserts all the statically-known values into the intern pool in the
     // order expected.
     for (&static_keys, 0..) |key, key_index| switch (@as(Index, @enumFromInt(key_index))) {
@@ -98,6 +121,28 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
     return new_index;
 }
 
+pub fn getString(ip: *InternPool, gpa: Allocator, slice: []const u8) Allocator.Error!NullTerminatedString {
+    const ctx: NullTerminatedString.Context = .{ .ip = ip };
+    const adapter: NullTerminatedString.Adapter = .{ .ip = ip };
+
+    // the new string is the position whose start-offset is already in `strings`.
+    // after we push the new end-sentinel, this index's slice is well-defined.
+    const new_index: NullTerminatedString = @enumFromInt(ip.strings.items.len - 1);
+
+    try ip.strings.ensureUnusedCapacity(gpa, 1);
+    try ip.string_bytes.ensureUnusedCapacity(gpa, slice.len + 1);
+
+    const gop = try ip.string_map.getOrPutContextAdapted(gpa, slice, adapter, ctx);
+    if (gop.found_existing) return gop.key_ptr.*;
+
+    ip.string_bytes.appendSliceAssumeCapacity(slice);
+    ip.string_bytes.appendAssumeCapacity(0);
+    ip.strings.appendAssumeCapacity(@intCast(ip.string_bytes.items.len));
+
+    gop.key_ptr.* = new_index;
+    return new_index;
+}
+
 pub fn indexToKey(ip: *const InternPool, index: Index) Key {
     assert(index != .none);
     const tag = ip.items.items(.tag)[@intFromEnum(index)];
@@ -115,6 +160,10 @@ pub fn deinit(
 ) void {
     ip.items.deinit(gpa);
     ip.map.deinit(gpa);
+    ip.string_bytes.deinit(gpa);
+    ip.strings.deinit(gpa);
+    ip.string_map.deinit(gpa);
+    ip.extra.deinit(gpa);
 }
 
 /// Stored-side context. The map holds `Index`es; we need the ip to
@@ -181,4 +230,19 @@ test "InternPool same key returns not the same index" {
     const c = try ip.get(gpa, .{ .number = 43 });
     try std.testing.expect(a == b);
     try std.testing.expect(a != c);
+}
+
+test "InternPool getString dedups identical bytes" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const a = try ip.getString(gpa, "foo");
+    const b = try ip.getString(gpa, "foo");
+    const c = try ip.getString(gpa, "bar");
+    try std.testing.expect(a == b);
+    try std.testing.expect(a != c);
+    try std.testing.expectEqualStrings("foo", a.toSlice(&ip));
+    try std.testing.expectEqualStrings("bar", c.toSlice(&ip));
 }

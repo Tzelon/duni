@@ -12,6 +12,9 @@ const Ast = @import("./Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 
+const string = @import("string.zig");
+const NullTerminatedString = string.NullTerminatedString;
+
 const log = std.log.scoped(.parser);
 
 pub const Error = error{ParseError} || Allocator.Error;
@@ -88,12 +91,46 @@ fn parsePrecedence(p: *Parse, precedence: Precedence) !Node.Index {
     return node;
 }
 
+/// take a list of Node.Index an return SubRange to extra_data
+fn listToSpan(p: *Parse, list: []const Node.Index) Allocator.Error!Node.SubRange {
+    try p.extra_data.appendSlice(p.gpa, @ptrCast(list));
+
+    return .{
+        .start = @enumFromInt(p.extra_data.items.len - list.len),
+        .end = @enumFromInt(p.extra_data.items.len),
+    };
+}
+
+/// append extra data to the extra_data list, can be any struct
+fn addExtra(p: *Parse, extra: anytype) Allocator.Error!Node.ExtraIndex {
+    const fields = std.meta.fields(@TypeOf(extra));
+    try p.extra_data.ensureUnusedCapacity(p.gpa, fields.len);
+    const result: ExtraIndex = @enumFromInt(p.extra_data.items.len);
+    inline for (fields) |field| {
+        const data: u32 = switch (field.type) {
+            Node.Index,
+            // Node.OptionalIndex,
+            // OptionalTokenIndex,
+            Node.ExtraIndex,
+            => @intFromEnum(@field(extra, field.name)),
+            TokenIndex,
+            => @field(extra, field.name),
+            else => @compileError("unexpected field type"),
+        };
+        p.extra_data.appendAssumeCapacity(data);
+    }
+    return result;
+}
+
 fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
     _ = self;
     const rule = switch (tag) {
-        // .minus => comptime ParseRule.init(Parse.unary, Parse.binary, .prec_term),
-        // .plus => comptime ParseRule.init(null, Parse.binary, .prec_term),
-        // .star => comptime ParseRule.init(null, Parse.binary, .prec_factor),
+        .l_paren => comptime ParseRule.init(Parse.grouping, null, .prec_call),
+        .r_paren => comptime ParseRule.init(null, null, .prec_none),
+        .minus => comptime ParseRule.init(Parse.unary, Parse.binary, .prec_term),
+        .plus => comptime ParseRule.init(null, Parse.binary, .prec_term),
+        .star => comptime ParseRule.init(null, Parse.binary, .prec_factor),
+        .slash => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         // .equal => comptime ParseRule.init(null, null, .prec_none),
         // .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
         // .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
@@ -115,6 +152,56 @@ fn number(p: *Parse) !Node.Index {
         .tag = .number_literal,
         .main_token = p.advance(),
         .data = undefined,
+    });
+}
+
+// example: -1
+fn unary(p: *Parse) !Node.Index {
+    const op_nts: NullTerminatedString = switch (p.token_tags[p.token_index]) {
+        .minus => .minus,
+        else => unreachable,
+    };
+
+    const operand = try p.parsePrecedence(.prec_unary);
+
+    const span = try p.listToSpan(&.{operand});
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{ .tag = .form, .main_token = p.advance(), .data = .{ .form = .{ .op = op_nts, .args = args } } });
+}
+
+/// example: 1 + 1
+fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
+    const op_nts: NullTerminatedString = switch (p.current()) {
+        .plus => .plus,
+        .minus => .minus,
+        .star => .star,
+        .slash => .slash,
+        else => unreachable,
+    };
+
+    const main_tk = p.token_index;
+    _ = p.advance();
+
+    const rule = p.getRule(p.current());
+    // We use one higher level of precedence for the right operand because the binary operators are left-associative.
+    const rhs = try p.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1));
+
+    const span = try p.listToSpan(&.{ lhs, rhs });
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{
+        .tag = .form,
+        .main_token = main_tk,
+        .data = .{ .form = .{ .op = op_nts, .args = args } },
+    });
+}
+
+fn grouping(p: *Parse) !Node.Index {
+    return p.addNode(.{
+        .tag = .grouped_expression,
+        .main_token = p.advance(),
+        .data = .{ .node_and_token = .{ try p.expression(), try p.consume(.r_paren) } },
     });
 }
 

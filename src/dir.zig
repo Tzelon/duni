@@ -11,6 +11,8 @@
 
 const Dir = @This();
 
+const builtin = @import("builtin");
+
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -18,6 +20,9 @@ const Allocator = std.mem.Allocator;
 const Ast = @import("Ast.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
+/// The meaning of this data is determined by `Inst.Tag` value.
+/// The first few indexes are reserved. See `ExtraIndex` for the values.
+extra: []u32,
 
 /// These are untyped instructions generated from an Abstract Syntax Tree.
 /// The data here is immutable because it is possible to have multiple
@@ -28,6 +33,22 @@ pub const Inst = struct {
 
     pub const Tag = enum(u8) {
         int,
+        /// Arithmetic addition, asserts no integer overflow.
+        /// Uses the `pl_node` union field. Payload is `Bin`.
+        add,
+        /// Arithmetic subtraction. Asserts no integer overflow.
+        /// Uses the `pl_node` union field. Payload is `Bin`.
+        sub,
+        /// Arithmetic multiplication. Asserts no integer overflow.
+        /// Uses the `pl_node` union field. Payload is `Bin`.
+        mul,
+        /// Implements the `@divTrunc` builtin.
+        /// Uses the `pl_node` union field with payload `Bin`.
+        div,
+        /// Arithmetic negation. Asserts no integer overflow.
+        /// Same as sub with a lhs of 0, split into a separate instruction to save memory.
+        /// Uses `un_node`.
+        negate,
     };
 
     /// The position of a DIR instruction within the `Dir` instructions array.
@@ -93,10 +114,45 @@ pub const Inst = struct {
     /// how to interpret the data within.
     pub const Data = union {
         int: u64,
+
+        /// Used for unary operators, with an AST node source location.
+        un_node: struct {
+            /// Offset from Decl AST node index.
+            src_node: Ast.Node.Offset,
+            /// The meaning of this operand depends on the corresponding `Tag`.
+            operand: Ref,
+        },
+
+        pl_node: struct {
+            /// Offset from Decl AST node index.
+            /// `Tag` determines which kind of AST node this points to.
+            src_node: Ast.Node.Offset,
+            /// index into extra.
+            /// `Tag` determines what lives there.
+            payload_index: u32,
+        },
+
+        bin: Bin,
+    };
+
+    // Make sure we don't accidentally add a field to make this union
+    // bigger than expected. Note that in Debug builds, Zig is allowed
+    // to insert a secret field for safety checks.
+    comptime {
+        if (builtin.mode != .Debug and builtin.mode != .ReleaseSafe) {
+            assert(@sizeOf(Data) == 8);
+        }
+    }
+
+    /// The meaning of these operands depends on the corresponding `Tag`.
+    pub const Bin = struct {
+        lhs: Ref,
+        rhs: Ref,
     };
 };
 
 pub fn deinit(code: *Dir, gpa: Allocator) void {
     code.instructions.deinit(gpa);
+    gpa.free(code.extra);
     code.* = undefined;
 }

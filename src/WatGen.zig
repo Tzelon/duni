@@ -8,7 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Air = @import("Sema/Air.zig");
-const InternPool = @import("Sema/InternPool.zig");
+const InternPool = @import("InternPool.zig");
 
 gpa: Allocator,
 air: *const Air,

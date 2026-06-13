@@ -1,3 +1,6 @@
+const std = @import("std");
+const assert = std.debug.assert;
+
 const TokenIndex = @import("../Ast.zig").TokenIndex;
 const NullTerminatedString = @import("../string.zig").NullTerminatedString;
 
@@ -21,14 +24,47 @@ pub const Tag = enum {
 pub const Data = union {
     node: Index,
     token: TokenIndex,
-    form: Form,
+    node_and_token: struct { Index, TokenIndex },
 
+    form: Form,
     extra: ExtraIndex,
 };
 
 pub const Index = enum(u32) {
     root = 0,
     _,
+
+    pub fn toOffset(base: Index, destination: Index) Offset {
+        const base_i64: i64 = @intFromEnum(base);
+        const destination_i64: i64 = @intFromEnum(destination);
+        return @enumFromInt(destination_i64 - base_i64);
+    }
+};
+
+/// A relative node index.
+pub const Offset = enum(i32) {
+    zero = 0,
+    _,
+
+    pub fn toOptional(o: Offset) OptionalOffset {
+        const result: OptionalOffset = @enumFromInt(@intFromEnum(o));
+        assert(result != .none);
+        return result;
+    }
+
+    pub fn toAbsolute(offset: Offset, base: Index) Index {
+        return @enumFromInt(@as(i64, @intFromEnum(base)) + @intFromEnum(offset));
+    }
+};
+
+/// A relative node index, or null.
+pub const OptionalOffset = enum(i32) {
+    none = std.math.maxInt(i32),
+    _,
+
+    pub fn unwrap(oo: OptionalOffset) ?Offset {
+        return if (oo == .none) null else @enumFromInt(@intFromEnum(oo));
+    }
 };
 
 pub const ExtraIndex = enum(u32) { _ };

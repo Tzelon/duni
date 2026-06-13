@@ -105,7 +105,7 @@ fn listToSpan(p: *Parse, list: []const Node.Index) Allocator.Error!Node.SubRange
 fn addExtra(p: *Parse, extra: anytype) Allocator.Error!Node.ExtraIndex {
     const fields = std.meta.fields(@TypeOf(extra));
     try p.extra_data.ensureUnusedCapacity(p.gpa, fields.len);
-    const result: ExtraIndex = @enumFromInt(p.extra_data.items.len);
+    const result: Node.ExtraIndex = @enumFromInt(p.extra_data.items.len);
     inline for (fields) |field| {
         const data: u32 = switch (field.type) {
             Node.Index,
@@ -157,17 +157,18 @@ fn number(p: *Parse) !Node.Index {
 
 // example: -1
 fn unary(p: *Parse) !Node.Index {
-    const op_nts: NullTerminatedString = switch (p.token_tags[p.token_index]) {
+    const op_nts: NullTerminatedString = switch (p.current()) {
         .minus => .minus,
         else => unreachable,
     };
 
+    const main_token = p.advance();
     const operand = try p.parsePrecedence(.prec_unary);
 
     const span = try p.listToSpan(&.{operand});
     const args = try p.addExtra(span);
 
-    return p.addNode(.{ .tag = .form, .main_token = p.advance(), .data = .{ .form = .{ .op = op_nts, .args = args } } });
+    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = op_nts, .args = args } } });
 }
 
 /// example: 1 + 1
@@ -180,10 +181,8 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
         else => unreachable,
     };
 
-    const main_tk = p.token_index;
-    _ = p.advance();
-
     const rule = p.getRule(p.current());
+    const main_token = p.advance();
     // We use one higher level of precedence for the right operand because the binary operators are left-associative.
     const rhs = try p.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1));
 
@@ -192,17 +191,17 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
 
     return p.addNode(.{
         .tag = .form,
-        .main_token = main_tk,
+        .main_token = main_token,
         .data = .{ .form = .{ .op = op_nts, .args = args } },
     });
 }
 
 fn grouping(p: *Parse) !Node.Index {
-    return p.addNode(.{
-        .tag = .grouped_expression,
-        .main_token = p.advance(),
-        .data = .{ .node_and_token = .{ try p.expression(), try p.consume(.r_paren) } },
-    });
+    _ = p.advance();
+    const inner = try p.expression();
+    _ = try p.consume(.r_paren);
+
+    return inner;
 }
 
 const ParsePrefixFn = *const fn (parser: *Parse) Error!Node.Index;
@@ -264,6 +263,21 @@ fn advance(p: *Parse) TokenIndex {
     return result;
 }
 
+/// return true if the current token has the given tag
+fn check(p: *Parse, expected_tag: Token.Tag) bool {
+    return p.tokens.items(.tag)[p.token_index] == expected_tag;
+}
+
+/// consume the current token only if the current token matches the type
+fn consume(p: *Parse, expected_tag: Token.Tag) !TokenIndex {
+    if (!p.check(expected_tag)) {
+        log.err("failed to consume {}\n", .{expected_tag});
+        return p.failExpected(expected_tag);
+    }
+
+    return p.advance();
+}
+
 // Helpers messages
 fn warnExpected(p: *Parse, expected_token: Token.Tag) error{OutOfMemory}!void {
     @branchHint(.cold);
@@ -298,4 +312,13 @@ fn failMsg(p: *Parse, msg: Ast.Error) error{ ParseError, OutOfMemory } {
     @branchHint(.cold);
     try p.warnMsg(msg);
     return error.ParseError;
+}
+
+fn failExpected(p: *Parse, expected_token: Token.Tag) error{ ParseError, OutOfMemory } {
+    @branchHint(.cold);
+    return p.failMsg(.{
+        .tag = .expected_token,
+        .token = p.token_index,
+        .extra = .{ .expected_tag = expected_token },
+    });
 }

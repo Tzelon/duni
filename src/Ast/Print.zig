@@ -47,5 +47,15 @@ fn visit(self: *Print, node: Node.Index) !void {
         // node: single child expression.
         .root => try self.visit(datas[i].node),
         .number_literal => {},
+        .form => {
+            const form = datas[i].form;
+            const sr_pos = @intFromEnum(form.args);
+            const start = tree.extra_data[sr_pos];
+            const end = tree.extra_data[sr_pos + 1];
+            for (start..end) |j| {
+                const child: Node.Index = @enumFromInt(tree.extra_data[j]);
+                try self.visit(child);
+            }
+        },
     }
 }

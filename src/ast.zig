@@ -7,6 +7,7 @@ const Ast = @This();
 
 const std = @import("std");
 const assert = std.debug.assert;
+const mem = std.mem;
 const Allocator = std.mem.Allocator;
 
 const scan = @import("scanner.zig");
@@ -14,6 +15,9 @@ const Scanner = scan.Scanner;
 const Token = scan.Token;
 
 const Parse = @import("Parse.zig");
+
+const string = @import("string.zig");
+const NullTerminatedString = string.NullTerminatedString;
 
 pub const Node = @import("./Ast/Node.zig");
 
@@ -120,6 +124,40 @@ pub fn nodeData(tree: *const Ast, node: Node.Index) Node.Data {
     return tree.nodes.items(.data)[@intFromEnum(node)];
 }
 
+pub fn formOp(tree: *const Ast, node: Node.Index) NullTerminatedString {
+    assert(tree.nodeTag(node) == .form);
+    return tree.nodeData(node).form.op;
+}
+
+pub fn formArgs(tree: *const Ast, node: Node.Index) []const Node.Index {
+    assert(tree.nodeTag(node) == .form);
+    const extra = tree.extraData(tree.nodeData(node).form.args, Node.SubRange);
+    return tree.extraDataSlice(extra, Node.Index);
+}
+
+// Helpers extra data
+
+///  return extra_data from a SubRange
+pub fn extraDataSlice(tree: Ast, range: Node.SubRange, comptime T: type) []const T {
+    return @ptrCast(tree.extra_data[@intFromEnum(range.start)..@intFromEnum(range.end)]);
+}
+
+// return node extra_data
+pub fn extraData(tree: Ast, index: Node.ExtraIndex, comptime T: type) T {
+    const info = @typeInfo(T).@"struct";
+    var result: T = undefined;
+    inline for (info.fields, 0..) |field, i| {
+        @field(result, field.name) = switch (field.type) {
+            Node.Index,
+            Node.ExtraIndex,
+            => @enumFromInt(tree.extra_data[@intFromEnum(index) + i]),
+            TokenIndex => tree.extra_data[@intFromEnum(index) + i],
+            else => @compileError("unexpected field type: " ++ @typeName(field.type)),
+        };
+    }
+    return result;
+}
+
 // Helpers tokens - yes there is the same helpers in Parse.zig
 
 /// return the lexeme of a token
@@ -148,6 +186,11 @@ pub fn tokenStart(tree: *const Ast, token_index: TokenIndex) ByteOffset {
 
 pub fn tokenTag(tree: *const Ast, token_index: TokenIndex) Token.Tag {
     return tree.tokens.items(.tag)[token_index];
+}
+
+pub fn tokensOnSameLine(tree: Ast, token1: TokenIndex, token2: TokenIndex) bool {
+    const source = tree.source[tree.tokenStart(token1)..tree.tokenStart(token2)];
+    return mem.findScalar(u8, source, '\n') == null;
 }
 
 fn dump(tree: *const Ast) !void {
@@ -189,6 +232,107 @@ pub const Error = struct {
     };
 };
 
+pub const Span = struct {
+    start: u32,
+    end: u32,
+    main: u32,
+};
+
+pub fn nodeToSpan(tree: *const Ast, node: Ast.Node.Index) Span {
+    return tokensToSpan(
+        tree,
+        tree.firstToken(node),
+        tree.lastToken(node),
+        tree.nodeMainToken(node),
+    );
+}
+
+pub fn tokenToSpan(tree: *const Ast, token: Ast.TokenIndex) Span {
+    return tokensToSpan(tree, token, token, token);
+}
+
+pub fn tokensToSpan(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, main: Ast.TokenIndex) Span {
+    var start_tok = start;
+    var end_tok = end;
+
+    if (tree.tokensOnSameLine(start, end)) {
+        // do nothing
+    } else if (tree.tokensOnSameLine(start, main)) {
+        end_tok = main;
+    } else if (tree.tokensOnSameLine(main, end)) {
+        start_tok = main;
+    } else {
+        start_tok = main;
+        end_tok = main;
+    }
+    const start_off = tree.tokenStart(start_tok);
+    const end_off = tree.tokenStart(end_tok) + @as(u32, @intCast(tree.tokenSlice(end_tok).len));
+    return Span{ .start = start_off, .end = end_off, .main = tree.tokenStart(main) };
+}
+
+
+
+pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
+    var n = node;
+    while (true) switch (tree.nodeTag(n)) {
+        .root => n = tree.nodeData(n).node,
+        .number_literal => return tree.nodeMainToken(n),
+        .form => {
+            const args = tree.formArgs(n);
+            // Unary form: operator (main_token) sits to the left of its single arg.
+            if (args.len == 1) return tree.nodeMainToken(n);
+            n = args[0];
+        },
+    };
+}
+
+pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
+    var n = node;
+    while (true) switch (tree.nodeTag(n)) {
+        .root => n = tree.nodeData(n).node,
+        .number_literal => return tree.nodeMainToken(n),
+        .form => {
+            const args = tree.formArgs(n);
+            n = args[args.len - 1];
+        },
+    };
+}
+
+const Expected = union(enum) {
+    number_literal,
+    form: struct {
+        op: NullTerminatedString,
+        args: []const Expected,
+    },
+};
+
+fn expectAst(source: [:0]const u8, expected: Expected) !void {
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expect(tree.errors.len == 0);
+
+    const top = tree.nodes.items(.data)[0].node;
+    try expectNode(&tree, top, expected);
+}
+
+fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
+    switch (expected) {
+        .number_literal => try std.testing.expectEqual(
+            Node.Tag.number_literal,
+            tree.nodeTag(node),
+        ),
+        .form => |f| {
+            try std.testing.expectEqual(Node.Tag.form, tree.nodeTag(node));
+            try std.testing.expectEqual(f.op, tree.formOp(node));
+            const args = tree.formArgs(node);
+            try std.testing.expectEqual(f.args.len, args.len);
+            for (f.args, args) |exp_child, actual_child| {
+                try expectNode(tree, actual_child, exp_child);
+            }
+        },
+    }
+}
+
 fn expectParse(source: [:0]const u8, expected: []const Node.Tag) !void {
     var tree = try Ast.parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);
@@ -197,11 +341,72 @@ fn expectParse(source: [:0]const u8, expected: []const Node.Tag) !void {
 }
 
 test "parser" {
-    try expectParse("42", &.{ .root, .number_literal });
+    try expectAst("42", .number_literal);
+}
+
+test "left associative & precedence" {
+    // zig fmt: off
+    try expectAst("1 + 1 * 2", .{ 
+        .form = .{ 
+            .op = .plus,
+            .args = &.{ 
+                .number_literal, .{ 
+                    .form = .{ 
+                        .op = .star,
+                        .args = &.{ .number_literal, .number_literal } 
+                    } 
+                }
+            }
+        } 
+    });
+    // zig fmt: on
+
+    // zig fmt: off
+    try expectAst("1 + (1 - 2) * 2", .{
+        .form = .{
+            .op = .plus,
+            .args = &.{
+                .number_literal,
+                .{
+                    .form = .{
+                        .op = .star,
+                        .args = &.{
+                            .{
+                                .form = .{
+                                    .op = .minus,
+                                    .args = &.{ .number_literal, .number_literal },
+                                },
+                            },
+                            .number_literal
+
+                        }
+                    },
+                },
+            },
+        },
+    });
+    // zig fmt: on
+
+    // zig fmt: off
+      try expectAst("1 - 2 - 3", .{
+          .form = .{
+              .op = .minus,
+              .args = &.{
+                  .{
+                      .form = .{
+                          .op = .minus,
+                          .args = &.{ .number_literal, .number_literal },
+                      },
+                  },
+                  .number_literal,
+              },
+          },
+      });
+      // zig fmt: on
 }
 
 test "dump" {
-    var tree = try Ast.parse(std.testing.allocator, "42_2");
+    var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3");
     defer tree.deinit(std.testing.allocator);
     try tree.dump();
 }

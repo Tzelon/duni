@@ -24,6 +24,10 @@ instructions: std.MultiArrayList(Inst).Slice,
 /// The first few indexes are reserved. See `ExtraIndex` for the values.
 extra: []u32,
 
+// TODO: temp until we have body tag
+main_body_start: u32,
+main_body_len: u32,
+
 /// These are untyped instructions generated from an Abstract Syntax Tree.
 /// The data here is immutable because it is possible to have multiple
 /// analyses on the same DIR happening at the same time.
@@ -150,6 +154,43 @@ pub const Inst = struct {
         rhs: Ref,
     };
 };
+
+fn ExtraData(comptime T: type) type {
+    return struct { data: T, end: usize };
+}
+
+/// Returns the requested data, as well as the new index which is at the start of the
+/// trailers for the object.
+pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
+    const info = @typeInfo(T).@"struct";
+    var i: usize = index;
+    var result: T = undefined;
+    inline for (info.fields) |field| {
+        @field(result, field.name) = switch (field.type) {
+            u32 => code.extra[i],
+
+            Inst.Ref,
+            Inst.Index,
+            Ast.Node.Index,
+            => @enumFromInt(code.extra[i]),
+
+            Ast.Node.Offset,
+            Ast.Node.OptionalOffset,
+            => @enumFromInt(@as(i32, @bitCast(code.extra[i]))),
+
+            else => @compileError("bad field type"),
+        };
+        i += 1;
+    }
+    return .{
+        .data = result,
+        .end = i,
+    };
+}
+
+pub fn bodySlice(dir: Dir, start: usize, len: usize) []Inst.Index {
+    return @ptrCast(dir.extra[start..][0..len]);
+}
 
 pub fn deinit(code: *Dir, gpa: Allocator) void {
     code.instructions.deinit(gpa);

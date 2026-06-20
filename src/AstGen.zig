@@ -33,12 +33,28 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     // as AST nodes.
     try astgen.instructions.ensureTotalCapacity(gpa, tree.nodes.len);
 
+    try astgen.extra.ensureTotalCapacity(gpa, tree.nodes.len);
+
     const root_data = tree.nodes.items(.data)[0];
     _ = try astgen.expr(root_data.node);
 
+    // TODO: this is super hacky for now, when we do not have proper body
+    // Append the body slice: every emitted instruction is part of the main body.
+    const body_len: u32 = @intCast(astgen.instructions.len);
+    const main_body_start: u32 = @intCast(astgen.extra.items.len);
+    try astgen.extra.ensureUnusedCapacity(gpa, body_len);
+    for (0..body_len) |i| {
+        astgen.extra.appendAssumeCapacity(@intCast(i));
+    }
+
     try astgen.extra.shrinkToLen(gpa);
 
-    return .{ .instructions = astgen.instructions.toOwnedSlice(), .extra = astgen.extra.toOwnedSliceAssert() };
+    return .{
+        .instructions = astgen.instructions.toOwnedSlice(),
+        .extra = astgen.extra.toOwnedSliceAssert(),
+        .main_body_start = main_body_start,
+        .main_body_len = body_len,
+    };
 }
 
 fn expr(astgen: *AstGen, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {

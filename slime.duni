@@ -1,0 +1,44 @@
+platform terminal
+from platform import draw_chart, clear_screen
+
+
+struct Vec2 { x number = 0, y number = 0 }
+
+
+struct State { 
+	pos Vec2 = Vec2{ x: 5, y: 10 } 
+	velocity Vec2 = Vec2{ x: 10, y: 0 } // type is optional
+}
+
+fn init() State { State{} }
+
+fn tick(state State, delta number) State {
+    new_x = state.pos.x + state.velocity.x * delta
+    new_vx = state.velocity.x
+    if new_x < 1 or new_x > 38 {
+        new_vx = -state.velocity.x
+        new_x = state.pos.x
+    }
+    State{ 
+		pos: Vec2{ x: new_x, y: state.pos.y }, 
+		velocity: Vec2{ x: new_vx, y: 0 } 
+	}
+}
+
+fn render(state State) {
+	clear_screen()
+	draw_chart(state.pos.x, state.pos.y, "s")
+}
+
+fn loop(state State, last_time number) State {
+	now = time_now()
+    delta = now - last_time
+    next = tick(state, delta)
+    render(next)
+    sleep_ms(100)
+    loop(next, now)              // tail call — compiles to return_call
+}
+
+fn main() {
+    loop(init(), time_now())
+}

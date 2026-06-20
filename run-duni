@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Built with Claude — do not use in prod.
+# Compile a .duni file to WAT, assemble to wasm, run, print result.
+# Usage: ./run-duni path/to/file.duni
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $0 <file.duni>" >&2
+  exit 64
+fi
+
+src="$1"
+wat="/tmp/duni.wat"
+wasm="/tmp/duni.wasm"
+
+zig build run -- "$src" 2>/dev/null >"$wat"
+wat2wasm "$wat" -o "$wasm"
+wasmtime run --invoke main "$wasm"

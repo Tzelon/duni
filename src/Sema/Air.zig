@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const InternPool = @import("../InternPool.zig");
+const Value = @import("../Value.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
 
@@ -83,6 +84,10 @@ pub const Inst = struct {
                 },
             };
         }
+
+        pub fn fromValue(v: Value) Ref {
+            return .fromInterned(v.toIntern());
+        }
     };
 
     /// All instructions have an 8-byte payload, which is contained within
@@ -92,6 +97,10 @@ pub const Inst = struct {
         un_op: Ref,
     };
 };
+
+pub fn internedToRef(ip_index: InternPool.Index) Inst.Ref {
+    return .fromInterned(ip_index);
+}
 
 pub fn deinit(air: *Air, gpa: std.mem.Allocator) void {
     air.instructions.deinit(gpa);

@@ -14,7 +14,11 @@ const Allocator = mem.Allocator;
 const assert = std.debug.assert;
 const log = std.log.scoped(.sema);
 
+const arith = @import("Sema/arith.zig");
+
 const Dir = @import("Dir.zig");
+
+const Value = @import("Value.zig");
 
 const Air = @import("Sema/Air.zig");
 
@@ -45,7 +49,10 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
         const i = @intFromEnum(inst_idx);
         const air_ref = switch (tags[i]) {
             .int => try sema.dirInt(ip, inst_idx),
-            .add => try sema.dirArithmetic(ip, inst_idx),
+            .add => try sema.dirArithmetic(ip, .add, inst_idx),
+            .sub => try sema.dirArithmetic(ip, .sub, inst_idx),
+            .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
+            .div => try sema.dirDiv(ip, inst_idx),
             else => unreachable,
         };
 
@@ -74,6 +81,7 @@ fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
 fn dirArithmetic(
     sema: *Sema,
     ip: *InternPool,
+    dir_tag: Dir.Inst.Tag,
     inst: Dir.Inst.Index,
 ) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -81,23 +89,53 @@ fn dirArithmetic(
     const lhs = sema.resolveInst(extra.lhs);
     const rhs = sema.resolveInst(extra.rhs);
 
-    return sema.analyzeArithmetic(ip, lhs, rhs);
+    return sema.analyzeArithmetic(ip, dir_tag, lhs, rhs);
 }
 
-fn analyzeArithmetic(sema: *Sema, ip: *InternPool, lhs: Air.Inst.Ref, rhs: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: Air.Inst.Ref, rhs: Air.Inst.Ref) CompileError!Air.Inst.Ref {
     //TODO: we assume everything is comptime know and we can fold. this will not be true in the future
-    const lhs_ip = lhs.toInterned().?;
-    const rhs_ip = rhs.toInterned().?;
+    const maybe_lhs_val = sema.resolveValue(lhs);
+    const maybe_rhs_val = sema.resolveValue(rhs);
 
-    const lhs_n = ip.indexToKey(lhs_ip).number;
-    const rhs_n = ip.indexToKey(rhs_ip).number;
+    if (maybe_lhs_val) |lhs_val| {
+        if (maybe_rhs_val) |rhs_val| {
+            const result_val = switch (dir_tag) {
+                .add => try arith.comptimeIntAdd(sema, ip, lhs_val, rhs_val),
+                .sub => try arith.comptimeIntSub(sema, ip, lhs_val, rhs_val),
+                .mul => try arith.comptimeIntMul(sema, ip, lhs_val, rhs_val),
+                else => unreachable,
+            };
+            return Air.internedToRef(result_val.toIntern());
+        }
+    }
 
-    const sum = std.math.add(u32, lhs_n, rhs_n) catch return error.AnalysisFail;
+    //TODO: We only support comptime known values
+    unreachable;
+}
 
-    const result_ip = try ip.get(sema.gpa, .{ .number = sum });
-    const result_ref = Air.Inst.Ref.fromInterned(result_ip);
+fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    // Expend when any of these lands in Duni:
+    //- A second number type that triggers peer-type resolution.
+    //- Floats (different div semantics).
+    // - Vector types.
+    // - Runtime division with safety wraps (the day Sema stops being fold-only).
 
-    return result_ref;
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.code.extraData(Dir.Inst.Bin, inst_data.payload_index).data;
+    const lhs = sema.resolveInst(extra.lhs);
+    const rhs = sema.resolveInst(extra.rhs);
+
+    //TODO: we assume everything is comptime know and we can fold. this will not be true in the future
+    const maybe_lhs_val = sema.resolveValue(lhs);
+    const maybe_rhs_val = sema.resolveValue(rhs);
+
+    if (maybe_lhs_val) |lhs_val| {
+        if (maybe_rhs_val) |rhs_val| {
+            return .fromValue(try arith.intDivTrunc(sema, ip, lhs_val, rhs_val));
+        }
+    }
+
+    unreachable;
 }
 
 fn resolveInst(sema: *Sema, dir_ref: Dir.Inst.Ref) Air.Inst.Ref {
@@ -108,6 +146,18 @@ fn resolveInst(sema: *Sema, dir_ref: Dir.Inst.Ref) Air.Inst.Ref {
     // First section of indexes correspond to a set number of constant values.
     // We intentionally map the same indexes to the same values between DIR and AIR.
     return @enumFromInt(@intFromEnum(dir_ref));
+}
+
+/// Return the Value corresponding to a given AIR ref, or `null` if it refers to a runtime value.
+fn resolveValue(sema: *Sema, inst: Air.Inst.Ref) ?Value {
+    _ = sema;
+    assert(inst != .none);
+
+    if (inst.toInterned()) |ip_index| {
+        return .fromInterned(ip_index);
+    }
+
+    return null;
 }
 
 pub fn deinit(sema: *Sema) void {
@@ -268,10 +318,10 @@ test "analyze 1 + 2" {
     //   [1] = Bin.rhs = ref(%1)
     //   [2..5] = body indices [0, 1, 2]
     var insts: std.MultiArrayList(Dir.Inst) = .{};
-    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
     try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
+    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
     try insts.append(gpa, .{
-        .tag = .add,
+        .tag = .sub,
         .data = .{ .pl_node = .{
             .src_node = @enumFromInt(0),
             .payload_index = 0,
@@ -310,5 +360,5 @@ test "analyze 1 + 2" {
     try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
 
     const ip_index = datas[0].un_op.toInterned().?;
-    try std.testing.expectEqual(InternPool.Key{ .number = 3 }, ip.indexToKey(ip_index));
+    try std.testing.expectEqual(InternPool.Key{ .number = 1 }, ip.indexToKey(ip_index));
 }

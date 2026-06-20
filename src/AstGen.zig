@@ -254,40 +254,11 @@ fn deinit(astgen: *AstGen, gpa: Allocator) void {
     astgen.extra.deinit(gpa);
 }
 
-fn expectDir(source: [:0]const u8, expected: []const Dir.Inst) !void {
-    const gpa = std.testing.allocator;
-
-    var tree = try Ast.parse(gpa, source);
-    defer tree.deinit(gpa);
-    try std.testing.expect(tree.errors.len == 0);
-
-    var dir = try AstGen.generate(gpa, tree);
-    defer dir.deinit(gpa);
-
-    const tags = dir.instructions.items(.tag);
-    const datas = dir.instructions.items(.data);
-    try std.testing.expectEqual(expected.len, dir.instructions.len);
-
-    for (expected, tags, datas) |exp, tag, data| {
-        try std.testing.expectEqual(exp.tag, tag);
-        switch (exp.tag) {
-            .int => try std.testing.expectEqual(exp.data.int, data.int),
-            else => unreachable,
-        }
-    }
-}
-
-test "int literal" {
-    try expectDir("42", &.{
-        .{ .tag = .int, .data = .{ .int = 42 } },
-    });
-}
-
-test "print 1 + 2" {
+fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     const Print = @import("print_dir.zig");
     const gpa = std.testing.allocator;
 
-    var tree = try Ast.parse(gpa, "1 + 2");
+    var tree = try Ast.parse(gpa, source);
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
@@ -298,10 +269,43 @@ test "print 1 + 2" {
     var w = std.Io.Writer.fixed(&buf);
     try Print.print(&dir, &tree, &w);
 
-    try std.testing.expectEqualStrings(
+    try std.testing.expectEqualStrings(expected, w.buffer[0..w.end]);
+}
+
+test "int literal" {
+    try expect("42",
+        \\%0 = int(42)
+        \\
+    );
+}
+
+test "simple binary op" {
+    try expect("1 + 2",
         \\%0 = int(1)
         \\%1 = int(2)
         \\%2 = add(%0, %1) node_offset:1:1 to :1:6
         \\
-    , w.buffer[0..w.end]);
+    );
+
+    try expect("1 + 2 * 5 / 10",
+        \\%0 = int(1)
+        \\%1 = int(2)
+        \\%2 = int(5)
+        \\%3 = mul(%1, %2) node_offset:1:5 to :1:10
+        \\%4 = int(10)
+        \\%5 = div(%3, %4) node_offset:1:5 to :1:15
+        \\%6 = add(%0, %5) node_offset:1:1 to :1:15
+        \\
+    );
+
+    try expect("1 * (2 - 5) / 10",
+        \\%0 = int(1)
+        \\%1 = int(2)
+        \\%2 = int(5)
+        \\%3 = sub(%1, %2) node_offset:1:6 to :1:11
+        \\%4 = mul(%0, %3) node_offset:1:1 to :1:11
+        \\%5 = int(10)
+        \\%6 = div(%4, %5) node_offset:1:1 to :1:17
+        \\
+    );
 }

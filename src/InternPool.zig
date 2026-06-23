@@ -48,13 +48,26 @@ pub const Index = enum(u32) {
 
 pub const Key = union(enum) {
     simple_type: SimpleType,
-    number: u32,
+    number: Number,
 
     /// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
     /// implement logic that only wants to deal with types because the logic can
     /// ignore all simple values. Note that technically, types are values.
     pub const SimpleType = enum(u32) {
         comptime_number = @intFromEnum(Index.number_type),
+    };
+
+    /// A comptime-known `number`. The intern pool stores it in the most compact
+    /// form that fits (see `Tag`), but the decoded key is always normalized:
+    /// integers as `i64`, floats as `f64`. This normalization is what makes the
+    /// dedup round-trip (`get` then `indexToKey`) stable.
+    pub const Number = struct {
+        storage: Storage,
+
+        pub const Storage = union(enum) {
+            int: i64,
+            float: f64,
+        };
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
@@ -65,7 +78,10 @@ pub const Key = union(enum) {
 
         return switch (key) {
             .simple_type => |x| Hash.hash(seed, asBytes(&x)),
-            .number => |n| Hash.hash(seed, asBytes(&n)),
+            .number => |n| switch (n.storage) {
+                .int => |v| Hash.hash(seed, asBytes(&v)),
+                .float => |v| Hash.hash(seed, asBytes(&v)),
+            },
         };
     }
 };
@@ -112,13 +128,41 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
                 .data = 0, // avoid writing `undefined` bits to a file
             });
         },
-        .number => |number| {
-            ip.items.appendAssumeCapacity(.{ .tag = .number_32, .data = number });
+        .number => |number| switch (number.storage) {
+            .int => |value| if (value >= std.math.minInt(i32) and value <= std.math.maxInt(i32)) {
+                // Fits inline: bitcast the i32 into the item's `data` word.
+                ip.items.appendAssumeCapacity(.{
+                    .tag = .number_i32,
+                    .data = @bitCast(@as(i32, @intCast(value))),
+                });
+            } else {
+                const extra_index = try ip.addExtraU64(gpa, @bitCast(value));
+                ip.items.appendAssumeCapacity(.{ .tag = .number_i64, .data = extra_index });
+            },
+            .float => |value| {
+                const extra_index = try ip.addExtraU64(gpa, @bitCast(value));
+                ip.items.appendAssumeCapacity(.{ .tag = .number_f64, .data = extra_index });
+            },
         },
     }
 
     gop.key_ptr.* = new_index;
     return new_index;
+}
+
+/// Append a 64-bit payload to `extra` as two `u32` words (low, high) and return
+/// the index of the first word. Used to spill numbers wider than `Item.data`.
+fn addExtraU64(ip: *InternPool, gpa: Allocator, bits: u64) Allocator.Error!u32 {
+    const extra_index: u32 = @intCast(ip.extra.items.len);
+    try ip.extra.appendSlice(gpa, &.{ @truncate(bits), @truncate(bits >> 32) });
+    return extra_index;
+}
+
+/// Read back a 64-bit payload previously stored by `addExtraU64`.
+fn getExtraU64(ip: *const InternPool, extra_index: u32) u64 {
+    const low: u64 = ip.extra.items[extra_index];
+    const high: u64 = ip.extra.items[extra_index + 1];
+    return low | (high << 32);
 }
 
 pub fn getString(ip: *InternPool, gpa: Allocator, slice: []const u8) Allocator.Error!NullTerminatedString {
@@ -150,7 +194,9 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
 
     return switch (tag) {
         .simple_type => .{ .simple_type = @enumFromInt(@intFromEnum(index)) },
-        .number_32 => .{ .number = data },
+        .number_i32 => .{ .number = .{ .storage = .{ .int = @as(i32, @bitCast(data)) } } },
+        .number_i64 => .{ .number = .{ .storage = .{ .int = @bitCast(ip.getExtraU64(data)) } } },
+        .number_f64 => .{ .number = .{ .storage = .{ .float = @bitCast(ip.getExtraU64(data)) } } },
     };
 }
 
@@ -201,7 +247,12 @@ pub const Tag = enum(u8) {
     /// A type that can be represented with only an enum tag.
     simple_type,
 
-    number_32,
+    /// An integer that fits `i32`. `data` is the value, bitcast to `u32`.
+    number_i32,
+    /// An integer that needs `i64`. `data` indexes `extra` (two words: low, high).
+    number_i64,
+    /// A 64-bit float. `data` indexes `extra` (two words: low, high).
+    number_f64,
 };
 
 pub const static_keys: [static_len]Key = .{.{ .simple_type = .comptime_number }};
@@ -218,18 +269,56 @@ test "InternPool same key returns same index" {
     try std.testing.expect(a == b);
 }
 
-test "InternPool same key returns not the same index" {
+fn internInt(ip: *InternPool, gpa: Allocator, value: i64) !Index {
+    return ip.get(gpa, .{ .number = .{ .storage = .{ .int = value } } });
+}
+
+fn internFloat(ip: *InternPool, gpa: Allocator, value: f64) !Index {
+    return ip.get(gpa, .{ .number = .{ .storage = .{ .float = value } } });
+}
+
+test "InternPool same number returns same index, distinct values differ" {
     const gpa = std.testing.allocator;
 
     var ip: InternPool = .{};
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    const a = try ip.get(gpa, .{ .number = 42 });
-    const b = try ip.get(gpa, .{ .number = 42 });
-    const c = try ip.get(gpa, .{ .number = 43 });
+    const a = try internInt(&ip, gpa, 42);
+    const b = try internInt(&ip, gpa, 42);
+    const c = try internInt(&ip, gpa, 43);
     try std.testing.expect(a == b);
     try std.testing.expect(a != c);
+}
+
+test "InternPool narrows by value and round-trips" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    // Fits i32 -> stored compactly as number_i32.
+    const small = try internInt(&ip, gpa, 5);
+    try std.testing.expectEqual(Tag.number_i32, ip.items.items(.tag)[@intFromEnum(small)]);
+    try std.testing.expectEqual(@as(i64, 5), ip.indexToKey(small).number.storage.int);
+
+    // Negative still fits i32.
+    const negative = try internInt(&ip, gpa, -7);
+    try std.testing.expectEqual(Tag.number_i32, ip.items.items(.tag)[@intFromEnum(negative)]);
+    try std.testing.expectEqual(@as(i64, -7), ip.indexToKey(negative).number.storage.int);
+
+    // Beyond i32 -> spills to number_i64.
+    const big = try internInt(&ip, gpa, 5_000_000_000);
+    try std.testing.expectEqual(Tag.number_i64, ip.items.items(.tag)[@intFromEnum(big)]);
+    try std.testing.expectEqual(@as(i64, 5_000_000_000), ip.indexToKey(big).number.storage.int);
+
+    // Float round-trips and dedups.
+    const f = try internFloat(&ip, gpa, 2.5);
+    const f2 = try internFloat(&ip, gpa, 2.5);
+    try std.testing.expectEqual(Tag.number_f64, ip.items.items(.tag)[@intFromEnum(f)]);
+    try std.testing.expect(f == f2);
+    try std.testing.expectEqual(@as(f64, 2.5), ip.indexToKey(f).number.storage.float);
 }
 
 test "InternPool getString dedups identical bytes" {

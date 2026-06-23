@@ -79,24 +79,24 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, sign: Sign) InnerError!D
     const result: Dir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
         .int => |num| switch (num) {
             0 => if (sign == .positive) try astgen.addInt(num) else {
-                std.log.err("0 cannot be negative", .{});
+                std.debug.print("error: 0 cannot be negative\n", .{});
                 return error.AnalysisFail;
             },
 
             else => try astgen.addInt(num),
         },
         .big_int => {
-            // TODO(tzelon): support big int
-            std.log.err("implement big_int", .{});
+            std.debug.print("error: integer literal exceeds 64-bit range\n", .{});
             return error.AnalysisFail;
         },
         .float => {
-            // TODO(tzelon): support big int
-            std.log.err("implement big_int", .{});
+            // Float literals are designed-in but not lowered yet; only division
+            // produces a float for now.
+            std.debug.print("error: float literals not yet supported\n", .{});
             return error.AnalysisFail;
         },
         .failure => {
-            std.log.err("failed to parse literal number", .{});
+            std.debug.print("error: failed to parse literal number\n", .{});
             return error.AnalysisFail;
         },
     };

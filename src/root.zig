@@ -19,4 +19,5 @@ test "basic add functionality" {
 
 comptime {
     _ = @import("Sema.zig");
+    _ = @import("pipeline_test.zig");
 }

@@ -72,9 +72,14 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
 fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const int = sema.code.instructions.items(.data)[@intFromEnum(inst)].int;
-    // TODO: we shouldn't @intCast here, need to handle big int properly.
-    assert(int <= std.math.maxInt(u32)); // protect TODO
-    const ip_index = try ip.get(sema.gpa, .{ .number = @intCast(int) });
+    // Literals arrive as an unsigned magnitude (negation is a separate op). The
+    // compact `number` representation tops out at signed 64-bit, which is also
+    // WASM's largest integer.
+    if (int > std.math.maxInt(i64)) {
+        std.debug.print("error: integer literal exceeds 64-bit range\n", .{});
+        return error.AnalysisFail;
+    }
+    const ip_index = try ip.get(sema.gpa, .{ .number = .{ .storage = .{ .int = @intCast(int) } } });
     return Air.Inst.Ref.fromInterned(ip_index);
 }
 
@@ -131,7 +136,7 @@ fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
 
     if (maybe_lhs_val) |lhs_val| {
         if (maybe_rhs_val) |rhs_val| {
-            return .fromValue(try arith.intDivTrunc(sema, ip, lhs_val, rhs_val));
+            return .fromValue(try arith.numberDiv(sema, ip, lhs_val, rhs_val));
         }
     }
 
@@ -302,7 +307,7 @@ test "analyze int literal" {
     try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
 
     const ip_index = datas[0].un_op.toInterned().?;
-    try std.testing.expectEqual(InternPool.Key{ .number = 42 }, ip.indexToKey(ip_index));
+    try std.testing.expectEqual(InternPool.Key{ .number = .{ .storage = .{ .int = 42 } } }, ip.indexToKey(ip_index));
 }
 
 test "analyze 1 + 2" {
@@ -360,5 +365,5 @@ test "analyze 1 + 2" {
     try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
 
     const ip_index = datas[0].un_op.toInterned().?;
-    try std.testing.expectEqual(InternPool.Key{ .number = 1 }, ip.indexToKey(ip_index));
+    try std.testing.expectEqual(InternPool.Key{ .number = .{ .storage = .{ .int = 1 } } }, ip.indexToKey(ip_index));
 }

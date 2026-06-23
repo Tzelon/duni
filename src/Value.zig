@@ -22,12 +22,26 @@ pub fn toIntern(val: Value) InternPool.Index {
     return val.ip_index;
 }
 
-/// Asserts the value is an integer and it fits in a i64
+/// Asserts the value is an integer `number`. Integers are always stored within
+/// `i64` range, so this never truncates.
 pub fn toSignedInt(val: Value, ip: *InternPool) i64 {
-    return switch (val.toIntern()) {
-        else => switch (ip.indexToKey(val.toIntern())) {
-            .number => |x| @intCast(x),
-            else => unreachable,
+    return switch (ip.indexToKey(val.toIntern())) {
+        .number => |num| switch (num.storage) {
+            .int => |int_value| int_value,
+            .float => unreachable,
         },
+        else => unreachable,
+    };
+}
+
+/// Returns the value as `f64`, asserting it is a `number`. Integer operands are
+/// lifted via `@floatFromInt`; this is how division promotes ints to floats.
+pub fn toFloat(val: Value, ip: *InternPool) f64 {
+    return switch (ip.indexToKey(val.toIntern())) {
+        .number => |num| switch (num.storage) {
+            .int => |int_value| @floatFromInt(int_value),
+            .float => |float_value| float_value,
+        },
+        else => unreachable,
     };
 }

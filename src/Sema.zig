@@ -55,9 +55,12 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
         const i = @intFromEnum(inst_idx);
         const air_ref = switch (tags[i]) {
             .int => try sema.dirInt(ip, inst_idx),
+            .int_big => try sema.dirIntBig(ip, inst_idx),
+            .float => try sema.dirFloat(ip, inst_idx),
             .add => try sema.dirArithmetic(ip, .add, inst_idx),
             .sub => try sema.dirArithmetic(ip, .sub, inst_idx),
             .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
+            .negate => try sema.dirNegate(ip, inst_idx),
             .div => try sema.dirDiv(ip, inst_idx),
             else => unreachable,
         };
@@ -82,6 +85,27 @@ fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
     return Air.Inst.Ref.fromInterned(ip_index);
 }
 
+fn dirIntBig(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Dir.Inst.Ref {
+    const int = sema.code.instructions.items(.data)[@intFromEnum(inst)].str;
+    const byte_count = int.len * @sizeOf(std.math.big.Limb);
+    const limb_bytes = sema.code.string_bytes[@intFromEnum(int.start)..][0..byte_count];
+
+    // TODO: this allocation and copy is only needed because the limbs may be unaligned.
+    // If DIR is adjusted so that big int limbs are guaranteed to be aligned, these
+    // two lines can be removed.
+    const limbs = try sema.arena.alloc(std.math.big.Limb, int.len);
+    @memcpy(mem.sliceAsBytes(limbs), limb_bytes);
+
+    const ip_index = try ip.get(sema.gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .big_int = .{ .limbs = limbs, .positive = true } } } });
+    return Air.Inst.Ref.fromInterned(ip_index);
+}
+
+fn dirFloat(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    const float = sema.code.instructions.items(.data)[@intFromEnum(inst)].float;
+    const ip_index = try ip.get(sema.gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = float } } });
+    return Air.Inst.Ref.fromInterned(ip_index);
+}
+
 fn dirArithmetic(
     sema: *Sema,
     ip: *InternPool,
@@ -97,6 +121,7 @@ fn dirArithmetic(
 }
 
 fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: Air.Inst.Ref, rhs: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+
     //TODO: we assume everything is comptime know and we can fold. this will not be true in the future
     const maybe_lhs_val = sema.resolveValue(lhs);
     const maybe_rhs_val = sema.resolveValue(rhs);
@@ -142,6 +167,22 @@ fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
     }
 
     unreachable;
+}
+
+fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const rhs = sema.resolveInst(inst_data.operand);
+
+    // Floats negate by sign-flip, not `0 - x` — preserves -0.0.
+    if (sema.resolveValue(rhs)) |rhs_val| {
+        if (ip.indexToKey(rhs_val.toIntern()) == .float) {
+            return .fromValue(try arith.floatNeg(sema, ip, rhs_val));
+        }
+    }
+
+    // negate is `0 - operand`
+    const lhs = Air.internedToRef(.zero);
+    return sema.analyzeArithmetic(ip, .sub, lhs, rhs);
 }
 
 fn resolveInst(sema: *Sema, dir_ref: Dir.Inst.Ref) Air.Inst.Ref {

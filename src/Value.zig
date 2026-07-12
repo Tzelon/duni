@@ -65,3 +65,19 @@ pub fn toBigInt(val: Value, space: *BigIntSpace, ip: *const InternPool) BigIntCo
     };
     return int_key.storage.toBigInt(space);
 }
+
+/// Asserts that the value is a float or an integer.
+pub fn toFloat(val: Value, comptime T: type, ip: *const InternPool) T {
+    return switch (ip.indexToKey(val.toIntern())) {
+        .int => |int| switch (int.storage) {
+            .big_int => |big_int| big_int.toFloat(T, .nearest_even)[0],
+            inline .u64, .i64 => |x| {
+                return @floatFromInt(x);
+            },
+        },
+        .float => |float| switch (float.storage) {
+            inline else => |x| @floatCast(x),
+        },
+        else => unreachable,
+    };
+}

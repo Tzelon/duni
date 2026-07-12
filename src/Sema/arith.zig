@@ -8,6 +8,8 @@ const InternPool = @import("../InternPool.zig");
 
 const Value = @import("../Value.zig");
 
+// Int
+
 /// Add two integers, returning a `comptime_int` regardless of the input types.
 pub fn comptimeIntAdd(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value {
     // TODO is this a performance issue? maybe we should try the operation without
@@ -93,5 +95,12 @@ pub fn intDivTrunc(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value 
     // }
 
     const result_ip = try ip.get(sema.gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .big_int = result_q.toConst() } } });
+    return Value.fromInterned(result_ip);
+}
+
+// Float
+
+pub fn floatNeg(sema: *Sema, ip: *InternPool, val: Value) !Value {
+    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = -val.toFloat(f64, ip) } } });
     return Value.fromInterned(result_ip);
 }

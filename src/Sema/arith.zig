@@ -8,6 +8,54 @@ const InternPool = @import("../InternPool.zig");
 
 const Value = @import("../Value.zig");
 
+/// Applies the `+` operator to comptime-known values.
+/// `lhs_val` and `rhs_val` are both of type `ty`.
+/// `ty` is an int, float, comptime_int, comptime_float, or vector.
+pub fn add(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int: bool) !Value {
+    if (is_int) {
+        const res = try comptimeIntAdd(sema, ip, lhs_val, rhs_val);
+        return res;
+    } else {
+        return floatAdd(sema, ip, lhs_val, rhs_val);
+    }
+}
+
+/// Applies the `-` operator to comptime-known values.
+/// `lhs_val` and `rhs_val` are both of type `ty`.
+/// `ty` is an int, float, comptime_int, comptime_float, or vector.
+pub fn sub(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int: bool) !Value {
+    if (is_int) {
+        const res = try comptimeIntSub(sema, ip, lhs_val, rhs_val);
+        return res;
+    } else {
+        return floatSub(sema, ip, lhs_val, rhs_val);
+    }
+}
+
+/// Applies the `*` operator to comptime-known values.
+/// `lhs_val` and `rhs_val` are fully-resolved values of type `ty`.
+/// `ty` is an int, float, comptime_int, comptime_float, or vector.
+pub fn mul(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int: bool) !Value {
+    if (is_int) {
+        const res = try comptimeIntMul(sema, ip, lhs_val, rhs_val);
+        return res;
+    } else {
+        return floatMul(sema, ip, lhs_val, rhs_val);
+    }
+}
+
+/// Applies the `/` operator to comptime-known values.
+/// `lhs_val` and `rhs_val` are fully-resolved values of type `ty`.
+/// `ty` is an int, float, comptime_int, comptime_float, or vector.
+pub fn div(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int: bool) !Value {
+    if (is_int) {
+        const res = try intDivTrunc(sema, ip, lhs_val, rhs_val);
+        return res;
+    } else {
+        return floatDiv(sema, ip, lhs_val, rhs_val);
+    }
+}
+
 // Int
 
 /// Add two integers, returning a `comptime_int` regardless of the input types.
@@ -99,6 +147,26 @@ pub fn intDivTrunc(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value 
 }
 
 // Float
+
+fn floatAdd(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value {
+    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = lhs.toFloat(f64, ip) + rhs.toFloat(f64, ip) } } });
+    return Value.fromInterned(result_ip);
+}
+
+fn floatSub(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value {
+    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = lhs.toFloat(f64, ip) - rhs.toFloat(f64, ip) } } });
+    return Value.fromInterned(result_ip);
+}
+
+fn floatMul(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value {
+    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = lhs.toFloat(f64, ip) * rhs.toFloat(f64, ip) } } });
+    return Value.fromInterned(result_ip);
+}
+
+fn floatDiv(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value {
+    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = lhs.toFloat(f64, ip) / rhs.toFloat(f64, ip) } } });
+    return Value.fromInterned(result_ip);
+}
 
 /// Negate a float by flipping its sign. Must not lower to `0 - x`:
 /// IEEE says `0.0 - (-0.0) == +0.0`, which would lose negative zero.

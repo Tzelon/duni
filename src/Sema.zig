@@ -127,10 +127,14 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
 
     if (maybe_lhs_val) |lhs_val| {
         if (maybe_rhs_val) |rhs_val| {
+            const lhs_is_float = ip.indexToKey(lhs_val.toIntern()) == .float;
+            const rhs_is_float = ip.indexToKey(rhs_val.toIntern()) == .float;
+            const is_int = !lhs_is_float and !rhs_is_float;
+
             const result_val = switch (dir_tag) {
-                .add => try arith.comptimeIntAdd(sema, ip, lhs_val, rhs_val),
-                .sub => try arith.comptimeIntSub(sema, ip, lhs_val, rhs_val),
-                .mul => try arith.comptimeIntMul(sema, ip, lhs_val, rhs_val),
+                .add => try arith.add(sema, ip, lhs_val, rhs_val, is_int),
+                .sub => try arith.sub(sema, ip, lhs_val, rhs_val, is_int),
+                .mul => try arith.mul(sema, ip, lhs_val, rhs_val, is_int),
                 else => unreachable,
             };
             return Air.internedToRef(result_val.toIntern());
@@ -159,9 +163,14 @@ fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
 
     if (maybe_lhs_val) |lhs_val| {
         if (maybe_rhs_val) |rhs_val| {
-            // Division by zero is a comptime error.
-            if (rhs_val.toIntern() == .zero) return error.AnalysisFail;
-            return .fromValue(try arith.intDivTrunc(sema, ip, lhs_val, rhs_val));
+            const lhs_is_float = ip.indexToKey(lhs_val.toIntern()) == .float;
+            const rhs_is_float = ip.indexToKey(rhs_val.toIntern()) == .float;
+            const is_int = !lhs_is_float and !rhs_is_float;
+
+            // Division by zero is a comptime error for ints and floats alike —
+            // IEEE inf/nan are never produced by comptime folding.
+            if (rhs_val.isZero(ip)) return error.AnalysisFail;
+            return .fromValue(try arith.div(sema, ip, lhs_val, rhs_val, is_int));
         }
     }
 
@@ -417,10 +426,12 @@ test "analyze division" {
         .{ .tag = .int, .data = .{ .int = 7 } },
         .{ .tag = .int, .data = .{ .int = 2 } },
         .{ .tag = .div, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
-    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .int = .{
-        .ty = .comptime_int_type,
-        .storage = .{ .u64 = 3 }, // trunc
-    } });
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{
+        .int = .{
+            .ty = .comptime_int_type,
+            .storage = .{ .u64 = 3 }, // trunc
+        },
+    });
 }
 
 test "analyze negate int" {
@@ -454,4 +465,24 @@ test "analyze 1 / 0 fails analysis" {
     defer ip.deinit(gpa);
 
     try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+}
+
+test "analyze float division by zero fails analysis" {
+    const gpa = std.testing.allocator;
+
+    // Both zero signs must be caught — 0.0 and -0.0 intern as distinct values.
+    for ([_]f64{ 0.0, -0.0 }) |divisor| {
+        var dir = try buildTestDir(gpa, &.{
+            .{ .tag = .float, .data = .{ .float = 1.5 } },
+            .{ .tag = .float, .data = .{ .float = divisor } },
+            .{ .tag = .div, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+        }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{});
+        defer dir.deinit(gpa);
+
+        var ip: InternPool = .{};
+        try ip.init(gpa);
+        defer ip.deinit(gpa);
+
+        try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+    }
 }

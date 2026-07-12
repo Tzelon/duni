@@ -66,6 +66,17 @@ pub fn toBigInt(val: Value, space: *BigIntSpace, ip: *const InternPool) BigIntCo
     return int_key.storage.toBigInt(space);
 }
 
+/// Whether the value is numerically zero. For floats this covers both
+/// 0.0 and -0.0 (distinct interned values, equal under IEEE `==`).
+pub fn isZero(val: Value, ip: *const InternPool) bool {
+    // Any integer zero dedups to the `zero` static — index compare suffices.
+    if (val.toIntern() == .zero) return true;
+    return switch (ip.indexToKey(val.toIntern())) {
+        .float => |float| float.storage.f64 == 0.0,
+        else => false,
+    };
+}
+
 /// Asserts that the value is a float or an integer.
 pub fn toFloat(val: Value, comptime T: type, ip: *const InternPool) T {
     return switch (ip.indexToKey(val.toIntern())) {

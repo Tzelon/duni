@@ -17,6 +17,10 @@ test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
 
+// Reference every file with tests: `zig build test` only collects test blocks
+// from files that get analyzed, and nothing else reaches these.
 comptime {
     _ = @import("Sema.zig");
+    _ = @import("AstGen.zig");
+    _ = @import("WatGen.zig");
 }

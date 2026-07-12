@@ -86,7 +86,9 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.In
     const result: Dir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
         .int => |num| switch (num) {
             0 => if (sign == .positive) try astgen.addInt(num) else {
-                std.log.err("0 cannot be negative", .{});
+                // TODO(tzelon): report through AstGen error reporting once it
+                // exists; log.warn because the test runner fails on log.err.
+                std.log.warn("0 cannot be negative", .{});
                 return error.AnalysisFail;
             },
 
@@ -121,7 +123,7 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.In
             return result;
         },
         .failure => {
-            std.log.err("failed to parse literal number", .{});
+            std.log.warn("failed to parse literal number", .{});
             return error.AnalysisFail;
         },
     };

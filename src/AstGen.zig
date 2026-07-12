@@ -21,6 +21,8 @@ tree: *const Ast,
 instructions: std.MultiArrayList(Dir.Inst) = .{},
 extra: ArrayList(u32) = .empty,
 
+string_bytes: ArrayList(u8) = .empty,
+
 pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     var astgen = AstGen{
         .tree = &tree,
@@ -52,6 +54,7 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     return .{
         .instructions = astgen.instructions.toOwnedSlice(),
         .extra = astgen.extra.toOwnedSliceAssert(),
+        .string_bytes = astgen.string_bytes.toOwnedSliceAssert(),
         .main_body_start = main_body_start,
         .main_body_len = body_len,
     };
@@ -61,7 +64,7 @@ fn expr(astgen: *AstGen, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const tree = astgen.tree;
 
     switch (tree.nodeTag(node)) {
-        .number_literal => return numberLiteral(astgen, node, .positive),
+        .number_literal => return numberLiteral(astgen, node, node, .positive),
         .form => return formExpr(astgen, node),
         else => {
             unreachable;
@@ -71,7 +74,7 @@ fn expr(astgen: *AstGen, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
 
 const Sign = enum { negative, positive };
 
-fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, sign: Sign) InnerError!Dir.Inst.Ref {
+fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.Index, sign: Sign) InnerError!Dir.Inst.Ref {
     const tree = astgen.tree;
     const num_token = tree.nodeMainToken(node);
     const bytes = tree.tokenSlice(num_token);
@@ -85,15 +88,33 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, sign: Sign) InnerError!D
 
             else => try astgen.addInt(num),
         },
-        .big_int => {
-            // TODO(tzelon): support big int
-            std.log.err("implement big_int", .{});
-            return error.AnalysisFail;
+        .big_int => |base| big: {
+            const gpa = astgen.gpa;
+            var big_int = try std.math.big.int.Managed.init(gpa);
+            defer big_int.deinit();
+            const prefix_offset: usize = if (base == .decimal) 0 else 2;
+            big_int.setString(@intFromEnum(base), bytes[prefix_offset..]) catch |err| switch (err) {
+                error.InvalidCharacter => unreachable, // caught in `parseNumberLiteral`
+                error.InvalidBase => unreachable, // we only pass 16, 8, 2, see above
+                error.OutOfMemory => |e| return e,
+            };
+
+            const limbs = big_int.limbs[0..big_int.len()];
+            assert(big_int.isPositive());
+            break :big try astgen.addIntBig(limbs);
         },
         .float => {
-            // TODO(tzelon): support big int
-            std.log.err("implement big_int", .{});
-            return error.AnalysisFail;
+            const unsigned_float_number = std.fmt.parseFloat(f128, bytes) catch |err| switch (err) {
+                error.InvalidCharacter => unreachable, // validated by tokenizer
+            };
+            const float_number = switch (sign) {
+                .negative => -unsigned_float_number,
+                .positive => unsigned_float_number,
+            };
+            @setFloatMode(.strict);
+            const smaller_float: f64 = @floatCast(float_number);
+            const result = try astgen.addFloat(smaller_float);
+            return result;
         },
         .failure => {
             std.log.err("failed to parse literal number", .{});
@@ -101,7 +122,12 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, sign: Sign) InnerError!D
         },
     };
 
-    return result;
+    if (sign == .positive) {
+        return result;
+    } else {
+        const negated = try astgen.addUnNode(.negate, result, source_node);
+        return negated;
+    }
 }
 
 fn formExpr(astgen: *AstGen, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -128,16 +154,17 @@ fn negation(
     node: Ast.Node.Index,
     args: []const Node.Index,
 ) InnerError!Dir.Inst.Ref {
-    // const tree = astgen.tree;
+    const tree = astgen.tree;
+
+    const operand_node = args[0];
 
     // Check for float literal as the sub-expression because we want to preserve
     // its negativity rather than having it go through comptime subtraction.
-    // const operand_node = tree.nodeData(node).node;
-    // if (tree.nodeTag(operand_node) == .number_literal) {
-    //     return numberLiteral(gz, ri, operand_node, node, .negative);
-    // }
+    if (tree.nodeTag(operand_node) == .number_literal) {
+        return numberLiteral(astgen, operand_node, node, .negative);
+    }
 
-    const operand = try astgen.expr(args[0]);
+    const operand = try astgen.expr(operand_node);
     const result = try astgen.addUnNode(.negate, operand, node);
     return result;
 }
@@ -195,6 +222,31 @@ fn addInt(astgen: *AstGen, integer: u64) !Dir.Inst.Ref {
     return astgen.add(.{
         .tag = .int,
         .data = .{ .int = integer },
+    });
+}
+
+fn addIntBig(astgen: *AstGen, limbs: []const std.math.big.Limb) !Dir.Inst.Ref {
+    const gpa = astgen.gpa;
+    try astgen.instructions.ensureUnusedCapacity(gpa, 1);
+    try astgen.string_bytes.ensureUnusedCapacity(gpa, @sizeOf(std.math.big.Limb) * limbs.len);
+
+    const new_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
+    astgen.instructions.appendAssumeCapacity(.{
+        .tag = .int_big,
+        .data = .{ .str = .{
+            .start = @enumFromInt(astgen.string_bytes.items.len),
+            .len = @intCast(limbs.len),
+        } },
+    });
+
+    astgen.string_bytes.appendSliceAssumeCapacity(mem.sliceAsBytes(limbs));
+    return new_index.toRef();
+}
+
+fn addFloat(astgen: *AstGen, number: f64) !Dir.Inst.Ref {
+    return astgen.add(.{
+        .tag = .float,
+        .data = .{ .float = number },
     });
 }
 
@@ -268,6 +320,7 @@ fn nodeIndexToRelative(astgen: *AstGen, node_index: Ast.Node.Index) Ast.Node.Off
 fn deinit(astgen: *AstGen, gpa: Allocator) void {
     astgen.instructions.deinit(gpa);
     astgen.extra.deinit(gpa);
+    astgen.string_bytes.deinit(gpa);
 }
 
 fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
@@ -283,7 +336,7 @@ fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
 
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Print.print(&dir, &tree, &w);
+    try Print.print(&dir, &tree, &w, gpa);
 
     try std.testing.expectEqualStrings(expected, w.buffer[0..w.end]);
 }

@@ -36,7 +36,12 @@ pub const Inst = struct {
     ///
     /// The ref `none` is an exception: it has the tag bit set but refers to the InternPool.
     pub const Ref = enum(u32) {
-        number_type = @intFromEnum(InternPool.Index.number_type),
+        comptime_int_type = @intFromEnum(InternPool.Index.comptime_int_type),
+        comptime_float_type = @intFromEnum(InternPool.Index.comptime_float_type),
+        f64_type = @intFromEnum(InternPool.Index.f64_type),
+        zero = @intFromEnum(InternPool.Index.zero),
+        one = @intFromEnum(InternPool.Index.one),
+        negative_one = @intFromEnum(InternPool.Index.negative_one),
 
         /// This Ref does not correspond to any AIR instruction or constant
         /// value and may instead be used as a sentinel to indicate null.

@@ -17,9 +17,21 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
+const InternPool = @import("InternPool.zig");
+
 const Ast = @import("Ast.zig");
 
+const string = @import("string.zig");
+const NullTerminatedString = string.NullTerminatedString;
+
 instructions: std.MultiArrayList(Inst).Slice,
+/// In order to store references to strings in fewer bytes, we copy all
+/// string bytes into here. String bytes can be null. It is up to whomever
+/// is referencing the data here whether they want to store both index and length,
+/// thus allowing null bytes, or store only index, and use null-termination. The
+/// `string_bytes` array is agnostic to either usage.
+/// Index 0 is reserved for special cases.
+string_bytes: []u8,
 /// The meaning of this data is determined by `Inst.Tag` value.
 /// The first few indexes are reserved. See `ExtraIndex` for the values.
 extra: []u32,
@@ -36,7 +48,12 @@ pub const Inst = struct {
     data: Data,
 
     pub const Tag = enum(u8) {
+        /// Integer literal that fits in a u64. Uses the `int` union field.
         int,
+        /// Arbitrary sized integer literal. Uses the `str` union field.
+        int_big,
+        /// A float literal that fits in a f64. Uses the float union value.
+        float,
         /// Arithmetic addition, asserts no integer overflow.
         /// Uses the `pl_node` union field. Payload is `Bin`.
         add,
@@ -89,7 +106,12 @@ pub const Inst = struct {
     /// The tag type is specified so that it is safe to bitcast between `[]u32`
     /// and `[]Ref`.
     pub const Ref = enum(u32) {
-        number_type,
+        comptime_int_type,
+        comptime_float_type,
+        f64_type,
+        zero,
+        one,
+        negative_one,
         /// This Ref does not correspond to any DIR instruction or constant
         /// value and may instead be used as a sentinel to indicate null.
         none = std.math.maxInt(u32),
@@ -118,6 +140,7 @@ pub const Inst = struct {
     /// how to interpret the data within.
     pub const Data = union {
         int: u64,
+        float: f64,
 
         /// Used for unary operators, with an AST node source location.
         un_node: struct {
@@ -137,6 +160,18 @@ pub const Inst = struct {
         },
 
         bin: Bin,
+
+        /// For strings which may contain null bytes.
+        str: struct {
+            /// Offset into `string_bytes`.
+            start: NullTerminatedString,
+            /// Number of bytes in the string.
+            len: u32,
+
+            pub fn get(self: @This(), code: Dir) []const u8 {
+                return code.string_bytes[@intFromEnum(self.start)..][0..self.len];
+            }
+        },
     };
 
     // Make sure we don't accidentally add a field to make this union
@@ -194,6 +229,7 @@ pub fn bodySlice(dir: Dir, start: usize, len: usize) []Inst.Index {
 
 pub fn deinit(code: *Dir, gpa: Allocator) void {
     code.instructions.deinit(gpa);
+    gpa.free(code.string_bytes);
     gpa.free(code.extra);
     code.* = undefined;
 }

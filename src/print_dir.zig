@@ -3,6 +3,9 @@
 
 const Print = @This();
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const mem = std.mem;
+
 const Ast = @import("Ast.zig");
 const Dir = @import("Dir.zig");
 
@@ -10,6 +13,8 @@ w: *std.Io.Writer,
 code: *const Dir,
 tree: ?*const Ast,
 parent_decl_node: Ast.Node.Index = .root,
+
+gpa: Allocator,
 
 /// Using `std.zig.findLineColumn` whenever we need to resolve a source location makes DIR
 /// printing O(N^2), which can have drastic effects - taking a DIR dump from a few seconds to
@@ -69,8 +74,8 @@ const LineColCursor = struct {
     }
 };
 
-pub fn print(code: *const Dir, tree: ?*const Ast, w: *std.Io.Writer) !void {
-    var printer = Print{ .w = w, .code = code, .tree = tree };
+pub fn print(code: *const Dir, tree: ?*const Ast, w: *std.Io.Writer, gpa: Allocator) !void {
+    var printer = Print{ .w = w, .code = code, .tree = tree, .gpa = gpa };
     const tags = code.instructions.items(.tag);
     const datas = code.instructions.items(.data);
     for (tags, datas, 0..) |tag, data, i| {
@@ -83,6 +88,8 @@ pub fn print(code: *const Dir, tree: ?*const Ast, w: *std.Io.Writer) !void {
 fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
     try self.w.print("{s}(", .{@tagName(tag)});
     switch (tag) {
+        .int_big => try self.writeIntBig(data),
+        .float => try self.writeFloat(data),
         .int => try self.writeInt(data),
         .negate => try self.writeUnNode(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),
@@ -91,6 +98,30 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
 
 fn writeInt(self: *Print, data: Dir.Inst.Data) !void {
     try self.w.print("{d})", .{data.int});
+}
+
+fn writeIntBig(self: *Print, data: Dir.Inst.Data) !void {
+    const str = data.str;
+    const byte_count = str.len * @sizeOf(std.math.big.Limb);
+    const limb_bytes = self.code.string_bytes[@intFromEnum(str.start)..][0..byte_count];
+    // limb_bytes is not aligned properly; we must allocate and copy the bytes
+    // in order to accomplish this.
+    const limbs = try self.gpa.alloc(std.math.big.Limb, str.len);
+    defer self.gpa.free(limbs);
+
+    @memcpy(mem.sliceAsBytes(limbs), limb_bytes);
+    const big_int: std.math.big.int.Const = .{
+        .limbs = limbs,
+        .positive = true,
+    };
+    const as_string = try big_int.toStringAlloc(self.gpa, 10, .lower);
+    defer self.gpa.free(as_string);
+    try self.w.print("{s})", .{as_string});
+}
+
+fn writeFloat(self: *Print, data: Dir.Inst.Data) !void {
+    const number = data.float;
+    try self.w.print("{d})", .{number});
 }
 
 fn writeUnNode(self: *Print, data: Dir.Inst.Data) !void {
@@ -111,17 +142,15 @@ fn writePlNodeBin(self: *Print, data: Dir.Inst.Data) !void {
 }
 
 fn writeRef(self: *Print, ref: Dir.Inst.Ref) !void {
-    switch (ref) {
-        .none => try self.w.writeAll("none"),
-        .number_type => try self.w.writeAll("number_type"),
-        _ => {
-            if (ref.toIndex()) |idx| {
-                try self.w.print("%{d}", .{@intFromEnum(idx)});
-            } else {
-                try self.w.print("ref({d})", .{@intFromEnum(ref)});
-            }
-        },
+    if (ref.toIndexAllowNone()) |idx| {
+        return self.w.print("%{d}", .{@intFromEnum(idx)});
     }
+    // `none` and the static InternPool refs are exactly the named tags,
+    // so new statics print correctly without touching this function.
+    if (std.enums.tagName(Dir.Inst.Ref, ref)) |name| {
+        return self.w.writeAll(name);
+    }
+    try self.w.print("ref({d})", .{@intFromEnum(ref)});
 }
 
 fn writeSrcNode(self: *Print, src_node: Ast.Node.Offset) !void {

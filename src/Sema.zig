@@ -33,10 +33,16 @@ instructions: std.MultiArrayList(Air.Inst) = .{},
 // inst_map is how Sema remembers, for every DIR instruction it has already lowered, the AIR ref (or interned comptime value) to substitute when later DIR instructions reference it.
 inst_map: InstMap = .{},
 
+/// Points to the temporary arena allocator of the Sema.
+/// This arena will be cleared when the sema is destroyed.
+arena: Allocator,
+
 code: Dir,
 
 pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
-    var sema = Sema{ .gpa = gpa, .code = code };
+    var analysis_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer analysis_arena.deinit();
+    var sema = Sema{ .gpa = gpa, .code = code, .arena = analysis_arena.allocator() };
     defer sema.deinit();
 
     try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
@@ -72,9 +78,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
 fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const int = sema.code.instructions.items(.data)[@intFromEnum(inst)].int;
-    // TODO: we shouldn't @intCast here, need to handle big int properly.
-    assert(int <= std.math.maxInt(u32)); // protect TODO
-    const ip_index = try ip.get(sema.gpa, .{ .number = @intCast(int) });
+    const ip_index = try ip.get(sema.gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = int } } });
     return Air.Inst.Ref.fromInterned(ip_index);
 }
 
@@ -131,6 +135,8 @@ fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
 
     if (maybe_lhs_val) |lhs_val| {
         if (maybe_rhs_val) |rhs_val| {
+            // Division by zero is a comptime error.
+            if (rhs_val.toIntern() == .zero) return error.AnalysisFail;
             return .fromValue(try arith.intDivTrunc(sema, ip, lhs_val, rhs_val));
         }
     }
@@ -278,11 +284,13 @@ test "analyze int literal" {
     try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 42 } });
 
     const extra = try gpa.alloc(u32, 1);
+    const string_bytes = try gpa.alloc(u8, 1);
     extra[0] = 0; // body[0] = instruction index 0
 
     var dir = Dir{
         .instructions = insts.toOwnedSlice(),
         .extra = extra,
+        .string_bytes = string_bytes,
         .main_body_start = 0,
         .main_body_len = 1,
     };
@@ -302,7 +310,7 @@ test "analyze int literal" {
     try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
 
     const ip_index = datas[0].un_op.toInterned().?;
-    try std.testing.expectEqual(InternPool.Key{ .number = 42 }, ip.indexToKey(ip_index));
+    try std.testing.expectEqual(InternPool.Key{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } }, ip.indexToKey(ip_index));
 }
 
 test "analyze 1 + 2" {
@@ -332,6 +340,7 @@ test "analyze 1 + 2" {
     const idx_1: Dir.Inst.Index = @enumFromInt(1);
 
     const extra = try gpa.alloc(u32, 5);
+    const string_bytes = try gpa.alloc(u8, 5);
     extra[0] = @intFromEnum(idx_0.toRef()); // Bin.lhs = %0
     extra[1] = @intFromEnum(idx_1.toRef()); // Bin.rhs = %1
     extra[2] = 0; // body[0] = %0
@@ -341,6 +350,7 @@ test "analyze 1 + 2" {
     var dir = Dir{
         .instructions = insts.toOwnedSlice(),
         .extra = extra,
+        .string_bytes = string_bytes,
         .main_body_start = 2,
         .main_body_len = 3,
     };
@@ -360,5 +370,56 @@ test "analyze 1 + 2" {
     try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
 
     const ip_index = datas[0].un_op.toInterned().?;
-    try std.testing.expectEqual(InternPool.Key{ .number = 1 }, ip.indexToKey(ip_index));
+
+    try std.testing.expectEqual(InternPool.Key{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } }, ip.indexToKey(ip_index));
+}
+
+test "analyze 1 / 0 fails analysis" {
+    const gpa = std.testing.allocator;
+
+    // Dir layout for `1 / 0`:
+    //   %0 = int(1)
+    //   %1 = int(0)
+    //   %2 = div  pl_node{ payload_index = 0 }
+    //
+    // extra:
+    //   [0] = Bin.lhs = ref(%0)
+    //   [1] = Bin.rhs = ref(%1)
+    //   [2..5] = body indices [0, 1, 2]
+    var insts: std.MultiArrayList(Dir.Inst) = .{};
+    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
+    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 0 } });
+    try insts.append(gpa, .{
+        .tag = .div,
+        .data = .{ .pl_node = .{
+            .src_node = @enumFromInt(0),
+            .payload_index = 0,
+        } },
+    });
+
+    const idx_0: Dir.Inst.Index = @enumFromInt(0);
+    const idx_1: Dir.Inst.Index = @enumFromInt(1);
+
+    const extra = try gpa.alloc(u32, 5);
+    const string_bytes = try gpa.alloc(u8, 5);
+    extra[0] = @intFromEnum(idx_0.toRef()); // Bin.lhs = %0
+    extra[1] = @intFromEnum(idx_1.toRef()); // Bin.rhs = %1
+    extra[2] = 0; // body[0] = %0
+    extra[3] = 1; // body[1] = %1
+    extra[4] = 2; // body[2] = %2
+
+    var dir = Dir{
+        .instructions = insts.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = string_bytes,
+        .main_body_start = 2,
+        .main_body_len = 3,
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
 }

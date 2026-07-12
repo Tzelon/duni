@@ -4,6 +4,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Hash = std.hash.Wyhash;
+const BigIntConst = std.math.big.int.Const;
+const BigIntMutable = std.math.big.int.Mutable;
+const Limb = std.math.big.Limb;
 
 const Dir = @import("Dir.zig");
 
@@ -17,6 +20,8 @@ map: std.hash_map.HashMapUnmanaged(Index, void, Context, std.hash_map.default_ma
 
 // parameter names, struct field names, enum tag names
 extra: std.ArrayList(u32) = .empty,
+
+limbs: std.ArrayList(Limb) = .empty,
 
 // Flat byte buffer. Each interned string is followed by a 0 terminator.
 string_bytes: std.ArrayListUnmanaged(u8) = .empty,
@@ -39,7 +44,15 @@ pub const Item = struct {
 /// When adding a tag to this enum, consider adding a corresponding entry to
 /// `primitives` in AstGen.zig.
 pub const Index = enum(u32) {
-    number_type,
+    comptime_int_type,
+    comptime_float_type,
+    f64_type,
+    /// `0` (comptime_int)
+    zero,
+    /// `1` (comptime_int)
+    one,
+    /// `-1` (comptime_int)
+    negative_one,
 
     /// Used by Air/Sema only.
     none = std.math.maxInt(u32),
@@ -48,13 +61,51 @@ pub const Index = enum(u32) {
 
 pub const Key = union(enum) {
     simple_type: SimpleType,
-    number: u32,
+    int: Key.Int,
+    float: Float,
+
+    pub const Int = struct {
+        ty: Index,
+        storage: Storage,
+
+        pub const Storage = union(enum) {
+            u64: u64,
+            i64: i64,
+            big_int: BigIntConst,
+
+            /// Big enough to fit any non-BigInt value
+            pub const BigIntSpace = struct {
+                /// The +1 is headroom so that operations such as incrementing once
+                /// or decrementing once are possible without using an allocator.
+                limbs: [(@sizeOf(u64) / @sizeOf(std.math.big.Limb)) + 1]std.math.big.Limb,
+            };
+
+            pub fn toBigInt(storage: Storage, space: *BigIntSpace) BigIntConst {
+                return switch (storage) {
+                    .big_int => |x| x,
+                    inline .u64, .i64 => |x| BigIntMutable.init(&space.limbs, x).toConst(),
+                };
+            }
+        };
+    };
+
+    pub const Float = struct {
+        ty: Index,
+        /// The storage used must match the size of the float type being represented.
+        storage: Storage,
+
+        pub const Storage = union(enum) {
+            f64: f64,
+        };
+    };
 
     /// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
     /// implement logic that only wants to deal with types because the logic can
     /// ignore all simple values. Note that technically, types are values.
     pub const SimpleType = enum(u32) {
-        comptime_number = @intFromEnum(Index.number_type),
+        comptime_int = @intFromEnum(Index.comptime_int_type),
+        comptime_float = @intFromEnum(Index.comptime_float_type),
+        f64 = @intFromEnum(Index.f64_type),
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
@@ -65,8 +116,88 @@ pub const Key = union(enum) {
 
         return switch (key) {
             .simple_type => |x| Hash.hash(seed, asBytes(&x)),
-            .number => |n| Hash.hash(seed, asBytes(&n)),
+            .int => |int| {
+                var hasher = Hash.init(seed);
+                // Canonicalize all integers by converting them to BigIntConst.
+                var buffer: Key.Int.Storage.BigIntSpace = undefined;
+                const big_int = int.storage.toBigInt(&buffer);
+
+                std.hash.autoHash(&hasher, int.ty);
+                std.hash.autoHash(&hasher, big_int.positive);
+                for (big_int.limbs) |limb| std.hash.autoHash(&hasher, limb);
+                return hasher.final();
+            },
+
+            .float => |float| {
+                var hasher = Hash.init(seed);
+                std.hash.autoHash(&hasher, float.ty);
+                switch (float.storage) {
+                    inline else => |val| std.hash.autoHash(
+                        &hasher,
+                        @as(@Int(.unsigned, @bitSizeOf(@TypeOf(val))), @bitCast(val)),
+                    ),
+                }
+                return hasher.final();
+            },
         };
+    }
+
+    pub fn eql(a: Key, b: Key, ip: *const InternPool) bool {
+        _ = ip;
+        const KeyTag = @typeInfo(Key).@"union".tag_type.?;
+        const a_tag: KeyTag = a;
+        const b_tag: KeyTag = b;
+        if (a_tag != b_tag) return false;
+        switch (a) {
+            .simple_type => |a_info| {
+                const b_info = b.simple_type;
+                return a_info == b_info;
+            },
+
+            .int => |a_info| {
+                const b_info = b.int;
+
+                if (a_info.ty != b_info.ty)
+                    return false;
+
+                return switch (a_info.storage) {
+                    .u64 => |aa| switch (b_info.storage) {
+                        .u64 => |bb| aa == bb,
+                        .i64 => |bb| aa == bb,
+                        .big_int => |bb| bb.orderAgainstScalar(aa) == .eq,
+                    },
+                    .i64 => |aa| switch (b_info.storage) {
+                        .u64 => |bb| aa == bb,
+                        .i64 => |bb| aa == bb,
+                        .big_int => |bb| bb.orderAgainstScalar(aa) == .eq,
+                    },
+                    .big_int => |aa| switch (b_info.storage) {
+                        .u64 => |bb| aa.orderAgainstScalar(bb) == .eq,
+                        .i64 => |bb| aa.orderAgainstScalar(bb) == .eq,
+                        .big_int => |bb| aa.eql(bb),
+                    },
+                };
+            },
+
+            .float => |a_info| {
+                const b_info = b.float;
+
+                if (a_info.ty != b_info.ty)
+                    return false;
+
+                const StorageTag = @typeInfo(Key.Float.Storage).@"union".tag_type.?;
+                assert(@as(StorageTag, a_info.storage) == @as(StorageTag, b_info.storage));
+
+                switch (a_info.storage) {
+                    inline else => |val, tag| {
+                        const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(val)));
+                        const a_bits: Bits = @bitCast(val);
+                        const b_bits: Bits = @bitCast(@field(b_info.storage, @tagName(tag)));
+                        return a_bits == b_bits;
+                    },
+                }
+            },
+        }
     }
 };
 
@@ -112,8 +243,67 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
                 .data = 0, // avoid writing `undefined` bits to a file
             });
         },
-        .number => |number| {
-            ip.items.appendAssumeCapacity(.{ .tag = .number_32, .data = number });
+        .int => |int| b: {
+            assert(ip.isIntegerType(int.ty));
+            switch (int.ty) {
+                .comptime_int_type => switch (int.storage) {
+                    .big_int => |big_int| {
+                        if (big_int.toInt(u32)) |casted| {
+                            ip.items.appendAssumeCapacity(.{
+                                .tag = .int_comptime_int_u32,
+                                .data = casted,
+                            });
+                            break :b;
+                        } else |_| {}
+                        if (big_int.toInt(i32)) |casted| {
+                            ip.items.appendAssumeCapacity(.{
+                                .tag = .int_comptime_int_i32,
+                                .data = @as(u32, @bitCast(casted)),
+                            });
+                            break :b;
+                        } else |_| {}
+                    },
+                    inline .u64, .i64 => |x| {
+                        if (std.math.cast(u32, x)) |casted| {
+                            ip.items.appendAssumeCapacity(.{
+                                .tag = .int_comptime_int_u32,
+                                .data = casted,
+                            });
+                            break :b;
+                        }
+                        if (std.math.cast(i32, x)) |casted| {
+                            ip.items.appendAssumeCapacity(.{
+                                .tag = .int_comptime_int_i32,
+                                .data = @as(u32, @bitCast(casted)),
+                            });
+                            break :b;
+                        }
+                    },
+                },
+                else => {},
+            }
+            // None of the 32-bit fast paths matched: store as limbs, whatever the storage variant.
+            switch (int.storage) {
+                .big_int => |big_int| {
+                    const tag: Tag = if (big_int.positive) .int_positive else .int_negative;
+                    try addInt(ip, gpa, int.ty, tag, big_int.limbs);
+                },
+                inline .u64, .i64 => |x| {
+                    var buf: [2]Limb = undefined;
+                    const big_int = BigIntMutable.init(&buf, x).toConst();
+                    const tag: Tag = if (big_int.positive) .int_positive else .int_negative;
+                    try addInt(ip, gpa, int.ty, tag, big_int.limbs);
+                },
+            }
+        },
+        .float => |float| {
+            switch (float.ty) {
+                .comptime_float_type => ip.items.appendAssumeCapacity(.{
+                    .tag = .float_comptime_float,
+                    .data = try addExtra(ip, gpa, Float64.pack(float.storage.f64)),
+                }),
+                else => unreachable,
+            }
         },
     }
 
@@ -150,9 +340,155 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
 
     return switch (tag) {
         .simple_type => .{ .simple_type = @enumFromInt(@intFromEnum(index)) },
-        .number_32 => .{ .number = data },
+        .int_comptime_int_u32 => .{ .int = .{
+            .ty = .comptime_int_type,
+            .storage = .{ .u64 = data },
+        } },
+        .int_comptime_int_i32 => .{ .int = .{
+            .ty = .comptime_int_type,
+            .storage = .{ .i64 = @as(i32, @bitCast(data)) },
+        } },
+        .int_u32 => unreachable,
+        .int_i32 => unreachable,
+        .int_positive => ip.indexToKeyBigInt(data, true),
+        .int_negative => ip.indexToKeyBigInt(data, false),
+        .float_f64 => .{ .float = .{
+            .ty = .f64_type,
+            .storage = .{ .f64 = extraData(ip, Float64, data).get() },
+        } },
+
+        .float_comptime_float => .{ .float = .{
+            .ty = .comptime_float_type,
+            .storage = .{ .f64 = extraData(ip, Float64, data).get() },
+        } },
     };
 }
+
+fn indexToKeyBigInt(ip: *const InternPool, limb_index: u32, positive: bool) Key {
+    const int: Int = @bitCast(ip.limbs.items[limb_index..][0..Int.limbs_items_len].*);
+    const big_int: BigIntConst = .{
+        .limbs = ip.limbs.items[limb_index + Int.limbs_items_len ..][0..int.limbs_len],
+        .positive = positive,
+    };
+    return .{ .int = .{
+        .ty = int.ty,
+        .storage = if (big_int.toInt(u64)) |x|
+            .{ .u64 = x }
+        else |_| if (big_int.toInt(i64)) |x|
+            .{ .i64 = x }
+        else |_|
+            .{ .big_int = big_int },
+    } };
+}
+
+/// includes .comptime_int_type
+pub fn isIntegerType(ip: *const InternPool, ty: Index) bool {
+    _ = ip;
+    return switch (ty) {
+        .comptime_int_type,
+        => true,
+        else => false,
+    };
+}
+
+fn addInt(
+    ip: *InternPool,
+    gpa: Allocator,
+    ty: Index,
+    tag: Tag,
+    limbs: []const Limb,
+) !void {
+    const limbs_len: u32 = @intCast(limbs.len);
+    try ip.limbs.ensureUnusedCapacity(gpa, Int.limbs_items_len + limbs_len);
+    ip.items.appendAssumeCapacity(.{
+        .tag = tag,
+        .data = @intCast(ip.limbs.items.len),
+    });
+    ip.limbs.addManyAsArrayAssumeCapacity(Int.limbs_items_len).* = @bitCast(Int{
+        .ty = ty,
+        .limbs_len = limbs_len,
+    });
+    ip.limbs.appendSliceAssumeCapacity(limbs);
+}
+
+fn addExtra(ip: *InternPool, gpa: Allocator, item: anytype) Allocator.Error!u32 {
+    const field_count = @typeInfo(@TypeOf(item)).@"struct".fields.len;
+    try ip.extra.ensureUnusedCapacity(gpa, field_count);
+    return addExtraAssumeCapacity(ip, item);
+}
+
+fn addExtraAssumeCapacity(ip: *InternPool, item: anytype) u32 {
+    const result: u32 = @intCast(ip.extra.items.len);
+    const info = @typeInfo(@TypeOf(item)).@"struct";
+    inline for (info.fields) |field| {
+        ip.extra.appendAssumeCapacity(switch (field.type) {
+            Index,
+            NullTerminatedString,
+            => @intFromEnum(@field(item, field.name)),
+
+            u32,
+            i32,
+            => @bitCast(@field(item, field.name)),
+
+            else => @compileError("bad field type: " ++ @typeName(field.type)),
+        });
+    }
+    return result;
+}
+
+fn extraDataTrail(ip: *const InternPool, comptime T: type, index: u32) struct { data: T, end: u32 } {
+    var result: T = undefined;
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields, index..) |field, extra_index| {
+        const extra_item = ip.extra.items[extra_index];
+        @field(result, field.name) = switch (field.type) {
+            Index,
+            NullTerminatedString,
+            => @enumFromInt(extra_item),
+
+            u32,
+            i32,
+            => @bitCast(extra_item),
+
+            else => @compileError("bad field type: " ++ @typeName(field.type)),
+        };
+    }
+    return .{
+        .data = result,
+        .end = @intCast(index + fields.len),
+    };
+}
+
+fn extraData(ip: *const InternPool, comptime T: type, index: u32) T {
+    return extraDataTrail(ip, T, index).data;
+}
+
+/// Trailing: Limb for every limbs_len
+pub const Int = packed struct {
+    ty: Index,
+    limbs_len: u32,
+
+    const limbs_items_len = @divExact(@sizeOf(Int), @sizeOf(Limb));
+};
+
+/// A f64 value, broken up into 2 u32 parts.
+pub const Float64 = struct {
+    piece0: u32,
+    piece1: u32,
+
+    pub fn get(self: Float64) f64 {
+        const int_bits = @as(u64, self.piece0) | (@as(u64, self.piece1) << 32);
+        return @bitCast(int_bits);
+    }
+
+    fn pack(val: f64) Float64 {
+        const bits: u64 = @bitCast(val);
+        return .{
+            .piece0 = @truncate(bits),
+            .piece1 = @truncate(bits >> 32),
+        };
+    }
+};
 
 pub fn deinit(
     ip: *InternPool,
@@ -164,6 +500,7 @@ pub fn deinit(
     ip.strings.deinit(gpa);
     ip.string_map.deinit(gpa);
     ip.extra.deinit(gpa);
+    ip.limbs.deinit(gpa);
 }
 
 /// Stored-side context. The map holds `Index`es; we need the ip to
@@ -175,6 +512,8 @@ const Context = struct {
         return ctx.ip.indexToKey(index).hash64(ctx.ip);
     }
     pub fn eql(ctx: @This(), a: Index, b: Index) bool {
+        std.debug.print("a .{}", .{ctx.ip.indexToKey(a)});
+        std.debug.print("b .{}", .{ctx.ip.indexToKey(a)});
         return std.meta.eql(ctx.ip.indexToKey(a), ctx.ip.indexToKey(b));
     }
 };
@@ -187,7 +526,7 @@ const Adapter = struct {
         return key.hash64(adpt.ip);
     }
     pub fn eql(adpt: @This(), key: Key, stored: Index) bool {
-        return std.meta.eql(key, adpt.ip.indexToKey(stored));
+        return key.eql(adpt.ip.indexToKey(stored), adpt.ip);
     }
 };
 
@@ -201,10 +540,49 @@ pub const Tag = enum(u8) {
     /// A type that can be represented with only an enum tag.
     simple_type,
 
-    number_32,
+    /// Type: u32
+    /// data is integer value
+    int_u32,
+    /// Type: i32
+    /// data is integer value bitcasted to u32.
+    int_i32,
+    /// A comptime_int that fits in a u32.
+    /// data is integer value.
+    int_comptime_int_u32,
+    /// A comptime_int that fits in an i32.
+    /// data is integer value bitcasted to u32.
+    int_comptime_int_i32,
+    /// A positive integer value.
+    /// data is a limbs index to `Int`.
+    int_positive,
+    /// A negative integer value.
+    /// data is a limbs index to `Int`.
+    int_negative,
+    /// An f64 value.
+    /// data is extra index to Float64.
+    float_f64,
+    /// A comptime_float value.
+    /// data is extra index to Float64.
+    float_comptime_float,
 };
 
-pub const static_keys: [static_len]Key = .{.{ .simple_type = .comptime_number }};
+pub const static_keys: [static_len]Key = .{
+    .{ .simple_type = .comptime_int },
+    .{ .simple_type = .comptime_float },
+    .{ .simple_type = .f64 },
+    .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = 0 },
+    } },
+    .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = 1 },
+    } },
+    .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .i64 = -1 },
+    } },
+};
 
 test "InternPool same key returns same index" {
     const gpa = std.testing.allocator;
@@ -213,8 +591,8 @@ test "InternPool same key returns same index" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    const a = try ip.get(gpa, .{ .simple_type = .comptime_number });
-    const b = try ip.get(gpa, .{ .simple_type = .comptime_number });
+    const a = try ip.get(gpa, .{ .simple_type = .comptime_int });
+    const b = try ip.get(gpa, .{ .simple_type = .comptime_int });
     try std.testing.expect(a == b);
 }
 
@@ -225,9 +603,9 @@ test "InternPool same key returns not the same index" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    const a = try ip.get(gpa, .{ .number = 42 });
-    const b = try ip.get(gpa, .{ .number = 42 });
-    const c = try ip.get(gpa, .{ .number = 43 });
+    const a = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } });
+    const b = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } });
+    const c = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 43 } } });
     try std.testing.expect(a == b);
     try std.testing.expect(a != c);
 }
@@ -245,4 +623,42 @@ test "InternPool getString dedups identical bytes" {
     try std.testing.expect(a != c);
     try std.testing.expectEqualStrings("foo", a.toSlice(&ip));
     try std.testing.expectEqualStrings("bar", c.toSlice(&ip));
+}
+
+test "InternPool dedups the same value across storage variants" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const via_u64 = try ip.get(gpa, .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = 42 },
+    } });
+
+    var limbs = [_]Limb{42};
+    const via_big = try ip.get(gpa, .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .big_int = .{ .limbs = &limbs, .positive = true } },
+    } });
+
+    try std.testing.expect(via_u64 == via_big);
+}
+
+test "InternPool dedups big integers" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    // 2^100: limb0 = 0, limb1 = 2^36 (on 64-bit limbs)
+    var limbs = [_]Limb{ 0, 1 << 36 };
+    const key: Key = .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .big_int = .{ .limbs = &limbs, .positive = true } },
+    } };
+
+    const a = try ip.get(gpa, key);
+    const b = try ip.get(gpa, key);
+    try std.testing.expect(a == b);
 }

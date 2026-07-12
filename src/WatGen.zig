@@ -56,10 +56,20 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data) !void {
 fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
     const ip_index = ref.toInterned() orelse @panic("inst-index refs not supported yet");
     switch (gen.ip.indexToKey(ip_index)) {
-        .number => |n| {
+        .int => |int| {
+            // The function result is i32 for now, so that is the runtime
+            // boundary: comptime ints of any width are fine as long as the
+            // final value fits. A `.big_int` here never fits — decode
+            // narrowing only leaves limbs for values beyond u64/i64.
+            const value = switch (int.storage) {
+                inline .u64, .i64 => |x| std.math.cast(i32, x) orelse
+                    @panic("TODO: integer result does not fit in i32"),
+                .big_int => @panic("TODO: integer result does not fit in i32"),
+            };
             try gen.writeIndent();
-            try gen.out.print("i32.const {d}\n", .{n});
+            try gen.out.print("i32.const {d}\n", .{value});
         },
+        .float => @panic("TODO: float lowering awaits the number->wasm type decision"),
         .simple_type => @panic("type as value not supported yet"),
     }
 }

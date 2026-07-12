@@ -31,6 +31,9 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
 
     defer astgen.deinit(gpa);
 
+    // String table index 0 is reserved for `NullTerminatedString.empty`.
+    try astgen.string_bytes.append(gpa, 0);
+
     // We expect at least as many DIR instructions and extra data items
     // as AST nodes.
     try astgen.instructions.ensureTotalCapacity(gpa, tree.nodes.len);
@@ -50,6 +53,7 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     }
 
     try astgen.extra.shrinkToLen(gpa);
+    try astgen.string_bytes.shrinkToLen(gpa);
 
     return .{
         .instructions = astgen.instructions.toOwnedSlice(),
@@ -348,6 +352,20 @@ test "int literal" {
     );
 }
 
+test "float literal" {
+    try expect("3.14",
+        \\%0 = float(3.14)
+        \\
+    );
+}
+
+test "big int literal" {
+    try expect("18446744073709551616", // 2^64, one past u64
+        \\%0 = int_big(18446744073709551616)
+        \\
+    );
+}
+
 test "simple binary op" {
     try expect("1 + 2",
         \\%0 = int(1)
@@ -377,4 +395,35 @@ test "simple binary op" {
         \\%6 = div(%4, %5) node_offset:1:1 to :1:17
         \\
     );
+}
+
+test "negation" {
+    // int literal: stored positive, sign is a negate instruction
+    try expect("-5",
+        \\%0 = int(5)
+        \\%1 = negate(%0) node_offset:1:1 to :1:3
+        \\
+    );
+    // float literal: sign folds into the constant, no negate
+    try expect("-3.14",
+        \\%0 = float(-3.14)
+        \\
+    );
+    // non-literal operand: general path. The negate span excludes the closing
+    // paren: parens produce no AST node, so `lastToken` stops at the inner `2`.
+    // See TODO(tzelon) on Parse.grouping.
+    try expect("-(1 + 2)",
+        \\%0 = int(1)
+        \\%1 = int(2)
+        \\%2 = add(%0, %1) node_offset:1:3 to :1:8
+        \\%3 = negate(%2) node_offset:1:1 to :1:8
+        \\
+    );
+}
+
+test "negative zero int is rejected" {
+    const gpa = std.testing.allocator;
+    var tree = try Ast.parse(gpa, "-0");
+    defer tree.deinit(gpa);
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
 }

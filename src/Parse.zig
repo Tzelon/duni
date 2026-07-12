@@ -196,6 +196,10 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
     });
 }
 
+// TODO(tzelon): parens are folded away, so node spans stop at the inner
+// expression (`-(1 + 2)` reports a span without the `)`). Keep the paren
+// tokens in the AST (e.g. a grouped node storing the r_paren, like Zig's
+// grouped_expression) once the LSP and other tooling need exact spans.
 fn grouping(p: *Parse) !Node.Index {
     _ = p.advance();
     const inner = try p.expression();

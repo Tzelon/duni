@@ -100,7 +100,9 @@ pub fn intDivTrunc(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value 
 
 // Float
 
+/// Negate a float by flipping its sign. Must not lower to `0 - x`:
+/// IEEE says `0.0 - (-0.0) == +0.0`, which would lose negative zero.
 pub fn floatNeg(sema: *Sema, ip: *InternPool, val: Value) !Value {
-    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = -val.toFloat(f64, ip) } } });
+    const result_ip = try ip.get(sema.gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = -val.toFloat(f64, ip) } } });
     return Value.fromInterned(result_ip);
 }

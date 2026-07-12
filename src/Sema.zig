@@ -62,7 +62,6 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
             .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
             .negate => try sema.dirNegate(ip, inst_idx),
             .div => try sema.dirDiv(ip, inst_idx),
-            else => unreachable,
         };
 
         sema.inst_map.putAssumeCapacity(inst_idx, air_ref);
@@ -85,7 +84,7 @@ fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
     return Air.Inst.Ref.fromInterned(ip_index);
 }
 
-fn dirIntBig(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Dir.Inst.Ref {
+fn dirIntBig(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const int = sema.code.instructions.items(.data)[@intFromEnum(inst)].str;
     const byte_count = int.len * @sizeOf(std.math.big.Limb);
     const limb_bytes = sema.code.string_bytes[@intFromEnum(int.start)..][0..byte_count];
@@ -318,83 +317,48 @@ pub const CompileError = error{
     AnalysisFail,
 };
 
-test "analyze int literal" {
-    const gpa = std.testing.allocator;
+// Test helpers
 
-    var insts: std.MultiArrayList(Dir.Inst) = .{};
-    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 42 } });
+/// Build a `Dir` from hand-written instructions. `bin_extra` holds the callers'
+/// `Bin` payloads; the body (every instruction, in order) is appended after it,
+/// mirroring AstGen.generate's main-body layout.
+fn buildTestDir(
+    gpa: Allocator,
+    insts: []const Dir.Inst,
+    bin_extra: []const u32,
+    string_bytes: []const u8,
+) !Dir {
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    errdefer list.deinit(gpa);
+    for (insts) |inst| try list.append(gpa, inst);
 
-    const extra = try gpa.alloc(u32, 1);
-    const string_bytes = try gpa.alloc(u8, 1);
-    extra[0] = 0; // body[0] = instruction index 0
+    const extra = try gpa.alloc(u32, bin_extra.len + insts.len);
+    errdefer gpa.free(extra);
+    @memcpy(extra[0..bin_extra.len], bin_extra);
+    for (0..insts.len) |i| extra[bin_extra.len + i] = @intCast(i);
 
-    var dir = Dir{
-        .instructions = insts.toOwnedSlice(),
+    return .{
+        .instructions = list.toOwnedSlice(),
         .extra = extra,
-        .string_bytes = string_bytes,
-        .main_body_start = 0,
-        .main_body_len = 1,
+        .string_bytes = try gpa.dupe(u8, string_bytes),
+        .main_body_start = @intCast(bin_extra.len),
+        .main_body_len = @intCast(insts.len),
     };
-    defer dir.deinit(gpa);
-
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    var air = try Sema.analyze(gpa, dir, &ip);
-    defer air.deinit(gpa);
-
-    try std.testing.expectEqual(@as(usize, 1), air.instructions.len);
-
-    const tags = air.instructions.items(.tag);
-    const datas = air.instructions.items(.data);
-    try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
-
-    const ip_index = datas[0].un_op.toInterned().?;
-    try std.testing.expectEqual(InternPool.Key{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } }, ip.indexToKey(ip_index));
 }
 
-test "analyze 1 + 2" {
+/// Analyze a hand-built Dir and expect the returned value to intern to
+/// `expected`. Comparing indexes (not keys) is exact for every value kind:
+/// big-int keys hold slices and 0.0/-0.0 compare equal as floats, but the
+/// pool guarantees one index per canonical value.
+fn expectAnalyzed(
+    insts: []const Dir.Inst,
+    bin_extra: []const u32,
+    string_bytes: []const u8,
+    expected: InternPool.Key,
+) !void {
     const gpa = std.testing.allocator;
 
-    // Dir layout for `1 + 2`:
-    //   %0 = int(1)
-    //   %1 = int(2)
-    //   %2 = add  pl_node{ payload_index = 0 }
-    //
-    // extra:
-    //   [0] = Bin.lhs = ref(%0)
-    //   [1] = Bin.rhs = ref(%1)
-    //   [2..5] = body indices [0, 1, 2]
-    var insts: std.MultiArrayList(Dir.Inst) = .{};
-    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
-    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
-    try insts.append(gpa, .{
-        .tag = .sub,
-        .data = .{ .pl_node = .{
-            .src_node = @enumFromInt(0),
-            .payload_index = 0,
-        } },
-    });
-
-    const idx_0: Dir.Inst.Index = @enumFromInt(0);
-    const idx_1: Dir.Inst.Index = @enumFromInt(1);
-
-    const extra = try gpa.alloc(u32, 5);
-    const string_bytes = try gpa.alloc(u8, 5);
-    extra[0] = @intFromEnum(idx_0.toRef()); // Bin.lhs = %0
-    extra[1] = @intFromEnum(idx_1.toRef()); // Bin.rhs = %1
-    extra[2] = 0; // body[0] = %0
-    extra[3] = 1; // body[1] = %1
-    extra[4] = 2; // body[2] = %2
-
-    var dir = Dir{
-        .instructions = insts.toOwnedSlice(),
-        .extra = extra,
-        .string_bytes = string_bytes,
-        .main_body_start = 2,
-        .main_body_len = 3,
-    };
+    var dir = try buildTestDir(gpa, insts, bin_extra, string_bytes);
     defer dir.deinit(gpa);
 
     var ip: InternPool = .{};
@@ -405,57 +369,84 @@ test "analyze 1 + 2" {
     defer air.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), air.instructions.len);
+    try std.testing.expectEqual(Air.Inst.Tag.ret, air.instructions.items(.tag)[0]);
 
-    const tags = air.instructions.items(.tag);
-    const datas = air.instructions.items(.data);
-    try std.testing.expectEqual(Air.Inst.Tag.ret, tags[0]);
+    const actual = air.instructions.items(.data)[0].un_op.toInterned().?;
+    try std.testing.expectEqual(try ip.get(gpa, expected), actual);
+}
 
-    const ip_index = datas[0].un_op.toInterned().?;
+fn instRef(i: u32) Dir.Inst.Ref {
+    return @as(Dir.Inst.Index, @enumFromInt(i)).toRef();
+}
 
-    try std.testing.expectEqual(InternPool.Key{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } }, ip.indexToKey(ip_index));
+test "analyze int literal" {
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 42 } },
+    }, &.{}, &.{}, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } });
+}
+
+test "analyze big int literal" {
+    const limbs = [_]std.math.big.Limb{ 0, 1 }; // 2^64
+    try expectAnalyzed(&.{
+        .{ .tag = .int_big, .data = .{ .str = .{ .start = @enumFromInt(0), .len = limbs.len } } },
+    }, &.{}, mem.sliceAsBytes(&limbs), .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .big_int = .{ .limbs = &limbs, .positive = true } },
+    } });
+}
+
+test "analyze float literal" {
+    try expectAnalyzed(&.{
+        .{ .tag = .float, .data = .{ .float = 3.14 } },
+    }, &.{}, &.{}, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 3.14 } } });
+}
+
+test "analyze subtraction with negative result" {
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .int, .data = .{ .int = 2 } },
+        .{ .tag = .sub, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .i64 = -1 },
+    } });
+}
+
+test "analyze division" {
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 7 } },
+        .{ .tag = .int, .data = .{ .int = 2 } },
+        .{ .tag = .div, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .int = .{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = 3 }, // trunc
+    } });
+}
+
+test "analyze negate int" {
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 5 } },
+        .{ .tag = .negate, .data = .{ .un_node = .{ .src_node = @enumFromInt(0), .operand = instRef(0) } } },
+    }, &.{}, &.{}, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -5 } } });
+}
+
+test "analyze negate preserves negative zero" {
+    // Sharp because we compare indexes: if negation produced +0.0, interning
+    // the expected -0.0 would create a distinct index and the test fails.
+    try expectAnalyzed(&.{
+        .{ .tag = .float, .data = .{ .float = 0.0 } },
+        .{ .tag = .negate, .data = .{ .un_node = .{ .src_node = @enumFromInt(0), .operand = instRef(0) } } },
+    }, &.{}, &.{}, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = -0.0 } } });
 }
 
 test "analyze 1 / 0 fails analysis" {
     const gpa = std.testing.allocator;
 
-    // Dir layout for `1 / 0`:
-    //   %0 = int(1)
-    //   %1 = int(0)
-    //   %2 = div  pl_node{ payload_index = 0 }
-    //
-    // extra:
-    //   [0] = Bin.lhs = ref(%0)
-    //   [1] = Bin.rhs = ref(%1)
-    //   [2..5] = body indices [0, 1, 2]
-    var insts: std.MultiArrayList(Dir.Inst) = .{};
-    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
-    try insts.append(gpa, .{ .tag = .int, .data = .{ .int = 0 } });
-    try insts.append(gpa, .{
-        .tag = .div,
-        .data = .{ .pl_node = .{
-            .src_node = @enumFromInt(0),
-            .payload_index = 0,
-        } },
-    });
-
-    const idx_0: Dir.Inst.Index = @enumFromInt(0);
-    const idx_1: Dir.Inst.Index = @enumFromInt(1);
-
-    const extra = try gpa.alloc(u32, 5);
-    const string_bytes = try gpa.alloc(u8, 5);
-    extra[0] = @intFromEnum(idx_0.toRef()); // Bin.lhs = %0
-    extra[1] = @intFromEnum(idx_1.toRef()); // Bin.rhs = %1
-    extra[2] = 0; // body[0] = %0
-    extra[3] = 1; // body[1] = %1
-    extra[4] = 2; // body[2] = %2
-
-    var dir = Dir{
-        .instructions = insts.toOwnedSlice(),
-        .extra = extra,
-        .string_bytes = string_bytes,
-        .main_body_start = 2,
-        .main_body_len = 3,
-    };
+    var dir = try buildTestDir(gpa, &.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .int, .data = .{ .int = 0 } },
+        .{ .tag = .div, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{});
     defer dir.deinit(gpa);
 
     var ip: InternPool = .{};

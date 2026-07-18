@@ -1,0 +1,1593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>InternPool — How It Works</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    @layer reset, base, layout, components, utilities;
+
+    @layer reset {
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      html { scroll-behavior: smooth; }
+    }
+
+    @layer base {
+      :root {
+        --bg: #0d1117;
+        --bg-card: #161b22;
+        --bg-code: #0d1117;
+        --bg-highlight: #1c2128;
+        --border: #30363d;
+        --border-subtle: #21262d;
+
+        --text: #e6edf3;
+        --text-muted: #8b949e;
+        --text-dim: #6e7681;
+
+        --accent-blue: #58a6ff;
+        --accent-green: #3fb950;
+        --accent-orange: #f0883e;
+        --accent-purple: #bc8cff;
+        --accent-red: #f85149;
+        --accent-yellow: #e3b341;
+        --accent-teal: #39d353;
+        --accent-pink: #f778ba;
+
+        --radius: 8px;
+        --radius-sm: 4px;
+        --radius-lg: 12px;
+
+        --shadow: 0 4px 24px rgba(0,0,0,.4);
+        --shadow-sm: 0 2px 8px rgba(0,0,0,.3);
+
+        --font-sans: 'Inter', system-ui, sans-serif;
+        --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+        --sidebar-w: 260px;
+        --content-max: 860px;
+      }
+
+      body {
+        font-family: var(--font-sans);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 15px;
+        line-height: 1.7;
+        min-height: 100dvh;
+      }
+
+      h1, h2, h3, h4 {
+        line-height: 1.25;
+        font-weight: 600;
+        letter-spacing: -.02em;
+      }
+
+      a { color: var(--accent-blue); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      code {
+        font-family: var(--font-mono);
+        font-size: .875em;
+        background: var(--bg-code);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        padding: .1em .4em;
+        color: var(--accent-orange);
+      }
+
+      p { margin-block: .75em; }
+      p:first-child { margin-top: 0; }
+
+      ul, ol { padding-left: 1.4em; }
+      li { margin-block: .3em; }
+    }
+
+    @layer layout {
+      .shell {
+        display: grid;
+        grid-template-columns: var(--sidebar-w) 1fr;
+        grid-template-rows: auto 1fr;
+        min-height: 100dvh;
+      }
+
+      .topbar {
+        grid-column: 1 / -1;
+        background: var(--bg-card);
+        border-bottom: 1px solid var(--border);
+        padding: .75rem 1.5rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        background: color-mix(in srgb, var(--bg-card) 90%, transparent);
+      }
+
+      .sidebar {
+        background: var(--bg-card);
+        border-right: 1px solid var(--border);
+        padding: 1.5rem 1rem;
+        position: sticky;
+        top: 57px;
+        height: calc(100dvh - 57px);
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .main {
+        padding: 2.5rem 2rem;
+        max-width: calc(var(--content-max) + 4rem);
+        overflow-x: hidden;
+      }
+
+      .section {
+        margin-block: 2.5rem;
+        scroll-margin-top: 80px;
+      }
+
+      .section:first-child { margin-top: 0; }
+
+      @media (max-width: 768px) {
+        .shell { grid-template-columns: 1fr; }
+        .sidebar { display: none; }
+        .main { padding: 1.5rem 1rem; }
+      }
+    }
+
+    @layer components {
+      /* ── Topbar ── */
+      .topbar-logo {
+        font-family: var(--font-mono);
+        font-weight: 500;
+        font-size: .85rem;
+        color: var(--text-muted);
+        background: var(--bg-highlight);
+        padding: .25rem .6rem;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border);
+      }
+
+      .topbar h1 {
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--text);
+      }
+
+      .topbar-badge {
+        margin-left: auto;
+        font-size: .75rem;
+        color: var(--text-dim);
+        font-family: var(--font-mono);
+      }
+
+      /* ── Sidebar nav ── */
+      .nav-section {
+        margin-block: 1.25rem;
+      }
+
+      .nav-label {
+        font-size: .7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .1em;
+        color: var(--text-dim);
+        padding: 0 .5rem;
+        margin-bottom: .4rem;
+      }
+
+      .nav-link {
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+        padding: .35rem .5rem;
+        border-radius: var(--radius-sm);
+        color: var(--text-muted);
+        font-size: .85rem;
+        transition: background .15s, color .15s;
+
+        &:hover {
+          background: var(--bg-highlight);
+          color: var(--text);
+          text-decoration: none;
+        }
+
+        &.active {
+          background: color-mix(in srgb, var(--accent-blue) 15%, transparent);
+          color: var(--accent-blue);
+        }
+      }
+
+      .nav-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: .5;
+        flex-shrink: 0;
+      }
+
+      /* ── Section headings ── */
+      .section-title {
+        font-size: 1.5rem;
+        color: var(--text);
+        margin-bottom: 1rem;
+        display: flex;
+        align-items: center;
+        gap: .75rem;
+      }
+
+      .section-title .icon {
+        font-size: 1.25rem;
+      }
+
+      .subsection-title {
+        font-size: 1.1rem;
+        color: var(--text);
+        margin-top: 1.75rem;
+        margin-bottom: .75rem;
+        padding-bottom: .4rem;
+        border-bottom: 1px solid var(--border-subtle);
+      }
+
+      /* ── Cards ── */
+      .card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1.25rem 1.5rem;
+        margin-block: 1rem;
+      }
+
+      .card.accent-blue  { border-left: 3px solid var(--accent-blue);   }
+      .card.accent-green { border-left: 3px solid var(--accent-green);  }
+      .card.accent-orange{ border-left: 3px solid var(--accent-orange); }
+      .card.accent-purple{ border-left: 3px solid var(--accent-purple); }
+      .card.accent-yellow{ border-left: 3px solid var(--accent-yellow); }
+
+      .card-title {
+        font-size: .8rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        margin-bottom: .5rem;
+      }
+
+      .card.accent-blue   .card-title { color: var(--accent-blue);   }
+      .card.accent-green  .card-title { color: var(--accent-green);  }
+      .card.accent-orange .card-title { color: var(--accent-orange); }
+      .card.accent-purple .card-title { color: var(--accent-purple); }
+      .card.accent-yellow .card-title { color: var(--accent-yellow); }
+
+      /* ── Code blocks ── */
+      pre {
+        background: var(--bg-code);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1rem 1.25rem;
+        overflow-x: auto;
+        font-family: var(--font-mono);
+        font-size: .82rem;
+        line-height: 1.65;
+        margin-block: .75rem;
+
+        & code {
+          background: none;
+          border: none;
+          padding: 0;
+          color: var(--text);
+          font-size: inherit;
+        }
+      }
+
+      .kw  { color: #ff7b72; }
+      .ty  { color: #79c0ff; }
+      .fn  { color: #d2a8ff; }
+      .str { color: #a5d6ff; }
+      .num { color: #f0883e; }
+      .cm  { color: var(--text-dim); font-style: italic; }
+      .op  { color: #ff7b72; }
+      .fi  { color: var(--accent-green); }
+
+      /* ── Memory layout diagrams ── */
+      .mem-diagram {
+        margin-block: 1.25rem;
+        overflow-x: auto;
+      }
+
+      .mem-label {
+        font-family: var(--font-mono);
+        font-size: .75rem;
+        color: var(--text-muted);
+        margin-bottom: .35rem;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+      }
+
+      .mem-row {
+        display: flex;
+        align-items: stretch;
+        gap: 2px;
+        margin-block: 2px;
+      }
+
+      .mem-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: .4rem .6rem;
+        border-radius: var(--radius-sm);
+        font-family: var(--font-mono);
+        font-size: .75rem;
+        min-width: 60px;
+        text-align: center;
+        line-height: 1.3;
+        border: 1px solid transparent;
+      }
+
+      .mem-cell .cell-label {
+        font-size: .65rem;
+        opacity: .7;
+        margin-bottom: .2rem;
+      }
+
+      .mem-cell.blue   { background: color-mix(in srgb, var(--accent-blue)   20%, var(--bg-card)); border-color: var(--accent-blue);   color: var(--accent-blue);   }
+      .mem-cell.green  { background: color-mix(in srgb, var(--accent-green)  20%, var(--bg-card)); border-color: var(--accent-green);  color: var(--accent-green);  }
+      .mem-cell.orange { background: color-mix(in srgb, var(--accent-orange) 20%, var(--bg-card)); border-color: var(--accent-orange); color: var(--accent-orange); }
+      .mem-cell.purple { background: color-mix(in srgb, var(--accent-purple) 20%, var(--bg-card)); border-color: var(--accent-purple); color: var(--accent-purple); }
+      .mem-cell.yellow { background: color-mix(in srgb, var(--accent-yellow) 20%, var(--bg-card)); border-color: var(--accent-yellow); color: var(--accent-yellow); }
+      .mem-cell.teal   { background: color-mix(in srgb, var(--accent-teal)   20%, var(--bg-card)); border-color: var(--accent-teal);   color: var(--accent-teal);   }
+      .mem-cell.dim    { background: var(--bg-highlight); border-color: var(--border); color: var(--text-dim); }
+      .mem-cell.pink   { background: color-mix(in srgb, var(--accent-pink)   20%, var(--bg-card)); border-color: var(--accent-pink);   color: var(--accent-pink);   }
+
+      .mem-arrow {
+        display: flex;
+        align-items: center;
+        padding: 0 .25rem;
+        color: var(--text-dim);
+        font-size: .9rem;
+      }
+
+      .mem-index {
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        color: var(--text-dim);
+        padding-right: .5rem;
+        min-width: 28px;
+        text-align: right;
+        align-self: center;
+      }
+
+      .mem-connector {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 2px;
+        padding: .25rem 0;
+      }
+
+      .connector-line {
+        width: 2px;
+        height: 16px;
+        background: var(--border);
+      }
+
+      /* ── Pipeline diagram ── */
+      .pipeline {
+        display: flex;
+        align-items: center;
+        gap: 0;
+        flex-wrap: wrap;
+        margin-block: 1rem;
+        row-gap: .5rem;
+      }
+
+      .pipeline-step {
+        background: var(--bg-highlight);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: .4rem .8rem;
+        font-family: var(--font-mono);
+        font-size: .78rem;
+        color: var(--text);
+        white-space: nowrap;
+      }
+
+      .pipeline-arrow {
+        color: var(--text-dim);
+        padding: 0 .4rem;
+        font-size: .9rem;
+      }
+
+      /* ── Flow steps ── */
+      .flow {
+        counter-reset: flow-step;
+        display: flex;
+        flex-direction: column;
+        gap: .6rem;
+        margin-block: 1rem;
+      }
+
+      .flow-step {
+        display: grid;
+        grid-template-columns: 2rem 1fr;
+        gap: .75rem;
+        align-items: start;
+        padding: .8rem 1rem;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        counter-increment: flow-step;
+        position: relative;
+
+        &::before {
+          content: counter(flow-step);
+          width: 2rem;
+          height: 2rem;
+          border-radius: 50%;
+          background: var(--accent-blue);
+          color: var(--bg);
+          font-weight: 700;
+          font-size: .8rem;
+          display: grid;
+          place-items: center;
+          flex-shrink: 0;
+        }
+      }
+
+      .flow-step-content {
+        padding-top: .15rem;
+      }
+
+      .flow-step-title {
+        font-weight: 600;
+        font-size: .9rem;
+        margin-bottom: .25rem;
+      }
+
+      .flow-step-desc {
+        font-size: .85rem;
+        color: var(--text-muted);
+        margin: 0;
+      }
+
+      /* ── Tag table ── */
+      .tag-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: .84rem;
+        margin-block: 1rem;
+      }
+
+      .tag-table thead th {
+        background: var(--bg-highlight);
+        padding: .6rem 1rem;
+        text-align: left;
+        font-size: .75rem;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        color: var(--text-muted);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .tag-table tbody tr {
+        border-bottom: 1px solid var(--border-subtle);
+        transition: background .1s;
+      }
+
+      .tag-table tbody tr:hover {
+        background: var(--bg-highlight);
+      }
+
+      .tag-table td {
+        padding: .6rem 1rem;
+        vertical-align: top;
+      }
+
+      .tag-table td:first-child {
+        font-family: var(--font-mono);
+        font-size: .8rem;
+        color: var(--accent-purple);
+        white-space: nowrap;
+      }
+
+      .tag-table td:nth-child(2) {
+        color: var(--text-muted);
+        font-size: .8rem;
+      }
+
+      .tag-table td:nth-child(3) {
+        color: var(--text);
+        font-size: .82rem;
+      }
+
+      /* ── Storage chips ── */
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: .3rem;
+        padding: .15rem .5rem;
+        border-radius: 999px;
+        font-size: .72rem;
+        font-family: var(--font-mono);
+        font-weight: 500;
+        border: 1px solid transparent;
+      }
+
+      .chip.blue   { background: color-mix(in srgb, var(--accent-blue)   15%, transparent); border-color: var(--accent-blue);   color: var(--accent-blue);   }
+      .chip.green  { background: color-mix(in srgb, var(--accent-green)  15%, transparent); border-color: var(--accent-green);  color: var(--accent-green);  }
+      .chip.orange { background: color-mix(in srgb, var(--accent-orange) 15%, transparent); border-color: var(--accent-orange); color: var(--accent-orange); }
+      .chip.purple { background: color-mix(in srgb, var(--accent-purple) 15%, transparent); border-color: var(--accent-purple); color: var(--accent-purple); }
+
+      /* ── Key-Value pairs ── */
+      .kv-grid {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: .4rem 1rem;
+        margin-block: .75rem;
+        font-size: .85rem;
+      }
+
+      .kv-key {
+        font-family: var(--font-mono);
+        color: var(--accent-orange);
+        font-size: .82rem;
+        align-self: start;
+        padding-top: .05em;
+      }
+
+      .kv-val {
+        color: var(--text-muted);
+      }
+
+      /* ── Index map visual ── */
+      .index-map {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: .5rem;
+        margin-block: 1rem;
+      }
+
+      .index-entry {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: .5rem .75rem;
+        text-align: center;
+      }
+
+      .index-num {
+        font-family: var(--font-mono);
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: var(--accent-blue);
+        display: block;
+      }
+
+      .index-name {
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        color: var(--text-muted);
+        display: block;
+        margin-top: .15rem;
+      }
+
+      .index-desc {
+        font-size: .7rem;
+        color: var(--text-dim);
+        display: block;
+        margin-top: .2rem;
+      }
+
+      /* ── Divider ── */
+      .divider {
+        border: none;
+        border-top: 1px solid var(--border-subtle);
+        margin-block: 2rem;
+      }
+
+      /* ── Big layout diagram ── */
+      .layout-diagram {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-block: 1.25rem;
+      }
+
+      .layout-array {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1rem;
+      }
+
+      .layout-array-title {
+        font-size: .72rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .1em;
+        color: var(--text-dim);
+        margin-bottom: .75rem;
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+      }
+
+      .layout-array-title .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+      }
+
+      .layout-slot {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: .35rem .75rem;
+        margin-block: .2rem;
+        align-items: center;
+      }
+
+      .slot-idx {
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        color: var(--text-dim);
+        text-align: right;
+        min-width: 18px;
+      }
+
+      .slot-bar {
+        height: 20px;
+        border-radius: 3px;
+        display: flex;
+        align-items: center;
+        padding: 0 .5rem;
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* ── Callout ── */
+      .callout {
+        display: flex;
+        gap: .75rem;
+        padding: .9rem 1.1rem;
+        border-radius: var(--radius);
+        margin-block: 1rem;
+        font-size: .88rem;
+      }
+
+      .callout.info    { background: color-mix(in srgb, var(--accent-blue)  10%, var(--bg-card)); border: 1px solid color-mix(in srgb, var(--accent-blue)  30%, transparent); }
+      .callout.warning { background: color-mix(in srgb, var(--accent-yellow)10%, var(--bg-card)); border: 1px solid color-mix(in srgb, var(--accent-yellow)30%, transparent); }
+      .callout.tip     { background: color-mix(in srgb, var(--accent-green) 10%, var(--bg-card)); border: 1px solid color-mix(in srgb, var(--accent-green) 30%, transparent); }
+
+      .callout-icon { font-size: 1.1rem; flex-shrink: 0; line-height: 1.5; }
+      .callout-body { color: var(--text-muted); }
+      .callout-body p { margin: 0; }
+      .callout-body strong { color: var(--text); }
+    }
+
+    @layer utilities {
+      .text-muted  { color: var(--text-muted); }
+      .text-dim    { color: var(--text-dim); }
+      .mono        { font-family: var(--font-mono); }
+      .mt-0        { margin-top: 0; }
+      .mb-0        { margin-bottom: 0; }
+      .gap-sm      { gap: .5rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ═══ TOP BAR ═══ -->
+  <header class="topbar">
+    <span class="topbar-logo">duni / src</span>
+    <h1>InternPool.zig</h1>
+    <span class="topbar-badge">Memory Layout &amp; Usage Guide</span>
+  </header>
+
+  <!-- ═══ SIDEBAR ═══ -->
+  <nav class="sidebar" aria-label="Page navigation">
+    <div class="nav-section">
+      <div class="nav-label">Overview</div>
+      <a href="#what-is-it"  class="nav-link"><span class="nav-dot"></span>What is it?</a>
+      <a href="#big-picture" class="nav-link"><span class="nav-dot"></span>Big picture</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Data structures</div>
+      <a href="#fields"      class="nav-link"><span class="nav-dot"></span>Fields</a>
+      <a href="#index"       class="nav-link"><span class="nav-dot"></span>Index enum</a>
+      <a href="#key"         class="nav-link"><span class="nav-dot"></span>Key union</a>
+      <a href="#tag"         class="nav-link"><span class="nav-dot"></span>Tag enum</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Memory Layout</div>
+      <a href="#items-layout"   class="nav-link"><span class="nav-dot"></span>items array</a>
+      <a href="#extra-layout"   class="nav-link"><span class="nav-dot"></span>extra array</a>
+      <a href="#limbs-layout"   class="nav-link"><span class="nav-dot"></span>limbs array</a>
+      <a href="#strings-layout" class="nav-link"><span class="nav-dot"></span>string storage</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Operations</div>
+      <a href="#init"       class="nav-link"><span class="nav-dot"></span>init</a>
+      <a href="#get"        class="nav-link"><span class="nav-dot"></span>get (intern value)</a>
+      <a href="#getstring"  class="nav-link"><span class="nav-dot"></span>getString</a>
+      <a href="#indextokey" class="nav-link"><span class="nav-dot"></span>indexToKey</a>
+      <a href="#context"    class="nav-link"><span class="nav-dot"></span>Context &amp; Adapter</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Reference</div>
+      <a href="#static-keys" class="nav-link"><span class="nav-dot"></span>Static keys</a>
+      <a href="#worked-example" class="nav-link"><span class="nav-dot"></span>Worked example</a>
+    </div>
+  </nav>
+
+  <!-- ═══ MAIN CONTENT ═══ -->
+  <main class="main">
+
+    <!-- ─── WHAT IS IT ─── -->
+    <section class="section" id="what-is-it">
+      <h2 class="section-title"><span class="icon">📦</span>What is the InternPool?</h2>
+
+      <p>
+        The <code>InternPool</code> is a <strong>deduplicating value store</strong> used during
+        semantic analysis. Its job is simple: every typed value in the compiler (integers, floats,
+        types) gets assigned a stable <strong>integer index</strong>. Two values that are equal
+        always get the <em>same</em> index, so equality checks become a single integer comparison.
+      </p>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body">
+          <p><strong>Key insight:</strong> once a value is interned, you never compare values
+          directly again — you compare <code>Index</code> integers. <code>a == b</code> tells
+          you whether the values are identical, regardless of how they were originally stored.</p>
+        </div>
+      </div>
+
+      <p>
+        It is owned by <code>main.zig</code> and threaded through <code>Sema</code> and
+        <code>WatGen</code>. All stages read and write to the same pool.
+      </p>
+    </section>
+
+    <!-- ─── BIG PICTURE ─── -->
+    <section class="section" id="big-picture">
+      <h2 class="section-title"><span class="icon">🗺️</span>Big Picture</h2>
+
+      <p>The InternPool sits in the middle of the compiler pipeline:</p>
+
+      <div class="pipeline">
+        <span class="pipeline-step">Text</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">Scanner</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">Parse → Ast</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">AstGen → Dir</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" style="border-color:var(--accent-blue);color:var(--accent-blue)">Sema ← <strong>InternPool</strong></span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">Air</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">WatGen</span>
+      </div>
+
+      <p>
+        The pool does <strong>two separate things</strong>, each with its own storage:
+      </p>
+
+      <div class="layout-diagram">
+        <div class="layout-array">
+          <div class="layout-array-title">
+            <span class="dot" style="background:var(--accent-blue)"></span>
+            Value interning
+          </div>
+          <p class="text-muted" style="font-size:.84rem;margin:0">
+            Stores typed <em>values</em> (ints, floats, types). Returns an <code>Index</code>.
+            Three backing arrays: <code>items</code>, <code>extra</code>, <code>limbs</code>.
+          </p>
+        </div>
+        <div class="layout-array">
+          <div class="layout-array-title">
+            <span class="dot" style="background:var(--accent-green)"></span>
+            String interning
+          </div>
+          <p class="text-muted" style="font-size:.84rem;margin:0">
+            Stores UTF-8 strings. Returns a <code>NullTerminatedString</code> index.
+            Three backing arrays: <code>string_bytes</code>, <code>strings</code>, <code>string_map</code>.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── FIELDS ─── -->
+    <section class="section" id="fields">
+      <h2 class="section-title"><span class="icon">🗄️</span>Fields</h2>
+
+      <p>The struct has six fields. Here's what each one is for:</p>
+
+      <table class="tag-table">
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Type</th>
+            <th>Role</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>items</td>
+            <td>MultiArrayList(Item)</td>
+            <td>The main packed array. Every interned value is one slot here — a <code>tag</code> byte and a <code>data: u32</code>. The slot's array position <em>is</em> its <code>Index</code>.</td>
+          </tr>
+          <tr>
+            <td>map</td>
+            <td>HashMapUnmanaged(Index, void)</td>
+            <td>The dedup guard. Maps an <code>Index</code> → nothing (we only need the key). The <em>Adapter</em> trick lets us query it with a <code>Key</code> without inserting first.</td>
+          </tr>
+          <tr>
+            <td>extra</td>
+            <td>ArrayList(u32)</td>
+            <td>Flat u32 array for structured overflow. Floats (and future compound types) store their data here as a sequence of u32 fields.</td>
+          </tr>
+          <tr>
+            <td>limbs</td>
+            <td>ArrayList(Limb)</td>
+            <td>Storage for arbitrary-precision integers. Big ints are stored as a header (<code>Int</code> packed struct) followed by the raw limbs.</td>
+          </tr>
+          <tr>
+            <td>string_bytes</td>
+            <td>ArrayListUnmanaged(u8)</td>
+            <td>Flat byte buffer. All interned strings are appended here back-to-back, each null-terminated.</td>
+          </tr>
+          <tr>
+            <td>strings</td>
+            <td>ArrayListUnmanaged(u32)</td>
+            <td>Offset table. <code>strings[i]</code> is the byte offset of the <em>end</em> of string <code>i</code> (one past its null byte). Subtract the previous entry to find the start.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── INDEX ─── -->
+    <section class="section" id="index">
+      <h2 class="section-title"><span class="icon">🔢</span>Index enum</h2>
+
+      <p>
+        <code>Index</code> is a <code>u32</code>-backed enum. Its numeric value is the slot
+        number inside <code>items</code>. The first few values are <em>statically pre-allocated</em>
+        so every file in the compiler can refer to them by name without calling <code>get()</code>.
+      </p>
+
+      <div class="index-map">
+        <div class="index-entry">
+          <span class="index-num">0</span>
+          <span class="index-name">comptime_int_type</span>
+          <span class="index-desc">the type itself</span>
+        </div>
+        <div class="index-entry">
+          <span class="index-num">1</span>
+          <span class="index-name">comptime_float_type</span>
+          <span class="index-desc">the type itself</span>
+        </div>
+        <div class="index-entry">
+          <span class="index-num">2</span>
+          <span class="index-name">f64_type</span>
+          <span class="index-desc">the type itself</span>
+        </div>
+        <div class="index-entry">
+          <span class="index-num">3</span>
+          <span class="index-name">zero</span>
+          <span class="index-desc">0 (comptime_int)</span>
+        </div>
+        <div class="index-entry">
+          <span class="index-num">4</span>
+          <span class="index-name">one</span>
+          <span class="index-desc">1 (comptime_int)</span>
+        </div>
+        <div class="index-entry">
+          <span class="index-num">5</span>
+          <span class="index-name">negative_one</span>
+          <span class="index-desc">−1 (comptime_int)</span>
+        </div>
+        <div class="index-entry" style="border-style:dashed">
+          <span class="index-num" style="color:var(--text-dim)">6+</span>
+          <span class="index-name" style="color:var(--text-dim)">runtime values</span>
+          <span class="index-desc">added by get()</span>
+        </div>
+        <div class="index-entry" style="border-color:var(--accent-red)">
+          <span class="index-num" style="color:var(--accent-red)">2³²−1</span>
+          <span class="index-name" style="color:var(--accent-red)">none</span>
+          <span class="index-desc">sentinel / "no value"</span>
+        </div>
+      </div>
+
+      <div class="callout warning">
+        <span class="callout-icon">⚠️</span>
+        <div class="callout-body">
+          <p><strong>Order matters.</strong> The static indices are assigned by position in
+          <code>static_keys</code>, not by name. Adding an entry to <code>Index</code> or
+          <code>static_keys</code> shifts all subsequent values.</p>
+        </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── KEY ─── -->
+    <section class="section" id="key">
+      <h2 class="section-title"><span class="icon">🔑</span>Key union</h2>
+
+      <p>
+        A <code>Key</code> is the <em>logical description</em> of a value — what you hand to
+        <code>get()</code> to look something up or insert it. It is <strong>not</strong> stored
+        directly; it is only used for hashing and comparison, then discarded. The pool stores
+        a more compact encoded form.
+      </p>
+
+      <h3 class="subsection-title">Variants</h3>
+
+      <div class="card accent-purple">
+        <div class="card-title">simple_type</div>
+        <p>One of <code>comptime_int</code>, <code>comptime_float</code>, <code>f64</code>.
+        Stored as just the enum tag — no data needed because the <code>Index</code> value
+        itself encodes which type.</p>
+      </div>
+
+      <div class="card accent-blue">
+        <div class="card-title">int</div>
+        <p>An integer value. Has two parts:</p>
+        <div class="kv-grid">
+          <span class="kv-key">ty</span>
+          <span class="kv-val">the type index (currently only <code>comptime_int_type</code>)</span>
+          <span class="kv-key">storage</span>
+          <span class="kv-val">one of <code>.u64</code>, <code>.i64</code>, or <code>.big_int</code></span>
+        </div>
+        <div class="callout tip" style="margin-top:.75rem">
+          <span class="callout-icon">✅</span>
+          <div class="callout-body">
+            <p><strong>Storage variants are equivalent.</strong> <code>u64{42}</code>,
+            <code>i64{42}</code>, and a single-limb big_int of 42 all hash and compare as the
+            same value. Canonicalization is done via <code>toBigInt()</code> in the hash function.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card accent-orange">
+        <div class="card-title">float</div>
+        <p>A floating-point value. Has:</p>
+        <div class="kv-grid">
+          <span class="kv-key">ty</span>
+          <span class="kv-val"><code>comptime_float_type</code> or <code>f64_type</code></span>
+          <span class="kv-key">storage</span>
+          <span class="kv-val"><code>.f64 = f64</code> — bit-exact comparison (NaN ≠ NaN)</span>
+        </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── TAG ─── -->
+    <section class="section" id="tag">
+      <h2 class="section-title"><span class="icon">🏷️</span>Tag enum</h2>
+
+      <p>
+        The <code>Tag</code> is a one-byte discriminant stored alongside every item in
+        <code>items</code>. It tells you <em>how to interpret</em> the 32-bit <code>data</code>
+        field next to it.
+      </p>
+
+      <table class="tag-table">
+        <thead>
+          <tr>
+            <th>Tag</th>
+            <th>data field means</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>simple_type</td>
+            <td>0 (unused)</td>
+            <td>The <code>Index</code> value itself identifies the type via the <code>SimpleType</code> enum cast.</td>
+          </tr>
+          <tr>
+            <td>int_comptime_int_u32</td>
+            <td>integer value (fits in u32)</td>
+            <td>Fast path for small non-negative comptime ints.</td>
+          </tr>
+          <tr>
+            <td>int_comptime_int_i32</td>
+            <td>integer value, bitcast u32</td>
+            <td>Fast path for small negative comptime ints (e.g. −1).</td>
+          </tr>
+          <tr>
+            <td>int_u32 / int_i32</td>
+            <td>—</td>
+            <td>Reserved for future concrete integer types (not yet used — <code>unreachable</code> in <code>indexToKey</code>).</td>
+          </tr>
+          <tr>
+            <td>int_positive</td>
+            <td>index into <code>limbs</code></td>
+            <td>Positive big integer. Limbs array starts with an <code>Int</code> header, then raw <code>Limb</code> words.</td>
+          </tr>
+          <tr>
+            <td>int_negative</td>
+            <td>index into <code>limbs</code></td>
+            <td>Same layout as <code>int_positive</code> but the sign is negative.</td>
+          </tr>
+          <tr>
+            <td>float_f64</td>
+            <td>index into <code>extra</code></td>
+            <td>An f64 value split into two u32 pieces (<code>Float64</code> struct).</td>
+          </tr>
+          <tr>
+            <td>float_comptime_float</td>
+            <td>index into <code>extra</code></td>
+            <td>Same encoding as <code>float_f64</code>, different type.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── ITEMS MEMORY LAYOUT ─── -->
+    <section class="section" id="items-layout">
+      <h2 class="section-title"><span class="icon">🧱</span>items — Memory layout</h2>
+
+      <p>
+        <code>items</code> is a <code>MultiArrayList(Item)</code>. Zig's MultiArrayList stores each
+        field of a struct in its <em>own</em> contiguous array (struct-of-arrays), not interleaved.
+        So in memory there are really <em>two</em> arrays:
+      </p>
+
+      <div class="mem-diagram">
+        <div class="mem-label">items.items(.tag) — one u8 per slot</div>
+        <div class="mem-row">
+          <span class="mem-index">0</span>
+          <div class="mem-cell purple"><span class="cell-label">tag</span>simple_type</div>
+          <span class="mem-index">1</span>
+          <div class="mem-cell purple"><span class="cell-label">tag</span>simple_type</div>
+          <span class="mem-index">2</span>
+          <div class="mem-cell purple"><span class="cell-label">tag</span>simple_type</div>
+          <span class="mem-index">3</span>
+          <div class="mem-cell blue"><span class="cell-label">tag</span>int_u32</div>
+          <span class="mem-index">4</span>
+          <div class="mem-cell blue"><span class="cell-label">tag</span>int_u32</div>
+          <span class="mem-index">5</span>
+          <div class="mem-cell blue"><span class="cell-label">tag</span>int_i32</div>
+          <span class="mem-index">6</span>
+          <div class="mem-cell dim"><span class="cell-label">tag</span>…</div>
+        </div>
+
+        <div class="mem-label" style="margin-top:.75rem">items.items(.data) — one u32 per slot</div>
+        <div class="mem-row">
+          <span class="mem-index">0</span>
+          <div class="mem-cell dim"><span class="cell-label">data</span>0</div>
+          <span class="mem-index">1</span>
+          <div class="mem-cell dim"><span class="cell-label">data</span>0</div>
+          <span class="mem-index">2</span>
+          <div class="mem-cell dim"><span class="cell-label">data</span>0</div>
+          <span class="mem-index">3</span>
+          <div class="mem-cell blue"><span class="cell-label">data</span>0</div>
+          <span class="mem-index">4</span>
+          <div class="mem-cell blue"><span class="cell-label">data</span>1</div>
+          <span class="mem-index">5</span>
+          <div class="mem-cell blue"><span class="cell-label">data</span>0xFFFFFFFF</div>
+          <span class="mem-index">6</span>
+          <div class="mem-cell dim"><span class="cell-label">data</span>…</div>
+        </div>
+      </div>
+
+      <p>
+        The slot's position (0, 1, 2 …) <em>is</em> its <code>Index</code>. No pointer
+        indirection — to find a value you just read <code>items.tag[i]</code> and
+        <code>items.data[i]</code>.
+      </p>
+    </section>
+
+    <!-- ─── EXTRA MEMORY LAYOUT ─── -->
+    <section class="section" id="extra-layout">
+      <h2 class="section-title"><span class="icon">📐</span>extra — Structured overflow</h2>
+
+      <p>
+        When a value's data doesn't fit in 32 bits, it is serialized into <code>extra</code> and
+        <code>data</code> stores the starting index into this array.
+      </p>
+
+      <p>Currently used by floats. A <code>Float64</code> occupies <strong>two consecutive u32
+      slots</strong>: the low 32 bits, then the high 32 bits of the 64-bit IEEE representation.
+      </p>
+
+      <div class="mem-diagram">
+        <div class="mem-label">items[N] — a float</div>
+        <div class="mem-row">
+          <div class="mem-cell orange"><span class="cell-label">tag</span>float_comptime_float</div>
+          <div class="mem-cell orange"><span class="cell-label">data</span>idx = 4</div>
+        </div>
+
+        <div style="height:.75rem"></div>
+        <div class="mem-label">extra — indexed by data value</div>
+        <div class="mem-row">
+          <span class="mem-index">0</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">1</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">2</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">3</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">4</span><div class="mem-cell orange"><span class="cell-label">piece0</span>low 32 bits</div>
+          <span class="mem-index">5</span><div class="mem-cell orange"><span class="cell-label">piece1</span>high 32 bits</div>
+          <span class="mem-index">6</span><div class="mem-cell dim">…</div>
+        </div>
+      </div>
+
+      <p>
+        <code>addExtra</code> uses compile-time reflection to serialize any struct whose fields are
+        <code>u32</code>, <code>i32</code>, <code>Index</code>, or <code>NullTerminatedString</code>.
+        <code>extraData</code> does the reverse.
+      </p>
+
+      <pre><code><span class="cm">// Packing a 64-bit float for storage in extra</span>
+<span class="kw">fn</span> <span class="fn">pack</span>(val: <span class="ty">f64</span>) Float64 {
+    <span class="kw">const</span> bits: <span class="ty">u64</span> = @bitCast(val);
+    <span class="kw">return</span> .{
+        .piece0 = @truncate(bits),          <span class="cm">// bits[0..31]</span>
+        .piece1 = @truncate(bits >> <span class="num">32</span>),    <span class="cm">// bits[32..63]</span>
+    };
+}</code></pre>
+    </section>
+
+    <!-- ─── LIMBS MEMORY LAYOUT ─── -->
+    <section class="section" id="limbs-layout">
+      <h2 class="section-title"><span class="icon">🔗</span>limbs — Big integers</h2>
+
+      <p>
+        Arbitrary-precision integers (those that don't fit in 32 bits) are stored in the
+        <code>limbs</code> array. Each big int occupies a <strong>header</strong> followed by
+        <strong>raw limbs</strong>.
+      </p>
+
+      <div class="mem-diagram">
+        <div class="mem-label">items[N] — a big int</div>
+        <div class="mem-row">
+          <div class="mem-cell green"><span class="cell-label">tag</span>int_positive</div>
+          <div class="mem-cell green"><span class="cell-label">data</span>idx = 3</div>
+        </div>
+
+        <div style="height:.75rem"></div>
+        <div class="mem-label">limbs — Int header + raw limb words (each one Limb = usize)</div>
+        <div class="mem-row">
+          <span class="mem-index">0</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">1</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">2</span><div class="mem-cell dim">…</div>
+          <span class="mem-index">3</span>
+          <div class="mem-cell green" style="min-width:100px"><span class="cell-label">Int.ty (u32)</span>comptime_int</div>
+          <span class="mem-index">4</span>
+          <div class="mem-cell green" style="min-width:100px"><span class="cell-label">Int.limbs_len (u32)</span>packed after ty</div>
+          <span class="mem-index">5</span>
+          <div class="mem-cell teal"><span class="cell-label">limb[0]</span>0x0000…</div>
+          <span class="mem-index">6</span>
+          <div class="mem-cell teal"><span class="cell-label">limb[1]</span>0x1000…</div>
+        </div>
+      </div>
+
+      <div class="callout info">
+        <span class="callout-icon">📌</span>
+        <div class="callout-body">
+          <p>
+            <strong>Header size:</strong> <code>Int</code> is a packed struct of two <code>u32</code>
+            fields. On 64-bit targets a <code>Limb</code> is <code>u64</code>, so the header occupies
+            exactly <strong>one limb slot</strong>
+            (<code>limbs_items_len = @sizeOf(Int) / @sizeOf(Limb) = 8/8 = 1</code>).
+            On 32-bit targets a limb is 32 bits wide, so the header takes two slots.
+          </p>
+        </div>
+      </div>
+
+      <p>To read a big int back, <code>indexToKeyBigInt</code> does:</p>
+      <pre><code><span class="cm">// data field from items holds the start index into limbs</span>
+<span class="kw">const</span> int: Int = @bitCast(ip.limbs.items[limb_index..][<span class="num">0</span>..Int.limbs_items_len].*);
+<span class="kw">const</span> big_int: BigIntConst = .{
+    .limbs = ip.limbs.items[limb_index + Int.limbs_items_len ..][<span class="num">0</span>..int.limbs_len],
+    .positive = positive,  <span class="cm">// comes from the tag (int_positive / int_negative)</span>
+};</code></pre>
+    </section>
+
+    <!-- ─── STRINGS MEMORY LAYOUT ─── -->
+    <section class="section" id="strings-layout">
+      <h2 class="section-title"><span class="icon">📝</span>String storage</h2>
+
+      <p>
+        Strings live in a separate trio of arrays, completely independent of the value intern pool.
+        The design is a classic <em>flat buffer + offset table</em>.
+      </p>
+
+      <div class="mem-diagram">
+        <div class="mem-label">string_bytes — all strings concatenated, null-terminated</div>
+        <div class="mem-row">
+          <div class="mem-cell dim" style="min-width:20px"><span class="cell-label">0</span>\0</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">1</span>f</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">2</span>o</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">3</span>o</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">4</span>\0</div>
+          <div class="mem-cell blue" style="min-width:20px"><span class="cell-label">5</span>b</div>
+          <div class="mem-cell blue" style="min-width:20px"><span class="cell-label">6</span>a</div>
+          <div class="mem-cell blue" style="min-width:20px"><span class="cell-label">7</span>r</div>
+          <div class="mem-cell blue" style="min-width:20px"><span class="cell-label">8</span>\0</div>
+        </div>
+
+        <div style="height:.75rem"></div>
+        <div class="mem-label">strings — end-offset table (one entry per string)</div>
+        <div class="mem-row">
+          <span class="mem-index">0</span>
+          <div class="mem-cell dim"><span class="cell-label">seed</span>0</div>
+          <span class="mem-index">1</span>
+          <div class="mem-cell dim"><span class="cell-label">""</span>end=1</div>
+          <span class="mem-index">2</span>
+          <div class="mem-cell green"><span class="cell-label">"foo"</span>end=5</div>
+          <span class="mem-index">3</span>
+          <div class="mem-cell blue"><span class="cell-label">"bar"</span>end=9</div>
+        </div>
+      </div>
+
+      <p>
+        <code>NullTerminatedString</code> is a <code>u32</code>-backed enum. Its value is the
+        <em>index into <code>strings</code></em>, not into <code>string_bytes</code>. To get the
+        actual bytes for string <code>i</code>:
+      </p>
+      <pre><code><span class="cm">// start of string i = end of string (i-1) = strings[i]</span>
+<span class="cm">// end of string i = strings[i+1] - 1  (excluding null terminator)</span>
+<span class="kw">const</span> start = ip.strings.items[@intFromEnum(s)];
+<span class="kw">const</span> end   = ip.strings.items[@intFromEnum(s) + <span class="num">1</span>] - <span class="num">1</span>; <span class="cm">// strip '\0'</span>
+<span class="kw">return</span> ip.string_bytes.items[start..end];</code></pre>
+
+      <div class="callout tip">
+        <span class="callout-icon">🌱</span>
+        <div class="callout-body">
+          <p><strong>Why seed with 0?</strong> <code>init()</code> appends a <code>0</code> to
+          <code>strings</code> before interning anything. This means <code>strings[0] = 0</code>
+          is the start-of-buffer anchor, and string index 0 is always the empty string <code>""</code>
+          (which occupies byte 0 = <code>'\0'</code>).</p>
+        </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── INIT ─── -->
+    <section class="section" id="init">
+      <h2 class="section-title"><span class="icon">🚀</span>init — Seeding static values</h2>
+
+      <p>
+        Before any user code can intern values, <code>init()</code> populates the pool with the
+        statically-known entries. It loops over <code>static_keys</code> (an array of
+        <code>Key</code>) and calls <code>get()</code> for each one, asserting the resulting
+        index matches the corresponding <code>Index</code> enum value.
+      </p>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Seed the strings offset table</div>
+            <p class="flow-step-desc">Append <code>0</code> to <code>strings</code>, making entry 0
+            the "start-of-buffer" anchor.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Intern the empty string ""</div>
+            <p class="flow-step-desc">This becomes <code>NullTerminatedString.empty</code> at index 0.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Intern all static_strings</div>
+            <p class="flow-step-desc">Identifier names used by the compiler (from <code>string.zig</code>)
+            get stable numeric indices.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Intern all static_keys</div>
+            <p class="flow-step-desc">The six pre-defined types and values (indices 0–5) are inserted in
+            exact order and asserted against their expected <code>Index</code> names.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── GET ─── -->
+    <section class="section" id="get">
+      <h2 class="section-title"><span class="icon">🔍</span>get — Interning a value</h2>
+
+      <p>
+        <code>get(key)</code> is the hot path. It either returns an existing <code>Index</code>
+        or encodes the key and inserts a new item.
+      </p>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Reserve a candidate index</div>
+            <p class="flow-step-desc"><code>new_index = items.len</code> — the slot that would
+            be used <em>if</em> this is a new value. Also pre-allocate one item slot.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Probe the hash map</div>
+            <p class="flow-step-desc"><code>map.getOrPutContextAdapted(key, adapter, ctx)</code>
+            hashes the <code>Key</code> and looks for a match. If found, return the existing
+            index immediately — no allocation.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Encode the value</div>
+            <p class="flow-step-desc">Pick the most compact representation:
+            small comptime ints → <code>int_comptime_int_u32/i32</code>;
+            large ints → limbs;
+            floats → extra.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Commit</div>
+            <p class="flow-step-desc">Store <code>new_index</code> as the map entry's key,
+            return it. Future calls with equal values will hit step 2 instead.</p>
+          </div>
+        </div>
+      </div>
+
+      <h3 class="subsection-title">Integer encoding decision tree</h3>
+
+      <pre><code><span class="kw">if</span> ty == comptime_int_type {
+    <span class="cm">// Try 32-bit fast paths first</span>
+    <span class="kw">if</span> fits_u32(value)  → tag = int_comptime_int_u32,  data = value
+    <span class="kw">if</span> fits_i32(value)  → tag = int_comptime_int_i32,  data = @bitCast(value)
+}
+<span class="cm">// Fallback: store in limbs regardless of storage variant in the key</span>
+tag = int_positive / int_negative, data = limbs start index</code></pre>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body">
+          <p>The fast paths check <em>value range</em>, not storage variant. Even if the caller
+          supplies a <code>.big_int</code> key, if it fits in 32 bits it still takes the compact path.
+          This keeps <code>items</code> small.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── GETSTRING ─── -->
+    <section class="section" id="getstring">
+      <h2 class="section-title"><span class="icon">💬</span>getString — Interning a string</h2>
+
+      <p>Follows the same pattern as <code>get()</code> but operates on the string-specific arrays.</p>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Candidate index</div>
+            <p class="flow-step-desc"><code>new_index = strings.len - 1</code> — the offset
+            entry that will be written <em>after</em> the new string's bytes.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Probe string_map</div>
+            <p class="flow-step-desc">The adapter compares byte slices.
+            On a hit, return the existing <code>NullTerminatedString</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Append bytes + null terminator</div>
+            <p class="flow-step-desc">Copy <code>slice</code> into <code>string_bytes</code>,
+            then append <code>0</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Append end-offset</div>
+            <p class="flow-step-desc">Push <code>string_bytes.len</code> onto <code>strings</code>,
+            marking where this string ends.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── INDEXTOKEY ─── -->
+    <section class="section" id="indextokey">
+      <h2 class="section-title"><span class="icon">↩️</span>indexToKey — Reading a value back</h2>
+
+      <p>
+        Given an <code>Index</code>, reconstruct a <code>Key</code>. This is the reverse of encoding
+        and is used by the hash-map context to compare stored items.
+      </p>
+
+      <table class="tag-table">
+        <thead><tr><th>Tag seen</th><th>What indexToKey returns</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>simple_type</td>
+            <td>Cast the <code>Index</code> integer to <code>SimpleType</code>, wrap in <code>.simple_type</code>.</td>
+          </tr>
+          <tr>
+            <td>int_comptime_int_u32</td>
+            <td><code>.int{ ty=comptime_int, storage=.u64{ data } }</code></td>
+          </tr>
+          <tr>
+            <td>int_comptime_int_i32</td>
+            <td><code>.int{ ty=comptime_int, storage=.i64{ @bitCast(data) } }</code></td>
+          </tr>
+          <tr>
+            <td>int_positive / int_negative</td>
+            <td>Read header + limbs from <code>limbs[data..]</code> via <code>indexToKeyBigInt</code>. Then try to downcast to <code>.u64</code> or <code>.i64</code> before falling back to <code>.big_int</code>.</td>
+          </tr>
+          <tr>
+            <td>float_f64 / float_comptime_float</td>
+            <td>Read <code>Float64</code> from <code>extra[data..]</code>, reassemble to <code>f64</code>, wrap in <code>.float</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ─── CONTEXT & ADAPTER ─── -->
+    <section class="section" id="context">
+      <h2 class="section-title"><span class="icon">🔀</span>Context &amp; Adapter</h2>
+
+      <p>
+        Zig's hash maps support two-sided custom hashing. The InternPool uses this to enable
+        looking up a <code>Key</code> without first converting it to an <code>Index</code>.
+      </p>
+
+      <div class="layout-diagram">
+        <div class="card accent-purple" style="margin:0">
+          <div class="card-title">Context (stored side)</div>
+          <p>Operates on <strong><code>Index</code></strong> values already in the map.
+          To hash or compare, it calls <code>indexToKey(index)</code> to get back the
+          canonical <code>Key</code>, then delegates to <code>Key.hash64</code> /
+          <code>Key.eql</code>.</p>
+          <pre style="margin-top:.75rem"><code>hash(index) → indexToKey(index).hash64(ip)
+eql(a, b)   → Key.eql(indexToKey(a), indexToKey(b))</code></pre>
+        </div>
+        <div class="card accent-blue" style="margin:0">
+          <div class="card-title">Adapter (probe side)</div>
+          <p>Operates on a <strong><code>Key</code></strong> you're looking up with.
+          Used in <code>getOrPutContextAdapted</code> so you can search the map <em>by Key</em>
+          before the item has been encoded or assigned an Index.</p>
+          <pre style="margin-top:.75rem"><code>hash(key)        → key.hash64(ip)
+eql(key, stored) → key.eql(indexToKey(stored), ip)</code></pre>
+        </div>
+      </div>
+
+      <p>
+        This is what makes the "check-then-insert" pattern allocation-free on cache hits:
+        no encoding, no limb allocation, no extra slot — just a hash lookup.
+      </p>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── STATIC KEYS ─── -->
+    <section class="section" id="static-keys">
+      <h2 class="section-title"><span class="icon">📋</span>Static keys</h2>
+
+      <p>
+        <code>static_keys</code> is a comptime array that declares the six pre-interned values in
+        the exact order they must appear in <code>items</code>:
+      </p>
+
+      <pre><code><span class="kw">pub const</span> static_keys: [static_len]Key = .{
+    .{ .simple_type = .comptime_int  },    <span class="cm">// Index 0 = comptime_int_type</span>
+    .{ .simple_type = .comptime_float },   <span class="cm">// Index 1 = comptime_float_type</span>
+    .{ .simple_type = .f64           },    <span class="cm">// Index 2 = f64_type</span>
+    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 =  0 } } }, <span class="cm">// Index 3 = zero</span>
+    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 =  1 } } }, <span class="cm">// Index 4 = one</span>
+    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -1 } } }, <span class="cm">// Index 5 = negative_one</span>
+};</code></pre>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── WORKED EXAMPLE ─── -->
+    <section class="section" id="worked-example">
+      <h2 class="section-title"><span class="icon">🎬</span>Worked example</h2>
+
+      <p>
+        Walk through what happens when the compiler encounters the integer literal
+        <code>42</code> for the first time:
+      </p>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">AstGen builds a Key</div>
+            <p class="flow-step-desc"><code>Key{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } }</code></p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">ip.get(gpa, key) is called</div>
+            <p class="flow-step-desc"><code>new_index = 6</code> (assuming only static values exist so far). <code>items.ensureUnusedCapacity(1)</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Map probe — miss</div>
+            <p class="flow-step-desc">No existing entry. <code>gop.found_existing == false</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Fast path: fits in u32?</div>
+            <p class="flow-step-desc"><code>42</code> fits in <code>u32</code>. Append
+            <code>Item{ .tag = .int_comptime_int_u32, .data = 42 }</code> to items.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Commit</div>
+            <p class="flow-step-desc"><code>gop.key_ptr.* = 6</code>. Return <code>Index{6}</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step" style="border-color:var(--accent-green)">
+          <div class="flow-step-content">
+            <div class="flow-step-title" style="color:var(--accent-green)">Second call with 42</div>
+            <p class="flow-step-desc">Map probe <em>hits</em>. Returns <code>Index{6}</code> directly — no allocation, no encoding.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="mem-diagram" style="margin-top:1.5rem">
+        <div class="mem-label">items after interning 42</div>
+        <div class="mem-row">
+          <span class="mem-index">0</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
+          <span class="mem-index">1</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
+          <span class="mem-index">2</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
+          <span class="mem-index">3</span><div class="mem-cell blue"><span class="cell-label">int_u32</span>0</div>
+          <span class="mem-index">4</span><div class="mem-cell blue"><span class="cell-label">int_u32</span>1</div>
+          <span class="mem-index">5</span><div class="mem-cell blue"><span class="cell-label">int_i32</span>0xFFFF…</div>
+          <span class="mem-index">6</span><div class="mem-cell teal"><span class="cell-label">int_u32</span>42</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // Highlight the active nav link based on scroll position
+  const sections = document.querySelectorAll('.section[id]');
+  const links = document.querySelectorAll('.nav-link');
+
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const active = document.querySelector(`.nav-link[href="#${e.target.id}"]`);
+        if (active) active.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+
+  sections.forEach(s => obs.observe(s));
+</script>
+</body>
+</html>

@@ -46,21 +46,42 @@ pub fn parseRoot(p: *Parse) !void {
         .data = undefined,
     });
 
-    const exps = try p.parseExpression();
-
-    if (p.tokenTag(p.token_index) != .eof) {
-        try p.warnExpected(.eof);
-    }
-
-    // add the list of expressions to the root node
-    p.nodes.items(.data)[0] = .{ .node = exps };
-}
-
-fn parseExpression(p: *Parse) !Node.Index {
     const scratch_top = p.scratch.items.len;
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
-    return p.expression();
+    while (true) {
+        while (p.check(.newline)) _ = p.advance(); // blank lines / separators
+        if (p.check(.eof)) break;
+
+        const stmt = p.expression() catch |err| switch (err) {
+            error.ParseError => {
+                p.findNextStmt();
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        try p.scratch.append(p.gpa, stmt);
+
+        if (!p.check(.newline) and !p.check(.eof)) {
+            try p.warnExpected(.newline);
+            p.findNextStmt();
+        }
+    }
+
+    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
+    p.nodes.items(.data)[0] = .{ .extra_range = span };
+}
+
+/// Statement-level resync: skip to just past the next newline (or stop at eof).
+fn findNextStmt(p: *Parse) void {
+    while (true) switch (p.current()) {
+        .newline => {
+            _ = p.advance();
+            return;
+        },
+        .eof => return,
+        else => _ = p.advance(),
+    };
 }
 
 fn expression(p: *Parse) !Node.Index {
@@ -131,12 +152,13 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .plus => comptime ParseRule.init(null, Parse.binary, .prec_term),
         .star => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         .slash => comptime ParseRule.init(null, Parse.binary, .prec_factor),
-        // .equal => comptime ParseRule.init(null, null, .prec_none),
+        .equal => comptime ParseRule.init(null, Parse.bind, .prec_assignment),
         // .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
         // .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
         .number_literal => comptime ParseRule.init(Parse.number, null, .prec_none),
+        .identifier => comptime ParseRule.init(Parse.identifier, null, .prec_none),
         .eof => comptime ParseRule.init(null, null, .prec_none),
-        // .newline => comptime ParseRule.init(null, null, .prec_none),
+        .newline => comptime ParseRule.init(null, null, .prec_none),
         else => {
             log.err("no rule for token {}", .{tag});
             unreachable;
@@ -144,6 +166,15 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
     };
 
     return rule;
+}
+
+/// example: x
+fn identifier(p: *Parse) !Node.Index {
+    return p.addNode(.{
+        .tag = .identifier,
+        .main_token = p.advance(),
+        .data = undefined,
+    });
 }
 
 /// example: 47
@@ -155,7 +186,7 @@ fn number(p: *Parse) !Node.Index {
     });
 }
 
-// example: -1
+/// example: -1
 fn unary(p: *Parse) !Node.Index {
     const op_nts: NullTerminatedString = switch (p.current()) {
         .minus => .minus,
@@ -206,6 +237,19 @@ fn grouping(p: *Parse) !Node.Index {
     _ = try p.consume(.r_paren);
 
     return inner;
+}
+
+// example: x = 1
+fn bind(p: *Parse, lhs: Node.Index) !Node.Index {
+    const main_token = p.advance();
+    // Same precedence for the right operand (no +1 like `binary`) because
+    // `=` is right-associative: `a = b = c` parses as `a = (b = c)`.
+    const rhs = try p.parsePrecedence(.prec_assignment);
+
+    const span = try p.listToSpan(&.{ lhs, rhs });
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .equal, .args = args } } });
 }
 
 const ParsePrefixFn = *const fn (parser: *Parse) Error!Node.Index;

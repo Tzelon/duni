@@ -21,9 +21,6 @@ const InternPool = @import("InternPool.zig");
 
 const Ast = @import("Ast.zig");
 
-const string = @import("string.zig");
-const NullTerminatedString = string.NullTerminatedString;
-
 instructions: std.MultiArrayList(Inst).Slice,
 /// In order to store references to strings in fewer bytes, we copy all
 /// string bytes into here. String bytes can be null. It is up to whomever
@@ -48,6 +45,12 @@ pub const Inst = struct {
     data: Data,
 
     pub const Tag = enum(u8) {
+        /// Uses a name to identify a Decl and uses it as a value.
+        /// Uses the `str_tok` union field.
+        decl_val,
+        /// String Literal. Makes an anonymous Decl and then takes a pointer to it.
+        /// Uses the `str` union field.
+        str,
         /// Integer literal that fits in a u64. Uses the `int` union field.
         int,
         /// Arbitrary sized integer literal. Uses the `str` union field.
@@ -168,8 +171,20 @@ pub const Inst = struct {
             /// Number of bytes in the string.
             len: u32,
 
-            pub fn get(self: @This(), code: Dir) []const u8 {
+            pub fn get(self: @This(), code: *const Dir) []const u8 {
                 return code.string_bytes[@intFromEnum(self.start)..][0..self.len];
+            }
+        },
+
+        /// For string which not contain null bytes, like identifiers
+        str_tok: struct {
+            /// Offset into `string_bytes`. Null-terminated.
+            start: NullTerminatedString,
+            /// Offset from Decl AST token index.
+            src_tok: Ast.TokenOffset,
+
+            pub fn get(self: @This(), code: *const Dir) [:0]const u8 {
+                return code.nullTerminatedString(self.start);
             }
         },
     };
@@ -225,6 +240,17 @@ pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
 
 pub fn bodySlice(dir: Dir, start: usize, len: usize) []Inst.Index {
     return @ptrCast(dir.extra[start..][0..len]);
+}
+
+pub const NullTerminatedString = enum(u32) {
+    empty = 0,
+    _,
+};
+
+/// Given an index into `string_bytes` returns the null-terminated string found there.
+pub fn nullTerminatedString(code: Dir, index: NullTerminatedString) [:0]const u8 {
+    const slice = code.string_bytes[@intFromEnum(index)..];
+    return slice[0..std.mem.findScalar(u8, slice, 0).? :0];
 }
 
 pub fn deinit(code: *Dir, gpa: Allocator) void {

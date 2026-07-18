@@ -44,9 +44,12 @@ fn visit(self: *Print, node: Node.Index) !void {
     defer self.indent -= 1;
 
     switch (tag) {
-        // node: single child expression.
-        .root => try self.visit(datas[i].node),
-        .number_literal => {},
+        .root => for (self.tree.rootDecls()) |statement| {
+            try self.visit(statement);
+        },
+
+        // leaf nodes: no children to visit.
+        .identifier, .number_literal, .string_literal => {},
         .form => {
             const form = datas[i].form;
             const sr_pos = @intFromEnum(form.args);

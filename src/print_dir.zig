@@ -92,6 +92,8 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .float => try self.writeFloat(data),
         .int => try self.writeInt(data),
         .negate => try self.writeUnNode(data),
+        .str => try self.writeStr(data),
+        .decl_val => try self.writeStrTok(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),
     }
 }
@@ -128,6 +130,16 @@ fn writeUnNode(self: *Print, data: Dir.Inst.Data) !void {
     try self.writeRef(data.un_node.operand);
     try self.w.writeAll(")");
     try self.writeSrcNode(data.un_node.src_node);
+}
+
+fn writeStr(self: *Print, data: Dir.Inst.Data) !void {
+    const str = data.str.get(self.code);
+    try self.w.print("{s})", .{str});
+}
+
+fn writeStrTok(self: *Print, data: Dir.Inst.Data) !void {
+    const str = data.str.get(self.code);
+    try self.w.print("{s})", .{str});
 }
 
 fn writePlNodeBin(self: *Print, data: Dir.Inst.Data) !void {

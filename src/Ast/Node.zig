@@ -17,7 +17,20 @@ pub const Tag = enum {
     root,
 
     /// The `data` field is unused.
+    ///
+    /// Most identifiers will not have explicit AST nodes, however for
+    /// expressions which could be one of many different kinds of AST nodes,
+    /// there will be an identifier AST node for it.
+    identifier,
+
+    /// The `data` field is unused.
     number_literal,
+
+    /// The `data` field is unused.
+    ///
+    /// The `main_token` field is the string literal token.
+    string_literal,
+
     form,
 };
 
@@ -27,6 +40,7 @@ pub const Data = union {
     node_and_token: struct { Index, TokenIndex },
 
     form: Form,
+    extra_range: SubRange,
     extra: ExtraIndex,
 };
 

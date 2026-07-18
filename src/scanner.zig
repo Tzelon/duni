@@ -11,7 +11,8 @@ pub const Scanner = struct {
 
     const State = enum {
         start,
-        indentifier,
+        identifier,
+        string_literal,
         number,
         number_dot,
         number_exponent,
@@ -54,12 +55,24 @@ pub const Scanner = struct {
                 '\n' => {
                     self.index += 1;
                     self.line += 1;
-                    continue :state .start;
+                    if (!self.insert_newline) {
+                        result.loc.start = self.index;
+                        continue :state .start;
+                    }
+                    result.tag = .newline;
                 },
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;
                     continue :state .number;
+                },
+                'a'...'z', 'A'...'Z', '_' => {
+                    result.tag = .identifier;
+                    continue :state .identifier;
+                },
+                '"' => {
+                    result.tag = .string_literal;
+                    continue :state .string_literal;
                 },
                 '(' => {
                     result.tag = .l_paren;
@@ -85,9 +98,61 @@ pub const Scanner = struct {
                     result.tag = .slash;
                     self.index += 1;
                 },
+                '=' => {
+                    self.index += 1;
+                    switch (self.buffer[self.index]) {
+                        // TODO(tzelon) - enable later
+                        // '=' => {
+                        //     result.tag = .equal_equal;
+                        //     self.index += 1;
+                        // },
+                        // '>' => {
+                        //     result.tag = .equal_angle_bracket_right;
+                        //     self.index += 1;
+                        // },
+                        else => result.tag = .equal,
+                    }
+                },
                 else => continue :state .invalid,
             },
-            .indentifier => unreachable,
+
+            .identifier => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    'a'...'z', 'A'...'Z', '_', '0'...'9' => continue :state .identifier,
+                    '!', '?' => self.index += 1, // consume and end token
+                    else => {
+                        const ident = self.buffer[result.loc.start..self.index];
+                        if (Token.getKeyword(ident)) |tag| {
+                            result.tag = tag;
+                        }
+                    },
+                }
+            },
+
+            .string_literal => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0 => {
+                        if (self.index != self.buffer.len) {
+                            continue :state .invalid;
+                        } else {
+                            result.tag = .invalid;
+                        }
+                    },
+                    '\n' => result.tag = .invalid,
+                    '"' => self.index += 1,
+                    // ASCII control characters (bell, backspace, tab, escape, DEL, ...) are rejected inside strings.
+                    // Excluded: 0x00 (EOF sentinel) and 0x0a (\n), handled above.
+                    // https://en.wikipedia.org/wiki/ASCII#Control_characters
+                    0x01...0x09, 0x0b...0x1f, 0x7f => {
+                        continue :state .invalid;
+                    },
+                    else => continue :state .string_literal,
+                }
+            },
+
+            // Numbers
             .number => switch (self.buffer[self.index]) {
                 '.' => continue :state .number_dot,
                 // digit separator (1_000_000)
@@ -153,6 +218,7 @@ pub const Scanner = struct {
                     else => continue :state .float,
                 }
             },
+
             .invalid => unreachable,
         }
 
@@ -164,6 +230,9 @@ pub const Scanner = struct {
     fn endExpression(tag: Token.Tag) bool {
         return switch (tag) {
             .identifier,
+            .r_paren,
+            .number_literal,
+            .string_literal,
             => true,
             else => false,
         };
@@ -174,6 +243,14 @@ pub const Token = struct {
     tag: Tag,
     loc: Loc,
 
+    pub const keywords = std.StaticStringMap(Tag).initComptime(.{
+        .{ "fn", .keyword_fn },
+    });
+
+    pub fn getKeyword(bytes: []const u8) ?Tag {
+        return keywords.get(bytes);
+    }
+
     pub const Loc = struct { start: usize, end: usize };
 
     pub const Tag = enum {
@@ -181,6 +258,7 @@ pub const Token = struct {
 
         // Literals.
         number_literal,
+        string_literal,
 
         // Operators tokens.
         equal,
@@ -193,6 +271,12 @@ pub const Token = struct {
         l_paren,
         r_paren,
 
+        // keywords
+        keyword_fn,
+
+        // Expression end
+        newline,
+
         // End
         invalid,
         eof,
@@ -203,8 +287,11 @@ pub const Token = struct {
                 .identifier,
                 .eof,
                 .number_literal,
+                .string_literal,
+                .newline,
                 => null,
 
+                .keyword_fn => "fn",
                 .equal => "=",
                 .plus => "+",
                 .minus => "-",
@@ -236,4 +323,11 @@ test "tokenizer" {
     try expectToken("1e-5", &.{.number_literal});
     try expectToken("3.14", &.{.number_literal});
     try expectToken("1 * (2 + 3) / 5 - 2", &.{ .number_literal, .star, .l_paren, .number_literal, .plus, .number_literal, .r_paren, .slash, .number_literal, .minus, .number_literal });
+    try expectToken("x = 1\n\ny", &.{ .identifier, .equal, .number_literal, .newline, .identifier });
+    try expectToken("1 +\n2", &.{ .number_literal, .plus, .number_literal });
+    try expectToken("empty? map!x", &.{ .identifier, .identifier, .identifier });
+    try expectToken("\"hello world\"", &.{.string_literal});
+    try expectToken("\"a\"\nx", &.{ .string_literal, .newline, .identifier });
+    try expectToken("\"abc", &.{.invalid});
+    try expectToken("\"a\nb", &.{ .invalid, .identifier });
 }

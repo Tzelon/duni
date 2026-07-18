@@ -11,9 +11,6 @@ parameters -> IDENTIFIER ( paramDecl "," )*  paramDecl;
 paramDecl -> IDENTIFIER ":" typeExpr ; 
 typeExpr -> IDENTIFIER ;
 
-varDecl -> "IDENTIFIER "=" expression ;
-
-
 # *** Block level ***
 statement -> exprStmt | printStmt | returnStmt | ifStmt | block;
 
@@ -23,11 +20,16 @@ ifStmt -> "if" "(" expression ")" statement ( "else" statement )? ;
 
 block -> "{" statement* "}" ;
 
-exprStmt -> expression "\n" ;
+exprStmt -> expression NEWLINE ;
 printStmt -> "print" expression ;
 
-expression -> equality ;
-assignment -> (call ".")? IDENTIFIER "=" assignment | logic_or ;
+expression -> bind ;
+# `=` is a binding (match), right-associative: `a = b = c` is `a = (b = c)`.
+# The lhs is a pattern; rebinding an existing name is allowed (Elixir-style).
+bind -> pattern "=" bind | logic_or ;
+# Patterns are syntactically just expressions; which patterns are legal is
+# decided during lowering (today: identifier only).
+pattern -> expression ;
 
 logic_or -> logic_and ( "or" logic_and )* ;
 logic_and -> equality ( "and" equality )* ;

@@ -46,6 +46,38 @@ pub const TokenList = std.MultiArrayList(struct {
 
 pub const NodeList = std.MultiArrayList(Node);
 
+/// A relative token index.
+pub const TokenOffset = enum(i32) {
+    zero = 0,
+    _,
+
+    pub fn init(base: TokenIndex, destination: TokenIndex) TokenOffset {
+        const base_i64: i64 = base;
+        const destination_i64: i64 = destination;
+        return @enumFromInt(destination_i64 - base_i64);
+    }
+
+    pub fn toOptional(to: TokenOffset) OptionalTokenOffset {
+        const result: OptionalTokenOffset = @enumFromInt(@intFromEnum(to));
+        assert(result != .none);
+        return result;
+    }
+
+    pub fn toAbsolute(offset: TokenOffset, base: TokenIndex) TokenIndex {
+        return @intCast(@as(i64, base) + @intFromEnum(offset));
+    }
+};
+
+/// A relative token index, or null.
+pub const OptionalTokenOffset = enum(i32) {
+    none = std.math.maxInt(i32),
+    _,
+
+    pub fn unwrap(oto: OptionalTokenOffset) ?TokenOffset {
+        return if (oto == .none) null else @enumFromInt(@intFromEnum(oto));
+    }
+};
+
 /// Result should be freed with tree.deinit() when there are
 /// no more references to any of the tokens or nodes.
 pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
@@ -156,6 +188,10 @@ pub fn extraData(tree: Ast, index: Node.ExtraIndex, comptime T: type) T {
         };
     }
     return result;
+}
+
+pub fn rootDecls(tree: Ast) []const Node.Index {
+    return tree.extraDataSlice(tree.nodeData(.root).extra_range, Node.Index);
 }
 
 // Helpers tokens - yes there is the same helpers in Parse.zig
@@ -270,13 +306,13 @@ pub fn tokensToSpan(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex
     return Span{ .start = start_off, .end = end_off, .main = tree.tokenStart(main) };
 }
 
-
-
 pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
     var n = node;
     while (true) switch (tree.nodeTag(n)) {
-        .root => n = tree.nodeData(n).node,
-        .number_literal => return tree.nodeMainToken(n),
+        .root => return 0,
+
+        .string_literal, .number_literal, .identifier => return tree.nodeMainToken(n),
+
         .form => {
             const args = tree.formArgs(n);
             // Unary form: operator (main_token) sits to the left of its single arg.
@@ -289,8 +325,9 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
 pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
     var n = node;
     while (true) switch (tree.nodeTag(n)) {
-        .root => n = tree.nodeData(n).node,
-        .number_literal => return tree.nodeMainToken(n),
+        .root => return @intCast(tree.tokens.len - 1),
+        .identifier, .string_literal, .number_literal => return tree.nodeMainToken(n),
+
         .form => {
             const args = tree.formArgs(n);
             n = args[args.len - 1];
@@ -310,9 +347,9 @@ fn expectAst(source: [:0]const u8, expected: Expected) !void {
     var tree = try Ast.parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);
     try std.testing.expect(tree.errors.len == 0);
-
-    const top = tree.nodes.items(.data)[0].node;
-    try expectNode(&tree, top, expected);
+    for (tree.rootDecls()) |statement| {
+        try expectNode(&tree, statement, expected);
+    }
 }
 
 fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {

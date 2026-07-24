@@ -642,6 +642,20 @@ test "InternPool getString dedups identical bytes" {
     try std.testing.expectEqualStrings("bar", c.toSlice(&ip));
 }
 
+test "InternPool dedups string values" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const a = try ip.get(gpa, .{ .string = try ip.getString(gpa, "foo") });
+    const b = try ip.get(gpa, .{ .string = try ip.getString(gpa, "foo") });
+    const c = try ip.get(gpa, .{ .string = try ip.getString(gpa, "bar") });
+    try std.testing.expect(a == b);
+    try std.testing.expect(a != c);
+    try std.testing.expectEqualStrings("foo", ip.indexToKey(a).string.toSlice(&ip));
+}
+
 test "InternPool dedups the same value across storage variants" {
     const gpa = std.testing.allocator;
     var ip: InternPool = .{};

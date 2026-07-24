@@ -123,6 +123,8 @@ above have answers.
 
 ### Sema (when it exists)
 - [ ] Resolve every `str` instruction to a `string`-typed value.
+      Representation decided: `Key.string` holds the interned handle — see
+      "String values — one handle type" in `intern_pool.md` for the why.
 - [ ] Concatenation operator (`+`? `++`? `..`?): pick *one*, applied to
       `string × string → string`. Document that mixing `string` and
       `number` is a type error (no implicit `to_string`).
@@ -131,11 +133,15 @@ above have answers.
       non-ASCII).
 
 ### Runtime / Codegen (further out)
-- [ ] Pick a representation: `{ ptr, len }` slice header? Length-prefixed?
-      Reference-counted? For an immutable type the simplest answer is
-      "compile-time literals live in a constant pool, runtime values are
-      `{ptr, len}` heap allocations" — that defers GC questions.
-- [ ] ABI for passing `string` across function calls.
+- [x] Pick a representation — DECIDED for the WAT stepping stone: comptime
+      literals become `(data …)` segments in linear memory (offsets assigned
+      in order of first appearance, deduped by handle); a string *result* is
+      a `(ptr, len)` pair of i32s via multivalue return; memory is exported
+      as `"memory"` so the host can read the bytes. Validated with
+      `wat2wasm` + `wasmtime`. Runtime-*constructed* strings (heap, GC) are
+      still open — this only covers constants.
+- [ ] ABI for passing `string` across function calls (the (ptr, len) pair is
+      the natural candidate, but decide when functions exist).
 
 ### Tests
 - [ ] One test per scanner-accepted form (basic, escaped, empty,

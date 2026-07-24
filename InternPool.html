@@ -723,6 +723,7 @@
       <a href="#init"       class="nav-link"><span class="nav-dot"></span>init</a>
       <a href="#get"        class="nav-link"><span class="nav-dot"></span>get (intern value)</a>
       <a href="#getstring"  class="nav-link"><span class="nav-dot"></span>getString</a>
+      <a href="#string-values" class="nav-link"><span class="nav-dot"></span>String values</a>
       <a href="#indextokey" class="nav-link"><span class="nav-dot"></span>indexToKey</a>
       <a href="#context"    class="nav-link"><span class="nav-dot"></span>Context &amp; Adapter</a>
     </div>
@@ -893,21 +894,26 @@
         </div>
         <div class="index-entry">
           <span class="index-num">3</span>
+          <span class="index-name">string_type</span>
+          <span class="index-desc">the type itself</span>
+        </div>
+        <div class="index-entry">
+          <span class="index-num">4</span>
           <span class="index-name">zero</span>
           <span class="index-desc">0 (comptime_int)</span>
         </div>
         <div class="index-entry">
-          <span class="index-num">4</span>
+          <span class="index-num">5</span>
           <span class="index-name">one</span>
           <span class="index-desc">1 (comptime_int)</span>
         </div>
         <div class="index-entry">
-          <span class="index-num">5</span>
+          <span class="index-num">6</span>
           <span class="index-name">negative_one</span>
           <span class="index-desc">−1 (comptime_int)</span>
         </div>
         <div class="index-entry" style="border-style:dashed">
-          <span class="index-num" style="color:var(--text-dim)">6+</span>
+          <span class="index-num" style="color:var(--text-dim)">7+</span>
           <span class="index-name" style="color:var(--text-dim)">runtime values</span>
           <span class="index-desc">added by get()</span>
         </div>
@@ -923,7 +929,11 @@
         <div class="callout-body">
           <p><strong>Order matters.</strong> The static indices are assigned by position in
           <code>static_keys</code>, not by name. Adding an entry to <code>Index</code> or
-          <code>static_keys</code> shifts all subsequent values.</p>
+          <code>static_keys</code> shifts all subsequent values. Simple types must stay the
+          <em>leading contiguous block</em> — <code>indexToKey</code> decodes them positionally —
+          which is why <code>string_type</code> was inserted before <code>zero</code>, shifting the
+          value statics by one. <code>Dir.Inst.Ref</code> mirrors this order positionally and
+          <code>Air.Inst.Ref</code> by explicit value; all four places move together.</p>
         </div>
       </div>
     </section>
@@ -945,9 +955,9 @@
 
       <div class="card accent-purple">
         <div class="card-title">simple_type</div>
-        <p>One of <code>comptime_int</code>, <code>comptime_float</code>, <code>f64</code>.
-        Stored as just the enum tag — no data needed because the <code>Index</code> value
-        itself encodes which type.</p>
+        <p>One of <code>comptime_int</code>, <code>comptime_float</code>, <code>f64</code>,
+        <code>string</code>. Stored as just the enum tag — no data needed because the
+        <code>Index</code> value itself encodes which type.</p>
       </div>
 
       <div class="card accent-blue">
@@ -977,6 +987,22 @@
           <span class="kv-val"><code>comptime_float_type</code> or <code>f64_type</code></span>
           <span class="kv-key">storage</span>
           <span class="kv-val"><code>.f64 = f64</code> — bit-exact comparison (NaN ≠ NaN)</span>
+        </div>
+      </div>
+
+      <div class="card accent-green">
+        <div class="card-title">string</div>
+        <p>A string value. The payload is a single <code>NullTerminatedString</code> — the
+        <em>handle</em> the byte-interning layer (<code>getString</code>) returned for the bytes.
+        No type field: all strings are <code>string_type</code>.</p>
+        <div class="callout tip" style="margin-top:.75rem">
+          <span class="callout-icon">✅</span>
+          <div class="callout-body">
+            <p><strong>Equality is handle equality.</strong> <code>getString</code> dedupes the
+            bytes <em>before</em> a Key ever exists, so equal strings share one handle —
+            <code>hash64</code>/<code>eql</code> compare the handle, never the bytes. Do not
+            "fix" them to compare bytes.</p>
+          </div>
         </div>
       </div>
     </section>
@@ -1041,6 +1067,12 @@
             <td>float_comptime_float</td>
             <td>index into <code>extra</code></td>
             <td>Same encoding as <code>float_f64</code>, different type.</td>
+          </tr>
+          <tr>
+            <td>string</td>
+            <td><code>NullTerminatedString</code> handle</td>
+            <td>A string value. The handle fits directly in <code>data</code> — no
+            <code>extra</code> record; length comes from the <code>strings</code> offset table.</td>
           </tr>
         </tbody>
       </table>
@@ -1304,7 +1336,7 @@
         <div class="flow-step">
           <div class="flow-step-content">
             <div class="flow-step-title">Intern all static_keys</div>
-            <p class="flow-step-desc">The six pre-defined types and values (indices 0–5) are inserted in
+            <p class="flow-step-desc">The seven pre-defined types and values (indices 0–6) are inserted in
             exact order and asserted against their expected <code>Index</code> names.</p>
           </div>
         </div>
@@ -1412,6 +1444,114 @@ tag = int_positive / int_negative, data = limbs start index</code></pre>
       </div>
     </section>
 
+    <!-- ─── STRING VALUES ─── -->
+    <section class="section" id="string-values">
+      <h2 class="section-title"><span class="icon">🧵</span>String values — the value layer</h2>
+
+      <p>
+        Strings live in the pool <strong>twice</strong>, at two different layers doing two
+        different jobs:
+      </p>
+
+      <div class="layout-diagram">
+        <div class="card accent-green" style="margin:0">
+          <div class="card-title">Byte layer — getString</div>
+          <p style="font-size:.85rem">Dedupes <em>bytes</em>. Returns a
+          <code>NullTerminatedString</code> handle. Used for identifier names (AstGen scope
+          lookups) and as the backing store below. Knows nothing about types or values.</p>
+        </div>
+        <div class="card accent-blue" style="margin:0">
+          <div class="card-title">Value layer — get(.{ .string = handle })</div>
+          <p style="font-size:.85rem">Wraps a handle as a first-class <em>value</em> of type
+          <code>string_type</code>. Returns an <code>Index</code> — so a string constant joins
+          the same universe as ints and floats: one slot in <code>items</code>, comparable by
+          index, referencable from Air.</p>
+        </div>
+      </div>
+
+      <p>What <code>"hello"</code> looks like across both layers:</p>
+
+      <div class="mem-diagram">
+        <div class="mem-label">byte layer — string_bytes + strings table</div>
+        <div class="mem-row">
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">…</span>h</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">…</span>e</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">…</span>l</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">…</span>l</div>
+          <div class="mem-cell green" style="min-width:20px"><span class="cell-label">…</span>o</div>
+          <div class="mem-cell dim" style="min-width:20px"><span class="cell-label">…</span>\0</div>
+          <span class="mem-arrow">←</span>
+          <div class="mem-cell green"><span class="cell-label">handle</span>NTS(9)</div>
+        </div>
+
+        <div style="height:.75rem"></div>
+        <div class="mem-label">value layer — one slot in items</div>
+        <div class="mem-row">
+          <span class="mem-index">12</span>
+          <div class="mem-cell blue"><span class="cell-label">tag</span>string</div>
+          <div class="mem-cell blue"><span class="cell-label">data</span>9 (the handle)</div>
+          <span class="mem-arrow">←</span>
+          <div class="mem-cell teal"><span class="cell-label">value</span>Index(12)</div>
+        </div>
+      </div>
+
+      <p>How Sema turns a DIR <code>str</code> instruction into an Air constant
+      (<code>dirStr</code>):</p>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Read the bytes from DIR</div>
+            <p class="flow-step-desc"><code>data.str.get(sema.code)</code> — AstGen already copied
+            the literal's bytes into the DIR's own <code>string_bytes</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Intern the bytes</div>
+            <p class="flow-step-desc"><code>ip.getString(gpa, bytes)</code> — dedup happens
+            <em>here</em>, at the byte layer. Equal literals collapse to one handle.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Intern the value</div>
+            <p class="flow-step-desc"><code>ip.get(gpa, .{ .string = handle })</code> — because
+            equal strings already share a handle, the map probe compares one <code>u32</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Wrap as an Air ref</div>
+            <p class="flow-step-desc"><code>.fromInterned(index)</code> — the constant now flows
+            through Sema like any interned value.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body">
+          <p><strong>Why no <code>{start, len}</code> record?</strong> The handle is a row in the
+          <code>strings</code> offset table, and the table's boundaries already carry the length —
+          <code>toSlice</code> never scans for the terminator. One <code>u32</code> in
+          <code>data</code> is the whole encoding. (See <code>notes/intern_pool.md</code>,
+          "String values — one handle type", for the full comparison with Zig's design.)</p>
+        </div>
+      </div>
+
+      <div class="callout warning">
+        <span class="callout-icon">⚠️</span>
+        <div class="callout-body">
+          <p><strong>Boundary of the arc:</strong> WatGen lowers a string-typed result as a
+          <code>(ptr, len)</code> pair of i32s — the bytes go into a <code>(data …)</code> segment
+          in linear memory (exported as <code>"memory"</code>), deduped by handle. String
+          <em>operators</em> (concat, compare) are not yet in Sema — that's the remaining
+          strings-arc work.</p>
+        </div>
+      </div>
+    </section>
+
     <!-- ─── INDEXTOKEY ─── -->
     <section class="section" id="indextokey">
       <h2 class="section-title"><span class="icon">↩️</span>indexToKey — Reading a value back</h2>
@@ -1443,6 +1583,10 @@ tag = int_positive / int_negative, data = limbs start index</code></pre>
           <tr>
             <td>float_f64 / float_comptime_float</td>
             <td>Read <code>Float64</code> from <code>extra[data..]</code>, reassemble to <code>f64</code>, wrap in <code>.float</code>.</td>
+          </tr>
+          <tr>
+            <td>string</td>
+            <td><code>.string = @enumFromInt(data)</code> — the data field <em>is</em> the handle; nothing else to decode.</td>
           </tr>
         </tbody>
       </table>
@@ -1490,7 +1634,7 @@ eql(key, stored) → key.eql(indexToKey(stored), ip)</code></pre>
       <h2 class="section-title"><span class="icon">📋</span>Static keys</h2>
 
       <p>
-        <code>static_keys</code> is a comptime array that declares the six pre-interned values in
+        <code>static_keys</code> is a comptime array that declares the seven pre-interned values in
         the exact order they must appear in <code>items</code>:
       </p>
 
@@ -1498,9 +1642,10 @@ eql(key, stored) → key.eql(indexToKey(stored), ip)</code></pre>
     .{ .simple_type = .comptime_int  },    <span class="cm">// Index 0 = comptime_int_type</span>
     .{ .simple_type = .comptime_float },   <span class="cm">// Index 1 = comptime_float_type</span>
     .{ .simple_type = .f64           },    <span class="cm">// Index 2 = f64_type</span>
-    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 =  0 } } }, <span class="cm">// Index 3 = zero</span>
-    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 =  1 } } }, <span class="cm">// Index 4 = one</span>
-    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -1 } } }, <span class="cm">// Index 5 = negative_one</span>
+    .{ .simple_type = .string        },    <span class="cm">// Index 3 = string_type</span>
+    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 =  0 } } }, <span class="cm">// Index 4 = zero</span>
+    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 =  1 } } }, <span class="cm">// Index 5 = one</span>
+    .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -1 } } }, <span class="cm">// Index 6 = negative_one</span>
 };</code></pre>
     </section>
 
@@ -1525,7 +1670,7 @@ eql(key, stored) → key.eql(indexToKey(stored), ip)</code></pre>
         <div class="flow-step">
           <div class="flow-step-content">
             <div class="flow-step-title">ip.get(gpa, key) is called</div>
-            <p class="flow-step-desc"><code>new_index = 6</code> (assuming only static values exist so far). <code>items.ensureUnusedCapacity(1)</code>.</p>
+            <p class="flow-step-desc"><code>new_index = 7</code> (assuming only static values exist so far). <code>items.ensureUnusedCapacity(1)</code>.</p>
           </div>
         </div>
         <div class="flow-step">
@@ -1544,13 +1689,13 @@ eql(key, stored) → key.eql(indexToKey(stored), ip)</code></pre>
         <div class="flow-step">
           <div class="flow-step-content">
             <div class="flow-step-title">Commit</div>
-            <p class="flow-step-desc"><code>gop.key_ptr.* = 6</code>. Return <code>Index{6}</code>.</p>
+            <p class="flow-step-desc"><code>gop.key_ptr.* = 7</code>. Return <code>Index{7}</code>.</p>
           </div>
         </div>
         <div class="flow-step" style="border-color:var(--accent-green)">
           <div class="flow-step-content">
             <div class="flow-step-title" style="color:var(--accent-green)">Second call with 42</div>
-            <p class="flow-step-desc">Map probe <em>hits</em>. Returns <code>Index{6}</code> directly — no allocation, no encoding.</p>
+            <p class="flow-step-desc">Map probe <em>hits</em>. Returns <code>Index{7}</code> directly — no allocation, no encoding.</p>
           </div>
         </div>
       </div>
@@ -1561,10 +1706,11 @@ eql(key, stored) → key.eql(indexToKey(stored), ip)</code></pre>
           <span class="mem-index">0</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
           <span class="mem-index">1</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
           <span class="mem-index">2</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
-          <span class="mem-index">3</span><div class="mem-cell blue"><span class="cell-label">int_u32</span>0</div>
-          <span class="mem-index">4</span><div class="mem-cell blue"><span class="cell-label">int_u32</span>1</div>
-          <span class="mem-index">5</span><div class="mem-cell blue"><span class="cell-label">int_i32</span>0xFFFF…</div>
-          <span class="mem-index">6</span><div class="mem-cell teal"><span class="cell-label">int_u32</span>42</div>
+          <span class="mem-index">3</span><div class="mem-cell purple"><span class="cell-label">simple_type</span>0</div>
+          <span class="mem-index">4</span><div class="mem-cell blue"><span class="cell-label">int_u32</span>0</div>
+          <span class="mem-index">5</span><div class="mem-cell blue"><span class="cell-label">int_u32</span>1</div>
+          <span class="mem-index">6</span><div class="mem-cell blue"><span class="cell-label">int_i32</span>0xFFFF…</div>
+          <span class="mem-index">7</span><div class="mem-cell teal"><span class="cell-label">int_u32</span>42</div>
         </div>
       </div>
     </section>

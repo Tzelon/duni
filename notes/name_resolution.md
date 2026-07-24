@@ -9,8 +9,9 @@ an instruction.
 Name resolution:
 - Maintains a chain of lexical scopes.
 - Looks up identifiers by walking the chain.
-- Pushes new bindings onto the chain.
-- Detects shadowing / redeclaration errors.
+- Pushes new bindings onto the chain. Rebinding an existing name is
+  allowed (Elixir-style) — the new binding shadows the old one.
+- Detects use of undeclared identifiers.
 
 ## Where it lives
 
@@ -65,16 +66,39 @@ Final DIR has no names:
 %2 = add %0 %1
 ```
 
-## Example 2 — shadow error
+## Example 2 — rebinding
 
-Source: `x = 1; x = 2`
+Source: `x = 1; x = 2; x`
+
+```
+Step          Action                              DIR
+─────────    ─────────────────────────────────   ─────────────────
+bind x = 1   emit, push LocalVal "x" → %0        %0 = int 1
+bind x = 2   emit, push LocalVal "x" → %1        %1 = int 2
+x            lookup "x" → %1 (first match wins)  —
+```
+
+No check on bind — a rebind is just another push. The chain after both
+binds:
+
+```
+LocalVal "x" → %1  ──►  LocalVal "x" → %0  ──►  Top
+```
+
+Lookup starts at the tip, so the newer binding wins; the older one is
+unreachable but harmless.
+
+## Example 3 — undeclared identifier
+
+Source: `x + 1`
 
 ```
 Step          Action                              Result
 ─────────    ─────────────────────────────────   ─────────────────────────
-bind x = 1   emit, push LocalVal "x" → %0        %0 = int 1
-bind x = 2   shadow check finds "x" in chain     ERROR
-                                                  "redeclaration of 'x'"
+x            lookup "x" walks to Top, no match   ERROR
+                                                  "use of undeclared
+                                                   identifier 'x'"
 ```
 
-DIR is never emitted; AstGen reports the error and stops.
+This is the only name-resolution error: with rebinding allowed there is
+no redeclaration check.

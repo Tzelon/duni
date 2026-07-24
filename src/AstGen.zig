@@ -728,7 +728,7 @@ test "bind lookup and rebinding" {
     );
 }
 
-test "rebind rhs sess the previous binding" {
+test "rebind rhs sees the previous binding" {
     try expect(
         \\x = 1
         \\x = x + 1

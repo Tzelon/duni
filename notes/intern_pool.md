@@ -94,9 +94,78 @@ compile error — but the *order* correspondence is on you. Getting it wrong is
 silent (an `Index` name pointing at the wrong interned value).
 
 Current statics: `comptime_int_type`, `comptime_float_type`, `f64_type`,
-`zero`, `one`, `negative_one`. Pre-interned value statics make hot checks
+`string_type`, `zero`, `one`, `negative_one`. (Simple types must stay the
+leading contiguous block — `indexToKey` decodes them positionally.) Pre-interned value statics make hot checks
 O(1) index compares: `dirNegate` builds `0 - x` from `.zero` without
 interning, and integer div-by-zero is `rhs.toIntern() == .zero`.
+
+## String values — one handle type, not Zig's two
+
+**Decision:** a comptime string value is `Key.string: NullTerminatedString` —
+the same table-ordinal handle `getString` returns and the dedup map is keyed
+by. One new `Tag.string` whose `data` is the handle. No `String {start, len}`
+struct, no aggregate encoding. `string_type` joins the simple-type block of
+the statics (before `zero`), extending the four-way correspondence above.
+
+### Why one handle type
+
+Zig's pool hands out **byte offsets** into `string_bytes`. A bare offset
+leaves the question "where does the string end?" with two possible answers,
+and each answer is a type:
+
+```
+Zig:  handle = byte position 6
+
+  NullTerminatedString(6):        String(6) + external len:
+    w o r l d 0                     w o r l d
+    →→→→→→→→→ ^                    └─ len=5 ─┘
+    walk until 0                    length stored elsewhere
+```
+
+Two incompatible contracts about the same buffer → two types.
+
+Our handles are **row numbers in the `strings` boundary table**, and the end
+always comes from the table — `toSlice` reads
+`string_bytes[strings[i] .. strings[i+1] - 1]`, never scanning for `0`:
+
+```
+Duni:  handle = row 1
+
+  strings table:   [0]=0   [1]=6   [2]=12
+                     │       │       │
+  string_bytes:    h e l l o 0 w o r l d 0
+                   └── row 0 ──┘└── row 1 ──┘
+```
+
+One contract → one type. A second type would be a second name for the same
+concept, paid for with conversions at every boundary (`getString`, the dedup
+map, and `Key` all speak the ordinal). The trailing `0` is decoration so
+`toSlice` can return `[:0]const u8` — it is *not* how length is known, so
+embedded `NUL`s can't corrupt anything (today they're unrepresentable anyway:
+the scanner rejects raw control characters and escapes don't exist yet).
+
+### Equality is handle equality
+
+`getString` dedupes bytes *before* a `Key` ever exists, so equal strings
+share one handle — `hash64`/`eql` on `Key.string` compare the handle, never
+the bytes. This is the core invariant (one index per canonical value)
+extended to strings; do not "fix" `eql` to compare bytes.
+
+### Why not Zig's aggregate encoding
+
+In Zig, `"hello"` is `*const [5:0]u8` — there is no string type, so string
+data is stored as an *array aggregate* (`Key.aggregate` with `bytes` storage)
+and the literal's value is a pointer to it. Duni's `string` is a primitive,
+Elixir-flavored opaque binary — not an indexable array of `u8`. A leaf value
+is the honest encoding; importing aggregates would be Zig's premise without
+Zig's language.
+
+### When a second type would earn its place
+
+Binary slicing (Elixir-style pattern matching on substrings): a substring's
+`start`/`len` doesn't land on table boundaries, so a row number can't
+describe it — *that* arc introduces a `{start, len}` type alongside the
+ordinal, which is Zig's split arrived at when the language demands it.
 
 ## Why comptime_int / comptime_float (and not `number`)
 

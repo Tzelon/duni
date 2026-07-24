@@ -102,17 +102,19 @@ fn writeFunc(gen: *WatGen) !void {
 }
 
 /// The wasm type of `main`'s result, derived from the value the final `ret`
-/// returns. Placeholder until Duni's `number` gets a defined runtime lowering.
+/// returns. A `number` is f64 at runtime (notes/number_literals.md).
 fn resultType(gen: *const WatGen) []const u8 {
     const datas = gen.air.instructions.items(.data);
     const ret_ref = datas[gen.air.instructions.len - 1].un_op;
     const ip_index = ret_ref.toInterned() orelse @panic("inst-index refs not supported yet");
     return switch (gen.ip.indexToKey(ip_index)) {
-        .int => "i32",
         .float => "f64",
-        .simple_type => @panic("type as value not supported yet"),
         // A string result is a (ptr, len) pair pointing into linear memory.
         .string => "i32 i32",
+        // Sema's `coerce` at the ret boundary turns every int into an
+        // interned float; no int value can reach codegen.
+        .int => unreachable,
+        .simple_type => @panic("type as value not supported yet"),
     };
 }
 
@@ -135,23 +137,15 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data) !void {
 fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
     const ip_index = ref.toInterned() orelse @panic("inst-index refs not supported yet");
     switch (gen.ip.indexToKey(ip_index)) {
-        .int => |int| {
-            // The function result is i32 for now, so that is the runtime
-            // boundary: comptime ints of any width are fine as long as the
-            // final value fits. A `.big_int` here never fits — decode
-            // narrowing only leaves limbs for values beyond u64/i64.
-            const value = switch (int.storage) {
-                inline .u64, .i64 => |x| std.math.cast(i32, x) orelse
-                    @panic("TODO: integer result does not fit in i32"),
-                .big_int => @panic("TODO: integer result does not fit in i32"),
-            };
-            try gen.writeIndent();
-            try gen.out.print("i32.const {d}\n", .{value});
-        },
         .float => |float| {
+            // `{d}` renders the shortest decimal form, so integral values
+            // print as `4`, not `4.0` — the `number` print rule.
             try gen.writeIndent();
             try gen.out.print("f64.const {d}\n", .{float.storage.f64});
         },
+        // Sema's `coerce` at the ret boundary turns every int into an
+        // interned float; no int value can reach codegen.
+        .int => unreachable,
         .simple_type => @panic("type as value not supported yet"),
         .string => |handle| {
             // (ptr, len) into linear memory; the data segment was emitted by
@@ -193,11 +187,14 @@ fn expectWatIndex(ip: *InternPool, ip_index: InternPool.Index, expected: []const
     try std.testing.expectEqualStrings(expected, w.buffer[0..w.end]);
 }
 
-test "emit int result" {
-    try expectWat(.{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -42 } } },
+test "emit integral float result" {
+    // The `number` print rule: integral values render as `-42`, not `-42.0`
+    // (notes/number_literals.md). Valid WAT — the text format accepts
+    // integer-looking tokens for float constants.
+    try expectWat(.{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = -42.0 } } },
         \\(module
-        \\  (func $main (result i32)
-        \\    i32.const -42
+        \\  (func $main (result f64)
+        \\    f64.const -42
         \\    return
         \\  )
         \\  (export "main" (func $main))

@@ -74,9 +74,18 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     const last_indx = body[body.len - 1];
     const last_ref = sema.inst_map.get(last_indx).?;
 
+    // The result type is inferred from the value until declarations carry
+    // types: numeric results are `number`, strings stay strings. The Zig
+    // analog is `analyzeRet` coercing to `fn_ret_ty`.
+    const result_ref = switch (ip.indexToKey(sema.resolveValue(last_ref).?.toIntern())) {
+        .int, .float => try sema.coerce(ip, .comptime_float_type, last_ref),
+        .string => last_ref,
+        .simple_type => unreachable, // no producer emits a type as a value
+    };
+
     try sema.instructions.append(gpa, .{
         .tag = .ret,
-        .data = .{ .un_op = last_ref },
+        .data = .{ .un_op = result_ref },
     });
 
     return .{ .instructions = sema.instructions.toOwnedSlice() };
@@ -158,6 +167,59 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
 fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const bytes = sema.code.instructions.items(.data)[@intFromEnum(inst)].str.get(&sema.code);
     return sema.addStrLit(ip, try ip.getString(sema.gpa, bytes));
+}
+
+/// Coerce a comptime-known value to `dest_ty`.
+/// Error when the destination cannot represent it exactly.
+/// Today the only destination is `number` (`comptime_float_type` stands in for it until
+/// runtime types exist); the low-level number types arc (i32/i64/u32/u64/f32)
+/// adds its destinations here.
+fn coerce(sema: *Sema, ip: *InternPool, dest_ty: InternPool.Index, inst: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+    const val = sema.resolveValue(inst).?; // Sema is fold-only: every result is comptime-known.
+    switch (dest_ty) {
+        .comptime_float_type => switch (ip.indexToKey(val.toIntern())) {
+            .float => return inst,
+            .int => return sema.coerceIntToFloat(ip, val),
+            else => unreachable,
+        },
+        else => unreachable,
+    }
+}
+
+/// comptime_int → comptime_float, exact or error (Zig's fits check in
+/// `coerceExtra`): round the int to f64, then round-trip back through a big
+/// int and compare against the operand. Accepts every integer f64 represents
+/// exactly — any magnitude with ≤ 53 significant bits, e.g. 2^64 — and
+/// rejects any that would round, e.g. 2^53 + 1. No silent precision loss,
+/// and no threshold.
+fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value) CompileError!Air.Inst.Ref {
+    const float = val.toFloat(f64, ip);
+    var space: Value.BigIntSpace = undefined;
+    const operand_big_int = val.toBigInt(&space, ip);
+    const fits = fits: {
+        if (!std.math.isFinite(float)) break :fits false;
+        var result_big_int: std.math.big.int.Mutable = .{
+            .limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcLimbLen(float)),
+            .len = undefined,
+            .positive = undefined,
+        };
+        switch (result_big_int.setFloat(float, .nearest_even)) {
+            .inexact => break :fits false,
+            .exact => {},
+        }
+        break :fits result_big_int.toConst().eql(operand_big_int);
+    };
+    if (!fits) {
+        // TODO(tzelon): report through structured Sema error reporting once
+        // it exists; log.warn because the test runner fails on log.err.
+        log.warn("number cannot represent integer value", .{});
+        return error.AnalysisFail;
+    }
+    const ip_index = try ip.get(sema.gpa, .{ .float = .{
+        .ty = .comptime_float_type,
+        .storage = .{ .f64 = float },
+    } });
+    return Air.Inst.Ref.fromInterned(ip_index);
 }
 
 fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -377,19 +439,50 @@ fn instRef(i: u32) Dir.Inst.Ref {
 }
 
 test "analyze int literal" {
+    // An int result materializes as a `number` (f64) at the runtime boundary.
     try expectAnalyzed(&.{
         .{ .tag = .int, .data = .{ .int = 42 } },
-    }, &.{}, &.{}, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 42 } } });
+    }, &.{}, &.{}, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 42.0 } } });
 }
 
 test "analyze big int literal" {
+    // 2^64 has one significant bit, so f64 represents it exactly — the
+    // coercion accepts any exactly-representable integer, not a threshold.
     const limbs = [_]std.math.big.Limb{ 0, 1 }; // 2^64
     try expectAnalyzed(&.{
         .{ .tag = .int_big, .data = .{ .str = .{ .start = @enumFromInt(0), .len = limbs.len } } },
-    }, &.{}, mem.sliceAsBytes(&limbs), .{ .int = .{
-        .ty = .comptime_int_type,
-        .storage = .{ .big_int = .{ .limbs = &limbs, .positive = true } },
+    }, &.{}, mem.sliceAsBytes(&limbs), .{ .float = .{
+        .ty = .comptime_float_type,
+        .storage = .{ .f64 = 18446744073709551616.0 },
     } });
+}
+
+test "coerce int result to number is exact or error" {
+    // 2^53 + 1 is the first integer f64 cannot represent — must error.
+    const gpa = std.testing.allocator;
+    var dir = try buildTestDir(gpa, &.{
+        .{ .tag = .int, .data = .{ .int = 9007199254740993 } },
+    }, &.{}, &.{});
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+
+    // Same rule through big-int storage: 2^64 + 1 needs 65 significant bits.
+    const limbs = [_]std.math.big.Limb{ 1, 1 };
+    var big_dir = try buildTestDir(gpa, &.{
+        .{ .tag = .int_big, .data = .{ .str = .{ .start = @enumFromInt(0), .len = limbs.len } } },
+    }, &.{}, mem.sliceAsBytes(&limbs));
+    defer big_dir.deinit(gpa);
+
+    var big_ip: InternPool = .{};
+    try big_ip.init(gpa);
+    defer big_ip.deinit(gpa);
+
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, big_dir, &big_ip));
 }
 
 test "analyze float literal" {
@@ -422,9 +515,9 @@ test "analyze subtraction with negative result" {
         .{ .tag = .int, .data = .{ .int = 1 } },
         .{ .tag = .int, .data = .{ .int = 2 } },
         .{ .tag = .sub, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
-    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .int = .{
-        .ty = .comptime_int_type,
-        .storage = .{ .i64 = -1 },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .float = .{
+        .ty = .comptime_float_type,
+        .storage = .{ .f64 = -1.0 },
     } });
 }
 
@@ -452,7 +545,7 @@ test "analyze negate int" {
     try expectAnalyzed(&.{
         .{ .tag = .int, .data = .{ .int = 5 } },
         .{ .tag = .negate, .data = .{ .un_node = .{ .src_node = @enumFromInt(0), .operand = instRef(0) } } },
-    }, &.{}, &.{}, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -5 } } });
+    }, &.{}, &.{}, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = -5.0 } } });
 }
 
 test "analyze negate preserves negative zero" {

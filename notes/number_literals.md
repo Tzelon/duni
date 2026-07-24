@@ -14,10 +14,15 @@ Both coerce into `number` at the runtime boundary; mixed comptime arithmetic
 coerces int → float (see `notes/sema.md`).
 
 > Supersedes an earlier version of this note that made floats a fully
-> separate user-space type. What `number` lowers to at runtime (f64?
-> error-on-overflow?) is still **the** open decision — today WatGen emits
-> `i32` for int results / `f64` for float results as a placeholder and
-> panics on ints that don't fit.
+> separate user-space type.
+
+At runtime, **`number` is semantically IEEE 754 f64** — the JS model (see
+"Decisions made"). Devs who need real integer semantics or a specific width
+drop to the explicit low-level types (`i32`/`i64`/`u32`/`u64`/`f32`), a
+later arc (the reserved `int_u32`/`int_i32`/`float_f64` InternPool tags are
+parked for it). Today WatGen still emits `i32` for int results / `f64` for
+float results as a placeholder and panics on ints that don't fit — that
+code predates this decision and must catch up.
 
 ## Pipeline status — all three literal forms work end-to-end
 
@@ -47,18 +52,48 @@ coerces int → float (see `notes/sema.md`).
 
 ## Decisions made
 
-- Integer `/` is **trunc division** (`intDivTrunc`); float `/` is IEEE
-  division. Division by zero is a comptime error for both.
+- **`number` = f64.** One user-facing runtime type, semantically an IEEE 754
+  double. Integer-valued numbers are doubles that happen to be integral.
+  Rationale: runtime-tagged integers (Erlang, Grain) turn every `+` into a
+  runtime call on WASM; a compile-time int/float dual repr collapses to f64
+  at every function boundary anyway. The cost — contiguous exact integers
+  only up to 2^53 — is fenced by the low-level-types escape hatch. ABI:
+  `number` is `f64` everywhere.
+- **`/` is always IEEE division**: `5 / 2` → `2.5`. Explicit `div`/`rem`
+  Kernel functions cover integer division later. *Supersedes* the earlier
+  "integer `/` is trunc division" decision; `intDivTrunc` must go.
+- **Exact or error at materialization — no threshold**: comptime stays
+  arbitrary precision; lowering a `comptime_int` to runtime `number` is a
+  Sema error unless f64 represents the value *exactly*. The check is Zig's
+  `coerceExtra` fits check (round the int to f64, round-trip back through a
+  big int via `setFloat(.nearest_even)`, compare): any magnitude with ≤ 53
+  significant bits passes — `2^53` and `2^64` are fine, `2^53 + 1` and
+  `2^64 + 1` error. (An earlier draft said "|x| ≤ 2^53"; that is only the
+  *contiguous* exact range and wrongly rejects exact values like `2^64`.)
+  Implemented: `Sema.coerce` / `coerceIntToFloat`, the Zig-shaped
+  destination-typed coercion seam the low-level types arc extends. Replaces
+  both WatGen "does not fit" panics with a real diagnostic.
+- **Float literal precision — accept with rounding, the JS way**: a float
+  literal means "the nearest f64", silently — `1.00000000000000001` is
+  `1.0`, same as JavaScript and Elixir. Documented behavior, not a bug; no
+  check in AstGen. (An earlier draft said "restore Zig's f64↔f128
+  round-trip check" — that check tests *binary* exactness, which almost no
+  decimal has: it rejects `3.14` and `0.1` too. Zig itself never rejects;
+  its comptime_float is f128 and the check only picks a storage format.
+  The alternative — error iff the shortest form of the literal's f64
+  denotes a different decimal than written — was considered and declined.)
+- **Integral numbers print without a fractional part**: `8 / 2` prints `4`,
+  not `4.0` — the JS convention. Affects WatGen text output and test
+  expectations.
+- Division by zero is a comptime error.
 - `comptime_int → comptime_float` coercion rounds via `nearest_even`
   (lossy for > 2^53 — accepted, same as Zig's coercion).
 
 ## Open decisions
 
-- **Float literal precision**: Zig round-trips f64↔f128 and refuses literals
-  that don't fit f64 exactly; Duni currently parses as f128 and silently
-  `@floatCast`s. `1.00000000000000001` quietly becomes `1.0`. Decide:
-  error or accept-documented.
-- **`number` runtime lowering** (see above).
+- Low-level types arc: surface syntax for `i32`/`i64`/`u32`/`u64`/`f32`,
+  their arithmetic semantics (overflow behavior), and `number` ↔ low-level
+  conversions.
 
 ## Error reporting
 

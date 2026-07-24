@@ -14,6 +14,7 @@ pub const NullTerminatedString = enum(u32) {
     star = 3,
     slash = 4,
     equal = 5,
+    block = 6,
     _,
 
     pub const static_len = @typeInfo(@This()).@"enum".fields.len;
@@ -127,4 +128,5 @@ pub const static_strings: [NullTerminatedString.static_len][]const u8 = .{
     "*",
     "/",
     "=",
+    "{", //block
 };

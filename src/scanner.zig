@@ -114,6 +114,14 @@ pub const Scanner = struct {
                         else => result.tag = .equal,
                     }
                 },
+                '{' => {
+                    result.tag = .l_brace;
+                    self.index += 1;
+                },
+                '}' => {
+                    result.tag = .r_brace;
+                    self.index += 1;
+                },
                 else => continue :state .invalid,
             },
 
@@ -244,6 +252,7 @@ pub const Scanner = struct {
         return switch (tag) {
             .identifier,
             .r_paren,
+            .r_brace,
             .number_literal,
             .string_literal,
             => true,
@@ -283,6 +292,8 @@ pub const Token = struct {
         // Single-character tokens.
         l_paren,
         r_paren,
+        l_brace,
+        r_brace,
 
         // keywords
         keyword_fn,
@@ -312,6 +323,8 @@ pub const Token = struct {
                 .slash => "/",
                 .l_paren => "(",
                 .r_paren => ")",
+                .l_brace => "{",
+                .r_brace => "}",
             };
         }
     };
@@ -344,4 +357,5 @@ test "tokenizer" {
     try expectToken("\"abc", &.{.invalid});
     try expectToken("\"a\nb", &.{ .invalid, .identifier });
     try expectToken("\"a\\\"b\"", &.{.string_literal});
+    try expectToken("}\nx", &.{ .r_brace, .newline, .identifier });
 }

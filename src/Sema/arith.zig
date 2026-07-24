@@ -45,8 +45,8 @@ pub fn mul(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int:
 }
 
 /// Applies the `/` operator to comptime-known values.
-/// `/` is always IEEE division on f64 — `number` is semantically f64 (see
-/// `notes/number_literals.md`). Int operands coerce via `nearest_even`;
+/// `/` is always IEEE division on f64 — `number` is semantically f64 .
+/// Int operands coerce via `nearest_even`;
 /// integer division is a separate named operation (`div`/`rem`), not `/`.
 pub fn div(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value) !Value {
     return floatDiv(sema, ip, lhs_val, rhs_val);

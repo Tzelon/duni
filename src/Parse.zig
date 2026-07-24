@@ -45,29 +45,7 @@ pub fn parseRoot(p: *Parse) !void {
         .data = undefined,
     });
 
-    const scratch_top = p.scratch.items.len;
-    defer p.scratch.shrinkRetainingCapacity(scratch_top);
-
-    while (true) {
-        while (p.check(.newline)) _ = p.advance(); // blank lines / separators
-        if (p.check(.eof)) break;
-
-        const stmt = p.expression() catch |err| switch (err) {
-            error.ParseError => {
-                p.findNextStmt();
-                continue;
-            },
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        try p.scratch.append(p.gpa, stmt);
-
-        if (!p.check(.newline) and !p.check(.eof)) {
-            try p.warnExpected(.newline);
-            p.findNextStmt();
-        }
-    }
-
-    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
+    const span = try p.parseBlock();
     p.nodes.items(.data)[0] = .{ .extra_range = span };
 }
 
@@ -85,6 +63,33 @@ fn findNextStmt(p: *Parse) void {
 
 fn expression(p: *Parse) !Node.Index {
     return p.parsePrecedence(.prec_assignment);
+}
+
+fn parseBlock(p: *Parse) !Node.SubRange {
+    const scratch_top = p.scratch.items.len;
+    defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (true) {
+        while (p.check(.newline)) _ = p.advance(); // blank lines / separators
+        if (p.check(.eof) or p.check(.r_brace)) break;
+
+        const stmt = p.expression() catch |err| switch (err) {
+            error.ParseError => {
+                p.findNextStmt();
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        try p.scratch.append(p.gpa, stmt);
+
+        if (!p.check(.newline) and !p.check(.eof)) {
+            try p.warnExpected(.newline);
+            p.findNextStmt();
+        }
+    }
+
+    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
+    return span;
 }
 
 // Pratt Parsing
@@ -147,6 +152,8 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
     const rule = switch (tag) {
         .l_paren => comptime ParseRule.init(Parse.grouping, null, .prec_call),
         .r_paren => comptime ParseRule.init(null, null, .prec_none),
+        .l_brace => comptime ParseRule.init(Parse.block, null, .prec_none),
+        .r_brace => comptime ParseRule.init(null, null, .prec_none),
         .minus => comptime ParseRule.init(Parse.unary, Parse.binary, .prec_term),
         .plus => comptime ParseRule.init(null, Parse.binary, .prec_term),
         .star => comptime ParseRule.init(null, Parse.binary, .prec_factor),
@@ -235,10 +242,15 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
     });
 }
 
-// TODO(tzelon): parens are folded away, so node spans stop at the inner
-// expression (`-(1 + 2)` reports a span without the `)`). Keep the paren
-// tokens in the AST (e.g. a grouped node storing the r_paren, like Zig's
-// grouped_expression) once the LSP and other tooling need exact spans.
+fn block(p: *Parse) !Node.Index {
+    const main_token = p.advance();
+    const span = try p.parseBlock();
+    const args = try p.addExtra(span);
+    _ = try p.consume(.r_brace);
+
+    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .block, .args = args } } });
+}
+
 fn grouping(p: *Parse) !Node.Index {
     _ = p.advance();
     const inner = try p.expression();

@@ -442,6 +442,21 @@ test "left associative & precedence" {
       // zig fmt: on
 }
 
+test "block" {
+    try expectAst("{}", .{ .form = .{ .op = .block, .args = &.{} } });
+
+    // zig fmt: off
+    try expectAst(
+        \\{
+        \\  1
+        \\  2
+        \\}
+        ,
+        .{ .form = .{ .op = .block, .args = &.{ .number_literal, .number_literal } } },
+    );
+    // zig fmt: on
+}
+
 test "dump" {
     var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3");
     defer tree.deinit(std.testing.allocator);

@@ -112,6 +112,7 @@ pub const Inst = struct {
         comptime_int_type,
         comptime_float_type,
         f64_type,
+        string_type,
         zero,
         one,
         negative_one,

@@ -24,6 +24,8 @@ const Air = @import("Sema/Air.zig");
 
 const InternPool = @import("InternPool.zig");
 
+const String = @import("string.zig");
+
 gpa: Allocator,
 
 // AIR instructions
@@ -62,6 +64,8 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
             .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
             .negate => try sema.dirNegate(ip, inst_idx),
             .div => try sema.dirDiv(ip, inst_idx),
+            .str => try sema.dirStr(ip, inst_idx),
+            .decl_val => unreachable,
         };
 
         sema.inst_map.putAssumeCapacity(inst_idx, air_ref);
@@ -145,6 +149,11 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
     unreachable;
 }
 
+fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    const bytes = sema.code.instructions.items(.data)[@intFromEnum(inst)].str.get(&sema.code);
+    return sema.addStrLit(ip, try ip.getString(sema.gpa, bytes));
+}
+
 fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     // Expend when any of these lands in Duni:
     //- A second number type that triggers peer-type resolution.
@@ -191,6 +200,11 @@ fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Ai
     // negate is `0 - operand`
     const lhs = Air.internedToRef(.zero);
     return sema.analyzeArithmetic(ip, .sub, lhs, rhs);
+}
+
+fn addStrLit(sema: *Sema, ip: *InternPool, string: String.NullTerminatedString) CompileError!Air.Inst.Ref {
+    const val = try ip.get(sema.gpa, .{ .string = string });
+    return .fromInterned(val);
 }
 
 fn resolveInst(sema: *Sema, dir_ref: Dir.Inst.Ref) Air.Inst.Ref {
@@ -408,6 +422,25 @@ test "analyze float literal" {
     try expectAnalyzed(&.{
         .{ .tag = .float, .data = .{ .float = 3.14 } },
     }, &.{}, &.{}, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 3.14 } } });
+}
+
+test "analyze string literal" {
+    const gpa = std.testing.allocator;
+
+    var dir = try buildTestDir(gpa, &.{
+        .{ .tag = .str, .data = .{ .str = .{ .start = @enumFromInt(0), .len = 5 } } },
+    }, &.{}, "hello");
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var air = try Sema.analyze(gpa, dir, &ip);
+    defer air.deinit(gpa);
+
+    const actual = air.instructions.items(.data)[0].un_op.toInterned().?;
+    try std.testing.expectEqualStrings("hello", ip.indexToKey(actual).string.toSlice(&ip));
 }
 
 test "analyze subtraction with negative result" {

@@ -39,6 +39,7 @@ pub const Inst = struct {
         comptime_int_type = @intFromEnum(InternPool.Index.comptime_int_type),
         comptime_float_type = @intFromEnum(InternPool.Index.comptime_float_type),
         f64_type = @intFromEnum(InternPool.Index.f64_type),
+        string_type = @intFromEnum(InternPool.Index.string_type),
         zero = @intFromEnum(InternPool.Index.zero),
         one = @intFromEnum(InternPool.Index.one),
         negative_one = @intFromEnum(InternPool.Index.negative_one),

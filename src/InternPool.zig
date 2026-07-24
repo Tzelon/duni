@@ -47,6 +47,7 @@ pub const Index = enum(u32) {
     comptime_int_type,
     comptime_float_type,
     f64_type,
+    string_type,
     /// `0` (comptime_int)
     zero,
     /// `1` (comptime_int)
@@ -63,6 +64,7 @@ pub const Key = union(enum) {
     simple_type: SimpleType,
     int: Key.Int,
     float: Float,
+    string: NullTerminatedString,
 
     pub const Int = struct {
         ty: Index,
@@ -106,6 +108,7 @@ pub const Key = union(enum) {
         comptime_int = @intFromEnum(Index.comptime_int_type),
         comptime_float = @intFromEnum(Index.comptime_float_type),
         f64 = @intFromEnum(Index.f64_type),
+        string = @intFromEnum(Index.string_type),
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
@@ -139,6 +142,8 @@ pub const Key = union(enum) {
                 }
                 return hasher.final();
             },
+
+            .string => |str| Hash.hash(seed, asBytes(&str)),
         };
     }
 
@@ -196,6 +201,10 @@ pub const Key = union(enum) {
                         return a_bits == b_bits;
                     },
                 }
+            },
+
+            .string => |a_info| {
+                return a_info == b.string;
             },
         }
     }
@@ -305,6 +314,9 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
                 else => unreachable,
             }
         },
+        .string => |str| {
+            ip.items.appendAssumeCapacity(.{ .tag = .string, .data = @intFromEnum(str) });
+        },
     }
 
     gop.key_ptr.* = new_index;
@@ -356,11 +368,12 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             .ty = .f64_type,
             .storage = .{ .f64 = extraData(ip, Float64, data).get() },
         } },
-
         .float_comptime_float => .{ .float = .{
             .ty = .comptime_float_type,
             .storage = .{ .f64 = extraData(ip, Float64, data).get() },
         } },
+
+        .string => .{ .string = @enumFromInt(data) },
     };
 }
 
@@ -564,12 +577,16 @@ pub const Tag = enum(u8) {
     /// A comptime_float value.
     /// data is extra index to Float64.
     float_comptime_float,
+    /// A string
+    /// data is NullTerminatedString
+    string,
 };
 
 pub const static_keys: [static_len]Key = .{
     .{ .simple_type = .comptime_int },
     .{ .simple_type = .comptime_float },
     .{ .simple_type = .f64 },
+    .{ .simple_type = .string },
     .{ .int = .{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = 0 },

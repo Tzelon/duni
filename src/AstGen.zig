@@ -48,25 +48,31 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     // We expect at least as many DIR instructions and extra data items
     // as AST nodes.
     try astgen.instructions.ensureTotalCapacity(gpa, tree.nodes.len);
-
     try astgen.extra.ensureTotalCapacity(gpa, tree.nodes.len);
 
-    // end-of-chain marker
     var top_scope: Scope.Top = .{};
-    // Tip of the scope chain
-    var scope_cursor: Scope.Cursor = .{ .tip = &top_scope.base };
+    var instrs: ArrayList(Dir.Inst.Index) = .empty;
+    defer instrs.deinit(gpa);
+
+    var main_gd: GenDir = .{
+        .decl_node_index = .root,
+        .decl_line = 0,
+        .cursor = .{ .tip = &top_scope.base },
+        .astgen = &astgen,
+        .instructions = &instrs,
+        .instructions_top = 0,
+    };
 
     for (tree.rootDecls()) |statement| {
-        _ = try astgen.expr(&scope_cursor, statement);
+        _ = try expr(&main_gd, statement);
     }
 
-    // TODO: this is super hacky for now, when we do not have proper body
-    // Append the body slice: every emitted instruction is part of the main body.
-    const body_len: u32 = @intCast(astgen.instructions.len);
+    const body = main_gd.instructionsSlice();
     const main_body_start: u32 = @intCast(astgen.extra.items.len);
-    try astgen.extra.ensureUnusedCapacity(gpa, body_len);
-    for (0..body_len) |i| {
-        astgen.extra.appendAssumeCapacity(@intCast(i));
+    const main_body_len: u32 = @intCast(body.len);
+    try astgen.extra.ensureUnusedCapacity(gpa, main_body_len);
+    for (body) |idx| {
+        astgen.extra.appendAssumeCapacity(@intFromEnum(idx));
     }
 
     try astgen.extra.shrinkToLen(gpa);
@@ -77,20 +83,20 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
         .extra = astgen.extra.toOwnedSliceAssert(),
         .string_bytes = astgen.string_bytes.toOwnedSliceAssert(),
         .main_body_start = main_body_start,
-        .main_body_len = body_len,
+        .main_body_len = main_body_len,
     };
 }
 
-fn expr(astgen: *AstGen, scope_cursor: *Scope.Cursor, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
-    const tree = astgen.tree;
+fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
 
     switch (tree.nodeTag(node)) {
-        .number_literal => return numberLiteral(astgen, node, node, .positive),
-        .string_literal => return stringLiteral(astgen, node),
+        .number_literal => return numberLiteral(gd, node, node, .positive),
+        .string_literal => return stringLiteral(gd, node),
 
-        .identifier => return identifier(astgen, scope_cursor, node),
+        .identifier => return identifier(gd, node),
 
-        .form => return formExpr(astgen, scope_cursor, node),
+        .form => return formExpr(gd, node),
         else => {
             unreachable;
         },
@@ -99,25 +105,25 @@ fn expr(astgen: *AstGen, scope_cursor: *Scope.Cursor, node: Ast.Node.Index) Inne
 
 const Sign = enum { negative, positive };
 
-fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.Index, sign: Sign) InnerError!Dir.Inst.Ref {
+fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index, sign: Sign) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
     const tree = astgen.tree;
     const num_token = tree.nodeMainToken(node);
     const bytes = tree.tokenSlice(num_token);
 
     const result: Dir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
         .int => |num| switch (num) {
-            0 => if (sign == .positive) try astgen.addInt(num) else {
+            0 => if (sign == .positive) try gd.addInt(num) else {
                 // TODO(tzelon): report through AstGen error reporting once it
                 // exists; log.warn because the test runner fails on log.err.
                 std.log.warn("0 cannot be negative", .{});
                 return error.AnalysisFail;
             },
 
-            else => try astgen.addInt(num),
+            else => try gd.addInt(num),
         },
         .big_int => |base| big: {
-            const gpa = astgen.gpa;
-            var big_int = try std.math.big.int.Managed.init(gpa);
+            var big_int = try std.math.big.int.Managed.init(astgen.gpa);
             defer big_int.deinit();
             const prefix_offset: usize = if (base == .decimal) 0 else 2;
             big_int.setString(@intFromEnum(base), bytes[prefix_offset..]) catch |err| switch (err) {
@@ -128,7 +134,7 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.In
 
             const limbs = big_int.limbs[0..big_int.len()];
             assert(big_int.isPositive());
-            break :big try astgen.addIntBig(limbs);
+            break :big try gd.addIntBig(limbs);
         },
         .float => {
             const unsigned_float_number = std.fmt.parseFloat(f128, bytes) catch |err| switch (err) {
@@ -140,8 +146,7 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.In
             };
             @setFloatMode(.strict);
             const smaller_float: f64 = @floatCast(float_number);
-            const result = try astgen.addFloat(smaller_float);
-            return result;
+            return try gd.addFloat(smaller_float);
         },
         .failure => {
             std.log.warn("failed to parse literal number", .{});
@@ -152,79 +157,66 @@ fn numberLiteral(astgen: *AstGen, node: Ast.Node.Index, source_node: Ast.Node.In
     if (sign == .positive) {
         return result;
     } else {
-        const negated = try astgen.addUnNode(.negate, result, source_node);
-        return negated;
+        return try gd.addUnNode(.negate, result, source_node);
     }
 }
 
-fn stringLiteral(
-    astgen: *AstGen,
-    node: Ast.Node.Index,
-) InnerError!Dir.Inst.Ref {
-    const tree = astgen.tree;
+fn stringLiteral(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
     const str_lit_token = tree.nodeMainToken(node);
-    const str = try astgen.strLitAsString(str_lit_token);
-    const result = try astgen.add(.{
+    const str = try gd.astgen.strLitAsString(str_lit_token);
+    return gd.add(.{
         .tag = .str,
         .data = .{ .str = .{
             .start = str.index,
             .len = str.len,
         } },
     });
-    return result;
 }
 
-fn formExpr(astgen: *AstGen, scope_cursor: *Scope.Cursor, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
-    const tree = astgen.tree;
+fn formExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
 
     const op = tree.formOp(node);
     const args = tree.formArgs(node);
 
     switch (op) {
-        .star => return astgen.simpleBinOp(scope_cursor, node, args, .mul),
-        .plus => return astgen.simpleBinOp(scope_cursor, node, args, .add),
+        .star => return simpleBinOp(gd, node, args, .mul),
+        .plus => return simpleBinOp(gd, node, args, .add),
         .minus => switch (args.len) {
-            1 => return astgen.negation(scope_cursor, node, args),
-            2 => return astgen.simpleBinOp(scope_cursor, node, args, .sub),
+            1 => return negation(gd, node, args),
+            2 => return simpleBinOp(gd, node, args, .sub),
             else => unreachable,
         },
-        .slash => return astgen.simpleBinOp(scope_cursor, node, args, .div),
-        .equal => return astgen.bind(scope_cursor, node, args),
+        .slash => return simpleBinOp(gd, node, args, .div),
+        .equal => return bind(gd, node, args),
         else => unreachable,
     }
 }
 
-fn negation(
-    astgen: *AstGen,
-    scope_cursor: *Scope.Cursor,
-    node: Ast.Node.Index,
-    args: []const Node.Index,
-) InnerError!Dir.Inst.Ref {
-    const tree = astgen.tree;
+fn negation(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
 
     const operand_node = args[0];
 
     // Check for float literal as the sub-expression because we want to preserve
     // its negativity rather than having it go through comptime subtraction.
     if (tree.nodeTag(operand_node) == .number_literal) {
-        return numberLiteral(astgen, operand_node, node, .negative);
+        return numberLiteral(gd, operand_node, node, .negative);
     }
 
-    const operand = try astgen.expr(scope_cursor, operand_node);
-    const result = try astgen.addUnNode(.negate, operand, node);
-    return result;
+    const operand = try expr(gd, operand_node);
+    return gd.addUnNode(.negate, operand, node);
 }
 
-fn simpleBinOp(astgen: *AstGen, scope_cursor: *Scope.Cursor, node: Ast.Node.Index, args: []const Node.Index, op_inst_tag: Dir.Inst.Tag) InnerError!Dir.Inst.Ref {
-    const lhs = try astgen.expr(scope_cursor, args[0]);
-    const rhs = try astgen.expr(scope_cursor, args[1]);
-
-    const result = try astgen.addPlNode(op_inst_tag, node, Dir.Inst.Bin{ .lhs = lhs, .rhs = rhs });
-
-    return result;
+fn simpleBinOp(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index, op_inst_tag: Dir.Inst.Tag) InnerError!Dir.Inst.Ref {
+    const lhs = try expr(gd, args[0]);
+    const rhs = try expr(gd, args[1]);
+    return gd.addPlNode(op_inst_tag, node, Dir.Inst.Bin{ .lhs = lhs, .rhs = rhs });
 }
 
-fn bind(astgen: *AstGen, scope_cursor: *Scope.Cursor, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
+fn bind(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
     const tree = astgen.tree;
     _ = node;
     const lhs_node = args[0];
@@ -239,31 +231,27 @@ fn bind(astgen: *AstGen, scope_cursor: *Scope.Cursor, node: Ast.Node.Index, args
 
     // Lower the rhs BEFORE pushing the note: in `x = x + 1`, the rhs `x`
     // must see the old binding.
-    const rhs = try astgen.expr(scope_cursor, rhs_node);
+    const rhs = try expr(gd, rhs_node);
 
     const name_token = tree.nodeMainToken(lhs_node);
     const name = try astgen.identAsString(name_token);
 
     const local_val = try astgen.scope_arena.allocator().create(Scope.LocalVal);
     local_val.* = .{
-        .parent = scope_cursor.tip,
+        .parent = gd.cursor.tip,
         .name = name,
         .id_cat = .@"local variable",
         .inst = rhs,
         .token_src = name_token,
     };
 
-    scope_cursor.tip = &local_val.base;
+    gd.cursor.tip = &local_val.base;
 
     return rhs;
 }
 
-fn identifier(
-    astgen: *AstGen,
-    scope_cursor: *Scope.Cursor,
-    ident: Ast.Node.Index,
-) InnerError!Dir.Inst.Ref {
-    const tree = astgen.tree;
+fn identifier(gd: *GenDir, ident: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
 
     const ident_token = tree.nodeMainToken(ident);
     const ident_name_raw = tree.tokenSlice(ident_token);
@@ -272,19 +260,15 @@ fn identifier(
         return dir_const_ref;
     }
 
-    return localVarRef(astgen, scope_cursor, ident, ident_token);
+    return localVarRef(gd, ident, ident_token);
 }
 
-fn localVarRef(
-    astgen: *AstGen,
-    scope_cursor: *Scope.Cursor,
-    ident: Ast.Node.Index,
-    ident_token: Ast.TokenIndex,
-) InnerError!Dir.Inst.Ref {
+fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) InnerError!Dir.Inst.Ref {
     _ = ident;
 
+    const astgen = gd.astgen;
     const name_str_index = try astgen.identAsString(ident_token);
-    find_scope: switch (scope_cursor.tip.unwrap()) {
+    find_scope: switch (gd.cursor.tip.unwrap()) {
         .local_val => |local_val| {
             if (local_val.name == name_str_index) {
                 // rebinding pushes the newest binding nearest the tip, so first match IS the shadowing semantics.
@@ -406,107 +390,6 @@ fn parseStrLit(
     }
 }
 
-fn addPlNode(
-    astgen: *AstGen,
-    tag: Dir.Inst.Tag,
-    /// Absolute node index. This function does the conversion to offset from Decl.
-    src_node: Ast.Node.Index,
-    extra: anytype,
-) !Dir.Inst.Ref {
-    const gpa = astgen.gpa;
-    try astgen.instructions.ensureUnusedCapacity(gpa, 1);
-
-    const payload_index = try astgen.addExtra(extra);
-    const new_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
-    astgen.instructions.appendAssumeCapacity(.{
-        .tag = tag,
-        .data = .{ .pl_node = .{
-            .src_node = astgen.nodeIndexToRelative(src_node),
-            .payload_index = payload_index,
-        } },
-    });
-    // astgen.instructions.appendAssumeCapacity(new_index);
-    return new_index.toRef();
-}
-
-fn addUnNode(
-    astgen: *AstGen,
-    tag: Dir.Inst.Tag,
-    operand: Dir.Inst.Ref,
-    /// Absolute node index. This function does the conversion to offset from Decl.
-    src_node: Ast.Node.Index,
-) !Dir.Inst.Ref {
-    assert(operand != .none);
-    return astgen.add(.{
-        .tag = tag,
-        .data = .{ .un_node = .{
-            .operand = operand,
-            .src_node = astgen.nodeIndexToRelative(src_node),
-        } },
-    });
-}
-
-fn addInt(astgen: *AstGen, integer: u64) !Dir.Inst.Ref {
-    return astgen.add(.{
-        .tag = .int,
-        .data = .{ .int = integer },
-    });
-}
-
-fn addIntBig(astgen: *AstGen, limbs: []const std.math.big.Limb) !Dir.Inst.Ref {
-    const gpa = astgen.gpa;
-    try astgen.instructions.ensureUnusedCapacity(gpa, 1);
-    try astgen.string_bytes.ensureUnusedCapacity(gpa, @sizeOf(std.math.big.Limb) * limbs.len);
-
-    const new_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
-    astgen.instructions.appendAssumeCapacity(.{
-        .tag = .int_big,
-        .data = .{ .str = .{
-            .start = @enumFromInt(astgen.string_bytes.items.len),
-            .len = @intCast(limbs.len),
-        } },
-    });
-
-    astgen.string_bytes.appendSliceAssumeCapacity(mem.sliceAsBytes(limbs));
-    return new_index.toRef();
-}
-
-fn addFloat(astgen: *AstGen, number: f64) !Dir.Inst.Ref {
-    return astgen.add(.{
-        .tag = .float,
-        .data = .{ .float = number },
-    });
-}
-
-fn addStrTok(
-    astgen: *AstGen,
-    tag: Dir.Inst.Tag,
-    str_index: Dir.NullTerminatedString,
-    /// Absolute token index. This function does the conversion to Decl offset.
-    abs_tok_index: Ast.TokenIndex,
-) !Dir.Inst.Ref {
-    return astgen.add(.{
-        .tag = tag,
-        .data = .{ .str_tok = .{
-            .start = str_index,
-            .src_tok = astgen.tokenIndexToRelative(abs_tok_index),
-        } },
-    });
-}
-
-fn add(astgen: *AstGen, inst: Dir.Inst) !Dir.Inst.Ref {
-    return (try astgen.addAsIndex(inst)).toRef();
-}
-
-fn addAsIndex(astgen: *AstGen, inst: Dir.Inst) !Dir.Inst.Index {
-    const gpa = astgen.gpa;
-    try astgen.instructions.ensureUnusedCapacity(gpa, 1);
-
-    const new_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
-    astgen.instructions.appendAssumeCapacity(inst);
-    return new_index;
-}
-
 fn addExtra(astgen: *AstGen, extra: anytype) Allocator.Error!u32 {
     const field_count = std.meta.fieldNames(@TypeOf(extra)).len;
     try astgen.extra.ensureUnusedCapacity(astgen.gpa, field_count);
@@ -554,24 +437,6 @@ fn reserveExtra(astgen: *AstGen, size: usize) Allocator.Error!u32 {
     return extra_index;
 }
 
-fn nodeIndexToRelative(astgen: *AstGen, node_index: Ast.Node.Index) Ast.Node.Offset {
-    // TODO: should be return gz.decl_node_index.toOffset(node_index);
-    // relevant when we want to cache location per decl
-    _ = astgen;
-    return Ast.Node.Index.root.toOffset(node_index);
-}
-
-fn tokenIndexToRelative(astgen: AstGen, token: Ast.TokenIndex) Ast.TokenOffset {
-    return .init(astgen.srcToken(), token);
-}
-
-fn srcToken(astgen: AstGen) Ast.TokenIndex {
-    _ = astgen;
-    // TODO: first token of the containing decl once decls exist (gz.srcToken in Zig)
-    // today the whole module is the decl, and its first token is 0.
-    return 0;
-}
-
 const primitive_instrs = std.StaticStringMap(Dir.Inst.Ref).initComptime(.{
     // .{ "bool", .bool_type },
     .{ "comptime_float", .comptime_float_type },
@@ -599,6 +464,175 @@ fn deinit(astgen: *AstGen, gpa: Allocator) void {
     astgen.string_table.deinit(gpa);
     astgen.scope_arena.deinit();
 }
+
+/// This is a temporary structure; references to it are valid only
+/// while constructing a `Dir`.
+const GenDir = struct {
+    /// The containing decl AST node.
+    decl_node_index: Ast.Node.Index,
+    /// The containing decl line index, absolute.
+    decl_line: u32,
+    cursor: Scope.Cursor,
+    /// All `GenDir` scopes for the same DIR share this.
+    astgen: *AstGen,
+    /// Keeps track of the list of instructions in this scope. Possibly shared.
+    /// Indexes to instructions in `astgen`.
+    instructions: *ArrayList(Dir.Inst.Index),
+    /// A sub-block may share its instructions ArrayList with containing GenDir,
+    /// if use is strictly nested. This saves prior size of list for unstacking.
+    instructions_top: usize,
+
+    const unstacked_top = std.math.maxInt(usize);
+
+    /// Call unstack before adding any new instructions to containing GenDir.
+    fn unstack(self: *GenDir) void {
+        if (self.instructions_top != unstacked_top) {
+            self.instructions.items.len = self.instructions_top;
+            self.instructions_top = unstacked_top;
+        }
+    }
+
+    fn isEmpty(self: *const GenDir) bool {
+        return (self.instructions_top == unstacked_top) or
+            (self.instructions.items.len == self.instructions_top);
+    }
+
+    fn instructionsSlice(self: *const GenDir) []Dir.Inst.Index {
+        return if (self.instructions_top == unstacked_top)
+            &[0]Dir.Inst.Index{}
+        else
+            self.instructions.items[self.instructions_top..];
+    }
+
+    fn makeSubBlock(gd: *GenDir) GenDir {
+        return .{
+            .decl_node_index = gd.decl_node_index,
+            .decl_line = gd.decl_line,
+            .cursor = .{ .tip = gd.cursor.tip },
+            .astgen = gd.astgen,
+            .instructions = gd.instructions,
+            .instructions_top = gd.instructions.items.len,
+        };
+    }
+
+    fn nodeIndexToRelative(gd: GenDir, node_index: Ast.Node.Index) Ast.Node.Offset {
+        return gd.decl_node_index.toOffset(node_index);
+    }
+
+    fn tokenIndexToRelative(gd: GenDir, token: Ast.TokenIndex) Ast.TokenOffset {
+        return .init(gd.srcToken(), token);
+    }
+
+    fn srcToken(gd: GenDir) Ast.TokenIndex {
+        return gd.astgen.tree.firstToken(gd.decl_node_index);
+    }
+
+    fn add(gd: *GenDir, inst: Dir.Inst) !Dir.Inst.Ref {
+        return (try gd.addAsIndex(inst)).toRef();
+    }
+
+    fn addAsIndex(gd: *GenDir, inst: Dir.Inst) !Dir.Inst.Index {
+        const gpa = gd.astgen.gpa;
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+        try gd.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        gd.astgen.instructions.appendAssumeCapacity(inst);
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index;
+    }
+
+    fn addInt(gd: *GenDir, integer: u64) !Dir.Inst.Ref {
+        return gd.add(.{
+            .tag = .int,
+            .data = .{ .int = integer },
+        });
+    }
+
+    fn addIntBig(gd: *GenDir, limbs: []const std.math.big.Limb) !Dir.Inst.Ref {
+        const astgen = gd.astgen;
+        const gpa = astgen.gpa;
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+        try astgen.instructions.ensureUnusedCapacity(gpa, 1);
+        try astgen.string_bytes.ensureUnusedCapacity(gpa, @sizeOf(std.math.big.Limb) * limbs.len);
+
+        const new_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        astgen.instructions.appendAssumeCapacity(.{
+            .tag = .int_big,
+            .data = .{ .str = .{
+                .start = @enumFromInt(astgen.string_bytes.items.len),
+                .len = @intCast(limbs.len),
+            } },
+        });
+        gd.instructions.appendAssumeCapacity(new_index);
+        astgen.string_bytes.appendSliceAssumeCapacity(mem.sliceAsBytes(limbs));
+        return new_index.toRef();
+    }
+
+    fn addFloat(gd: *GenDir, number: f64) !Dir.Inst.Ref {
+        return gd.add(.{
+            .tag = .float,
+            .data = .{ .float = number },
+        });
+    }
+
+    fn addUnNode(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        operand: Dir.Inst.Ref,
+        /// Absolute node index. This function does the conversion to offset from Decl.
+        src_node: Ast.Node.Index,
+    ) !Dir.Inst.Ref {
+        assert(operand != .none);
+        return gd.add(.{
+            .tag = tag,
+            .data = .{ .un_node = .{
+                .operand = operand,
+                .src_node = gd.nodeIndexToRelative(src_node),
+            } },
+        });
+    }
+
+    fn addPlNode(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        /// Absolute node index. This function does the conversion to offset from Decl.
+        src_node: Ast.Node.Index,
+        extra: anytype,
+    ) !Dir.Inst.Ref {
+        const gpa = gd.astgen.gpa;
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+        try gd.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+
+        const payload_index = try gd.astgen.addExtra(extra);
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        gd.astgen.instructions.appendAssumeCapacity(.{
+            .tag = tag,
+            .data = .{ .pl_node = .{
+                .src_node = gd.nodeIndexToRelative(src_node),
+                .payload_index = payload_index,
+            } },
+        });
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index.toRef();
+    }
+
+    fn addStrTok(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        str_index: Dir.NullTerminatedString,
+        /// Absolute token index. This function does the conversion to Decl offset.
+        abs_tok_index: Ast.TokenIndex,
+    ) !Dir.Inst.Ref {
+        return gd.add(.{
+            .tag = tag,
+            .data = .{ .str_tok = .{
+                .start = str_index,
+                .src_tok = gd.tokenIndexToRelative(abs_tok_index),
+            } },
+        });
+    }
+};
 
 fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     const Print = @import("print_dir.zig");

@@ -639,6 +639,13 @@ test "big int literal" {
     );
 }
 
+test "string literal" {
+    try expect("\"hello world\"",
+        \\%0 = str(hello world)
+        \\
+    );
+}
+
 test "simple binary op" {
     try expect("1 + 2",
         \\%0 = int(1)

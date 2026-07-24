@@ -10,31 +10,34 @@ Everything beyond "there is one type called `string`" is still open — see the
 TODOs below. The note is here to make those decisions visible so they get made
 on purpose, not by accident through implementation choices.
 
-## Pipeline status (as of today)
+## Pipeline status
 
-Strings are **unsupported at every layer**. There is no path from source to IR:
+String **constants** work end-to-end:
 
 ```
-"hello"  --Scanner-->  (no string_literal token; `"` is not lexed)
-         --Parser-->   (ParseRule for .string_literal is commented out)
-         --AST-->      (.string_literal exists in Node.Tag but nothing emits it)
-         --AstGen-->   (expr: .string_literal => unreachable)
-         --Dir-->      (no string Inst.Tag; no string_bytes interner)
+"hello"  --Scanner-->  .string_literal token (newline/EOF aborts as .invalid)
+         --Parser-->   Parse.string prefix rule -> .string_literal leaf node
+         --AstGen-->   stringLiteral -> Dir `str` inst {start, len} in Dir string_bytes
+         --Sema-->     dirStr -> ip.getString -> Key.string  (see intern_pool.md,
+                       "String values — one handle type")
+         --WatGen-->   (data ...) segment + (ptr, len) i32 pair result;
+                       memory exported as "memory"
 ```
 
-### What exists
-- `Ast.Node.Tag.string_literal` is declared.
-- `AstGen.expr` has a `.string_literal => unreachable` arm — purely defensive,
-  never reached because Parse never produces the node.
+Validated with `wat2wasm` + `wasmtime`: `main` returns the ptr/len pair and
+the host reads the bytes out of exported memory.
 
 ### What is missing
-- Scanner does not recognise `"`. There is no `string_literal` entry in
-  `Token.Tag`.
-- Parser has no `string` prefix rule (only the commented stub at
-  `Parse.zig:96`).
-- Parse does not emit `.string_literal` nodes; the AST tag is dead.
-- `Dir.Inst.Tag` has no string variant. `Dir` has no `string_bytes` interner
-  array (we removed `NullTerminatedString` when trimming Dir.zig).
+- **Escapes.** The scanner treats `\` as an ordinary byte, so `"a\"b"` closes
+  at the middle quote. AstGen's `parseStrLit` already parses Zig-style
+  escapes via `std.zig.string_literal`, but the scanner never delivers them —
+  and its failure path is a swallowed `log.warn` (`failWithStrLitError`
+  commented out, blocked on AstGen error reporting).
+- **Operators in Sema**: concat / equality / compare — design questions below
+  still open.
+- **Runtime-constructed strings** (heap, GC): only constants exist.
+- **Host-side test runner** that decodes `(ptr, len)` so tests can assert on
+  the text itself rather than on offsets.
 
 ## Open language design questions (decide these first)
 

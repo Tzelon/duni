@@ -40,10 +40,31 @@ link pointing one level outward.
 ```
 
 To look up a name, start at the tip and follow `parent` links. The **first
-match wins** — that's why inner bindings shadow outer ones.
+match wins** — that's why inner bindings shadow outer ones. (Today only
+`LocalVal` and `Top` exist; `GenDir`/`Namespace` arrive with blocks and
+containers.)
 
 A new binding pushes one more node onto the tip. Leaving a block pops the
 tip back to where it was.
+
+## The cursor — how the tip travels
+
+Because `=` is an *expression*, a bind inside an operand must be visible to
+its sibling (`(x = 1) + x`), so Zig's pass-scope-down/return-scope-up shape
+doesn't fit. Instead the tip lives in a `Scope.Cursor { tip: *Scope }` and
+every lowering function receives `*Cursor` — a pointer to the *caller's*
+cursor variable:
+
+- **Bind** writes `cursor.tip = &new_local_val.base` — the mutation travels
+  through the shared cursor, so later siblings and statements see it.
+- **Lookup** walks from `cursor.tip`.
+- **Blocks (future)** copy the cursor (`var inner = .{ .tip = cursor.tip }`)
+  and pass `&inner` down — leaving the block is just the copy dying with its
+  stack frame. Scope exit stays structural, nothing to restore.
+
+`LocalVal` nodes are allocated from `scope_arena` on AstGen and freed all at
+once after `generate` — the chain holds pointers, so notes need stable
+addresses for exactly the duration of lowering.
 
 ## Example 1 — happy path
 

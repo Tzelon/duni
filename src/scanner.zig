@@ -13,6 +13,7 @@ pub const Scanner = struct {
         start,
         identifier,
         string_literal,
+        string_literal_backslash,
         number,
         number_dot,
         number_exponent,
@@ -141,10 +142,22 @@ pub const Scanner = struct {
                         }
                     },
                     '\n' => result.tag = .invalid,
+                    '\\' => continue :state .string_literal_backslash,
                     '"' => self.index += 1,
                     // ASCII control characters (bell, backspace, tab, escape, DEL, ...) are rejected inside strings.
                     // Excluded: 0x00 (EOF sentinel) and 0x0a (\n), handled above.
                     // https://en.wikipedia.org/wiki/ASCII#Control_characters
+                    0x01...0x09, 0x0b...0x1f, 0x7f => {
+                        continue :state .invalid;
+                    },
+                    else => continue :state .string_literal,
+                }
+            },
+
+            .string_literal_backslash => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0, '\n' => result.tag = .invalid,
                     0x01...0x09, 0x0b...0x1f, 0x7f => {
                         continue :state .invalid;
                     },
@@ -330,4 +343,5 @@ test "tokenizer" {
     try expectToken("\"a\"\nx", &.{ .string_literal, .newline, .identifier });
     try expectToken("\"abc", &.{.invalid});
     try expectToken("\"a\nb", &.{ .invalid, .identifier });
+    try expectToken("\"a\\\"b\"", &.{.string_literal});
 }

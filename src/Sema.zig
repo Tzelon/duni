@@ -63,7 +63,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
             .sub => try sema.dirArithmetic(ip, .sub, inst_idx),
             .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
             .negate => try sema.dirNegate(ip, inst_idx),
-            .div => try sema.dirDiv(ip, inst_idx),
+            .div => try sema.dirArithmetic(ip, .div, inst_idx),
             .str => try sema.dirStr(ip, inst_idx),
             .decl_val => unreachable,
         };
@@ -139,6 +139,12 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
                 .add => try arith.add(sema, ip, lhs_val, rhs_val, is_int),
                 .sub => try arith.sub(sema, ip, lhs_val, rhs_val, is_int),
                 .mul => try arith.mul(sema, ip, lhs_val, rhs_val, is_int),
+                .div => blk: {
+                    // Division by zero is a comptime error for ints and floats alike —
+                    // IEEE inf/nan are never produced by comptime folding.
+                    if (rhs_val.isZero(ip)) return error.AnalysisFail;
+                    break :blk try arith.div(sema, ip, lhs_val, rhs_val);
+                },
                 else => unreachable,
             };
             return Air.internedToRef(result_val.toIntern());
@@ -152,38 +158,6 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
 fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const bytes = sema.code.instructions.items(.data)[@intFromEnum(inst)].str.get(&sema.code);
     return sema.addStrLit(ip, try ip.getString(sema.gpa, bytes));
-}
-
-fn dirDiv(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
-    // Expend when any of these lands in Duni:
-    //- A second number type that triggers peer-type resolution.
-    //- Floats (different div semantics).
-    // - Vector types.
-    // - Runtime division with safety wraps (the day Sema stops being fold-only).
-
-    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const extra = sema.code.extraData(Dir.Inst.Bin, inst_data.payload_index).data;
-    const lhs = sema.resolveInst(extra.lhs);
-    const rhs = sema.resolveInst(extra.rhs);
-
-    //TODO: we assume everything is comptime know and we can fold. this will not be true in the future
-    const maybe_lhs_val = sema.resolveValue(lhs);
-    const maybe_rhs_val = sema.resolveValue(rhs);
-
-    if (maybe_lhs_val) |lhs_val| {
-        if (maybe_rhs_val) |rhs_val| {
-            const lhs_is_float = ip.indexToKey(lhs_val.toIntern()) == .float;
-            const rhs_is_float = ip.indexToKey(rhs_val.toIntern()) == .float;
-            const is_int = !lhs_is_float and !rhs_is_float;
-
-            // Division by zero is a comptime error for ints and floats alike —
-            // IEEE inf/nan are never produced by comptime folding.
-            if (rhs_val.isZero(ip)) return error.AnalysisFail;
-            return .fromValue(try arith.div(sema, ip, lhs_val, rhs_val, is_int));
-        }
-    }
-
-    unreachable;
 }
 
 fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -455,15 +429,22 @@ test "analyze subtraction with negative result" {
 }
 
 test "analyze division" {
+    // `/` is always IEEE division on f64 (`number` = f64); int operands
+    // coerce to float, and an evenly-dividing int pair still yields a float —
+    // the result type never depends on the operand values.
     try expectAnalyzed(&.{
         .{ .tag = .int, .data = .{ .int = 7 } },
         .{ .tag = .int, .data = .{ .int = 2 } },
         .{ .tag = .div, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
     }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{
-        .int = .{
-            .ty = .comptime_int_type,
-            .storage = .{ .u64 = 3 }, // trunc
-        },
+        .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 3.5 } },
+    });
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 4 } },
+        .{ .tag = .int, .data = .{ .int = 2 } },
+        .{ .tag = .div, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{
+        .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 2.0 } },
     });
 }
 

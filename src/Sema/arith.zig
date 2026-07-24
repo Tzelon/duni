@@ -45,15 +45,11 @@ pub fn mul(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int:
 }
 
 /// Applies the `/` operator to comptime-known values.
-/// `lhs_val` and `rhs_val` are fully-resolved values of type `ty`.
-/// `ty` is an int, float, comptime_int, comptime_float, or vector.
-pub fn div(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value, is_int: bool) !Value {
-    if (is_int) {
-        const res = try intDivTrunc(sema, ip, lhs_val, rhs_val);
-        return res;
-    } else {
-        return floatDiv(sema, ip, lhs_val, rhs_val);
-    }
+/// `/` is always IEEE division on f64 — `number` is semantically f64 (see
+/// `notes/number_literals.md`). Int operands coerce via `nearest_even`;
+/// integer division is a separate named operation (`div`/`rem`), not `/`.
+pub fn div(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value) !Value {
+    return floatDiv(sema, ip, lhs_val, rhs_val);
 }
 
 // Int
@@ -116,33 +112,6 @@ pub fn comptimeIntMul(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Val
     result_bigint.mul(lhs_bigint, rhs_bigint, limbs_buffer, sema.arena);
 
     const result_ip = try ip.get(sema.gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .big_int = result_bigint.toConst() } } });
-    return Value.fromInterned(result_ip);
-}
-
-pub fn intDivTrunc(sema: *Sema, ip: *InternPool, lhs: Value, rhs: Value) !Value {
-    var lhs_space: Value.BigIntSpace = undefined;
-    var rhs_space: Value.BigIntSpace = undefined;
-    const lhs_bigint = lhs.toBigInt(&lhs_space, ip);
-    const rhs_bigint = rhs.toBigInt(&rhs_space, ip);
-    const limbs_q = try sema.arena.alloc(std.math.big.Limb, lhs_bigint.limbs.len);
-    const limbs_r = try sema.arena.alloc(std.math.big.Limb, rhs_bigint.limbs.len);
-    const limbs_buf = try sema.arena.alloc(
-        std.math.big.Limb,
-        std.math.big.int.calcDivLimbsBufferLen(lhs_bigint.limbs.len, rhs_bigint.limbs.len),
-    );
-    var result_q: BigIntMutable = .{ .limbs = limbs_q, .positive = undefined, .len = undefined };
-    var result_r: BigIntMutable = .{ .limbs = limbs_r, .positive = undefined, .len = undefined };
-    result_q.divTrunc(&result_r, lhs_bigint, rhs_bigint, limbs_buf);
-
-    // TODO(tzelon): for none comptime_int_type
-    // if (ty.toIntern() != .comptime_int_type) {
-    //     const info = ty.intInfo(zcu);
-    //     if (!result_q.toConst().fitsInTwosComp(info.signedness, info.bits)) {
-    //         return error.Overflow;
-    //     }
-    // }
-
-    const result_ip = try ip.get(sema.gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .big_int = result_q.toConst() } } });
     return Value.fromInterned(result_ip);
 }
 

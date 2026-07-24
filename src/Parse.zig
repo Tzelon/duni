@@ -12,8 +12,7 @@ const Ast = @import("./Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 
-const string = @import("string.zig");
-const NullTerminatedString = string.NullTerminatedString;
+const NullTerminatedString = @import("string.zig").NullTerminatedString;
 
 const log = std.log.scoped(.parser);
 

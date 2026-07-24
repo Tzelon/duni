@@ -287,8 +287,7 @@ fn localVarRef(
     find_scope: switch (scope_cursor.tip.unwrap()) {
         .local_val => |local_val| {
             if (local_val.name == name_str_index) {
-                // Locals shadow anything, first wins, so we do not need to look for ambiguous
-                // references in this case.
+                // rebinding pushes the newest binding nearest the tip, so first match IS the shadowing semantics.
                 return local_val.inst;
             }
             continue :find_scope local_val.parent.unwrap();

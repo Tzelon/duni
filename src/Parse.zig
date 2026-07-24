@@ -154,7 +154,7 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .slash => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         .equal => comptime ParseRule.init(null, Parse.bind, .prec_assignment),
         // .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
-        // .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
+        .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
         .number_literal => comptime ParseRule.init(Parse.number, null, .prec_none),
         .identifier => comptime ParseRule.init(Parse.identifier, null, .prec_none),
         .eof => comptime ParseRule.init(null, null, .prec_none),
@@ -181,6 +181,15 @@ fn identifier(p: *Parse) !Node.Index {
 fn number(p: *Parse) !Node.Index {
     return p.addNode(.{
         .tag = .number_literal,
+        .main_token = p.advance(),
+        .data = undefined,
+    });
+}
+
+/// example: "hello world"
+fn string(p: *Parse) !Node.Index {
+    return p.addNode(.{
+        .tag = .string_literal,
         .main_token = p.advance(),
         .data = undefined,
     });

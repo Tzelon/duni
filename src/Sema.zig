@@ -49,6 +49,34 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
     try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
     const body = code.bodySlice(code.main_body_start, code.main_body_len);
+
+    try analyzeBody(&sema, ip, body);
+
+    const last_indx = body[body.len - 1];
+    const last_ref = sema.inst_map.get(last_indx).?;
+
+    // The result type is inferred from the value until declarations carry
+    // types: numeric results are `number`, strings stay strings. The Zig
+    // analog is `analyzeRet` coercing to `fn_ret_ty`.
+    const result_ref = switch (ip.indexToKey(sema.resolveValue(last_ref).?.toIntern())) {
+        .int, .float => try sema.coerce(ip, .comptime_float_type, last_ref),
+        .string => last_ref,
+        .simple_type => unreachable, // no producer emits a type as a value
+    };
+
+    try sema.instructions.append(sema.gpa, .{
+        .tag = .ret,
+        .data = .{ .un_op = result_ref },
+    });
+
+    return .{ .instructions = sema.instructions.toOwnedSlice() };
+}
+
+fn analyzeBody(
+    sema: *Sema,
+    ip: *InternPool,
+    body: []const Dir.Inst.Index,
+) CompileError!void {
     try sema.inst_map.ensureSpaceForInstructions(sema.gpa, body);
 
     const tags = sema.code.instructions.items(.tag);
@@ -65,30 +93,12 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
             .negate => try sema.dirNegate(ip, inst_idx),
             .div => try sema.dirArithmetic(ip, .div, inst_idx),
             .str => try sema.dirStr(ip, inst_idx),
+            .block => try sema.dirBlock(ip, inst_idx),
             .decl_val => unreachable,
         };
 
         sema.inst_map.putAssumeCapacity(inst_idx, air_ref);
     }
-
-    const last_indx = body[body.len - 1];
-    const last_ref = sema.inst_map.get(last_indx).?;
-
-    // The result type is inferred from the value until declarations carry
-    // types: numeric results are `number`, strings stay strings. The Zig
-    // analog is `analyzeRet` coercing to `fn_ret_ty`.
-    const result_ref = switch (ip.indexToKey(sema.resolveValue(last_ref).?.toIntern())) {
-        .int, .float => try sema.coerce(ip, .comptime_float_type, last_ref),
-        .string => last_ref,
-        .simple_type => unreachable, // no producer emits a type as a value
-    };
-
-    try sema.instructions.append(gpa, .{
-        .tag = .ret,
-        .data = .{ .un_op = result_ref },
-    });
-
-    return .{ .instructions = sema.instructions.toOwnedSlice() };
 }
 
 fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -167,6 +177,16 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
 fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const bytes = sema.code.instructions.items(.data)[@intFromEnum(inst)].str.get(&sema.code);
     return sema.addStrLit(ip, try ip.getString(sema.gpa, bytes));
+}
+
+fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
+    const body = sema.code.bodySlice(extra.end, extra.data.body_len);
+
+    try sema.analyzeBody(ip, body);
+
+    return sema.inst_map.get(body[body.len - 1]).?;
 }
 
 /// Coerce a comptime-known value to `dest_ty`.
@@ -572,6 +592,48 @@ test "analyze 1 / 0 fails analysis" {
     defer ip.deinit(gpa);
 
     try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+}
+
+test "analyze block" {
+    const gpa = std.testing.allocator;
+
+    // { 1\n 2 } — block evaluates to its last expression, not the first
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .tag = .block, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } });
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
+
+    // extra[0] = body_len=2, extra[1]=%1, extra[2]=%2 (block body), extra[3]=%0 (main body)
+    const extra = try gpa.alloc(u32, 4);
+    extra[0] = 2; // body_len
+    extra[1] = 1; // %1
+    extra[2] = 2; // %2
+    extra[3] = 0; // main body: %0
+
+    var dir: Dir = .{
+        .instructions = list.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = try gpa.dupe(u8, &.{}),
+        .main_body_start = 3,
+        .main_body_len = 1,
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var air = try Sema.analyze(gpa, dir, &ip);
+    defer air.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), air.instructions.len);
+    try std.testing.expectEqual(Air.Inst.Tag.ret, air.instructions.items(.tag)[0]);
+    const actual = air.instructions.items(.data)[0].un_op.toInterned().?;
+    try std.testing.expectEqual(
+        try ip.get(gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 2.0 } } }),
+        actual,
+    );
 }
 
 test "analyze float division by zero fails analysis" {

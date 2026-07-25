@@ -190,6 +190,7 @@ fn formExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
         },
         .slash => return simpleBinOp(gd, node, args, .div),
         .equal => return bind(gd, node, args),
+        .block => return blockExpr(gd, node, args),
         else => unreachable,
     }
 }
@@ -248,6 +249,29 @@ fn bind(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!
     gd.cursor.tip = &local_val.base;
 
     return rhs;
+}
+
+fn blockExpr(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+
+    // Since this block is unlabeled, its control flow is effectively linear and we
+    // can *almost* get away with inlining the block here. However, we actually need
+    // to preserve the .block for Sema, to properly pop the error return trace.
+
+    const block_tag: Dir.Inst.Tag = .block;
+    const block_inst = try gd.makeBlockInst(block_tag, node);
+    try gd.instructions.append(astgen.gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    for (args) |statement| {
+        _ = try expr(&block_scope, statement);
+    }
+
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
 }
 
 fn identifier(gd: *GenDir, ident: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -504,6 +528,22 @@ const GenDir = struct {
             self.instructions.items[self.instructions_top..];
     }
 
+    /// Note that this returns a `Dir.Inst.Index` not a ref.
+    /// Does *not* append the block instruction to the scope.
+    /// Leaves the `payload_index` field undefined.
+    fn makeBlockInst(gd: *GenDir, tag: Dir.Inst.Tag, node: Ast.Node.Index) !Dir.Inst.Index {
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        const gpa = gd.astgen.gpa;
+        try gd.astgen.instructions.append(gpa, .{
+            .tag = tag,
+            .data = .{ .pl_node = .{
+                .src_node = gd.nodeIndexToRelative(node),
+                .payload_index = undefined,
+            } },
+        });
+        return new_index;
+    }
+
     fn makeSubBlock(gd: *GenDir) GenDir {
         return .{
             .decl_node_index = gd.decl_node_index,
@@ -513,6 +553,27 @@ const GenDir = struct {
             .instructions = gd.instructions,
             .instructions_top = gd.instructions.items.len,
         };
+    }
+
+    /// Assumes nothing stacked on `gd`. Unstacks `gd`.
+    fn setBlockBody(gd: *GenDir, inst: Dir.Inst.Index) !void {
+        const astgen = gd.astgen;
+        const gpa = astgen.gpa;
+        const body = gd.instructionsSlice();
+
+        try astgen.extra.ensureUnusedCapacity(
+            gpa,
+            @typeInfo(Dir.Inst.Block).@"struct".fields.len + body.len,
+        );
+        const dir_datas = astgen.instructions.items(.data);
+        dir_datas[@intFromEnum(inst)].pl_node.payload_index = astgen.addExtraAssumeCapacity(
+            Dir.Inst.Block{ .body_len = @intCast(body.len) },
+        );
+
+        for (body) |instruction| {
+            astgen.extra.appendAssumeCapacity(@intFromEnum(instruction));
+        }
+        gd.unstack();
     }
 
     fn nodeIndexToRelative(gd: GenDir, node_index: Ast.Node.Index) Ast.Node.Offset {

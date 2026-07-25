@@ -73,6 +73,9 @@ pub const Inst = struct {
         /// Same as sub with a lhs of 0, split into a separate instruction to save memory.
         /// Uses `un_node`.
         negate,
+        /// A block of code, which return a value.
+        /// Uses the `pl_node` union field. Payload is `Block`.
+        block,
     };
 
     /// The position of a DIR instruction within the `Dir` instructions array.
@@ -203,6 +206,12 @@ pub const Inst = struct {
     pub const Bin = struct {
         lhs: Ref,
         rhs: Ref,
+    };
+
+    /// This data is stored inside extra, with trailing operands according to `body_len`.
+    /// Each operand is an `Index`.
+    pub const Block = struct {
+        body_len: u32,
     };
 };
 

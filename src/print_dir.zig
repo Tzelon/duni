@@ -95,7 +95,20 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .str => try self.writeStr(data),
         .decl_val => try self.writeStrTok(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),
+        .block => try self.writeBlock(data),
     }
+}
+
+fn writeBlock(self: *Print, data: Dir.Inst.Data) !void {
+    const idx = data.pl_node.payload_index;
+    const body_len = self.code.extra[idx];
+    for (0..body_len) |i| {
+        if (i > 0) try self.w.writeAll(", ");
+        const inst_idx: Dir.Inst.Index = @enumFromInt(self.code.extra[idx + 1 + i]);
+        try self.writeRef(inst_idx.toRef());
+    }
+    try self.w.writeAll(")");
+    try self.writeSrcNode(data.pl_node.src_node);
 }
 
 fn writeInt(self: *Print, data: Dir.Inst.Data) !void {

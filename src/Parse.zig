@@ -56,7 +56,9 @@ fn findNextStmt(p: *Parse) void {
             _ = p.advance();
             return;
         },
-        .eof => return,
+        .eof,
+        .r_brace,
+        => return,
         else => _ = p.advance(),
     };
 }
@@ -82,7 +84,7 @@ fn parseBlock(p: *Parse) !Node.SubRange {
         };
         try p.scratch.append(p.gpa, stmt);
 
-        if (!p.check(.newline) and !p.check(.eof)) {
+        if (!p.check(.newline) and !p.check(.eof) and !p.check(.r_brace)) {
             try p.warnExpected(.newline);
             p.findNextStmt();
         }

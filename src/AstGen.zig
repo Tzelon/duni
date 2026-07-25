@@ -834,3 +834,21 @@ test "rebind rhs sees the previous binding" {
         \\
     );
 }
+
+test "block" {
+    try expect("{ 1 }",
+        \\%0 = block(%1) node_offset:1:1 to :1:6
+        \\%1 = int(1)
+        \\
+    );
+
+    try expect(
+        \\{
+        \\  1 
+        \\}
+    ,
+        \\%0 = block(%1) node_offset:1:1 to :1:2
+        \\%1 = int(1)
+        \\
+    );
+}

@@ -315,9 +315,17 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
 
         .form => {
             const args = tree.formArgs(n);
+
             // Unary form: operator (main_token) sits to the left of its single arg.
             if (args.len == 1) return tree.nodeMainToken(n);
-            n = args[0];
+
+            const op = tree.formOp(n);
+            switch (op) {
+                .block => return tree.nodeMainToken(n),
+                else => {
+                    n = args[0];
+                },
+            }
         },
     };
 }
@@ -330,7 +338,18 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
 
         .form => {
             const args = tree.formArgs(n);
-            n = args[args.len - 1];
+            const op = tree.formOp(n);
+
+            switch (op) {
+                .block => {
+                    var tok = tree.nodeMainToken(node);
+                    while (tree.tokenTag(tok) != .r_brace) : (tok += 1) {}
+                    return tok;
+                },
+                else => {
+                    n = args[args.len - 1];
+                },
+            }
         },
     };
 }

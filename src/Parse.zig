@@ -6,7 +6,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
-const Token = @import("./scanner.zig").Token;
+const scan = @import("scanner.zig");
+const Scanner = scan.Scanner;
+const Token = scan.Token;
 
 const Ast = @import("./Ast.zig");
 const Node = Ast.Node;
@@ -97,6 +99,87 @@ fn parseBlock(p: *Parse) !Node.SubRange {
     return span;
 }
 
+fn parseProto(p: *Parse) !Node.Index {
+    const name_token = try p.consume(.identifier);
+    const op = try p.ip.getString(p.gpa, p.tokenSlice(name_token));
+    const params = try p.parseParams();
+    const return_type_expr = try p.parseRetType();
+
+    const span = if (return_type_expr) |ret|
+        try p.listToSpan(&.{ params, ret })
+    else blk: {
+        try p.warn(.expected_return_type);
+        break :blk try p.listToSpan(&.{params});
+    };
+
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{
+        .tag = .form,
+        .main_token = name_token,
+        .data = .{ .form = .{ .op = op, .args = args } },
+    });
+}
+
+fn parseParams(p: *Parse) !Node.Index {
+    const main_token = try p.consume(.l_paren);
+
+    const scratch_top = p.scratch.items.len;
+    defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (true) {
+        if (p.check(.r_paren)) break;
+        const param = try p.parseParamDecl();
+        try p.scratch.append(p.gpa, param);
+
+        if (!p.check(.comma)) break;
+        _ = p.advance();
+    }
+
+    _ = try p.consume(.r_paren);
+
+    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .params, .args = args } } });
+}
+
+fn parseParamDecl(p: *Parse) !Node.Index {
+    const name_token = try p.consume(.identifier);
+    const name_node = try p.addNode(.{
+        .tag = .identifier,
+        .main_token = name_token,
+        .data = undefined,
+    });
+    const type_node = try p.parseTypeExpr() orelse return p.failMsg(.{ .tag = .expected_type_expr, .token = p.token_index });
+
+    const span = try p.listToSpan(&.{ name_node, type_node });
+    const args = try p.addExtra(span);
+    return p.addNode(.{ .tag = .form, .main_token = name_token, .data = .{ .form = .{ .op = .param, .args = args } } });
+}
+
+fn parseRetType(p: *Parse) !?Node.Index {
+    const type_token = p.token_index;
+    const type_node = (try p.parseTypeExpr()) orelse return null;
+
+    const span = try p.listToSpan(&.{type_node});
+    const args = try p.addExtra(span);
+    return try p.addNode(.{ .tag = .form, .main_token = type_token, .data = .{ .form = .{ .op = .ret, .args = args } } });
+}
+
+fn parseTypeExpr(p: *Parse) !?Node.Index {
+    switch (p.tokenTag(p.token_index)) {
+        .identifier => {
+            return try p.addNode(.{
+                .tag = .identifier,
+                .main_token = p.advance(),
+                .data = undefined,
+            });
+        },
+        else => return null,
+    }
+}
+
 // Pratt Parsing
 fn parsePrecedence(p: *Parse, precedence: Precedence) !Node.Index {
     const prefixRule = p.getRule(p.current()).prefix orelse {
@@ -155,6 +238,7 @@ fn addExtra(p: *Parse, extra: anytype) Allocator.Error!Node.ExtraIndex {
 fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
     _ = self;
     const rule = switch (tag) {
+        .keyword_fn => comptime ParseRule.init(Parse.function, null, .prec_none),
         .l_paren => comptime ParseRule.init(Parse.grouping, null, .prec_call),
         .r_paren => comptime ParseRule.init(null, null, .prec_none),
         .l_brace => comptime ParseRule.init(Parse.block, null, .prec_none),
@@ -247,6 +331,23 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
     });
 }
 
+fn function(p: *Parse) !Node.Index {
+    const main_token = p.advance();
+    const proto = try p.parseProto();
+
+    if (!p.check(.l_brace)) return p.failExpected(.l_brace);
+    const body = try p.block();
+
+    const span = try p.listToSpan(&.{ proto, body });
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{
+        .tag = .form,
+        .main_token = main_token,
+        .data = .{ .form = .{ .op = .@"fn", .args = args } },
+    });
+}
+
 fn block(p: *Parse) !Node.Index {
     const main_token = p.advance();
     const span = try p.parseBlock();
@@ -322,6 +423,26 @@ fn tokenStart(p: *const Parse, token_index: TokenIndex) Ast.ByteOffset {
 
 fn tokensOnSameLine(p: *Parse, token1: TokenIndex, token2: TokenIndex) bool {
     return std.mem.findScalar(u8, p.source[p.tokenStart(token1)..p.tokenStart(token2)], '\n') == null;
+}
+
+/// return the lexeme of a token
+fn tokenSlice(p: *Parse, token_index: TokenIndex) []const u8 {
+    const token_tag = p.tokenTag(token_index);
+
+    // Many tokens can be determined entirely by their tag.
+    if (token_tag.lexeme()) |lexeme| {
+        return lexeme;
+    }
+
+    // For some tokens, re-tokenization is needed to find the end.
+    var scanner: Scanner = .{
+        .buffer = p.source,
+        .index = p.tokenStart(token_index),
+        .line = 0,
+    };
+    const token = scanner.next();
+    assert(token.tag == token_tag);
+    return p.source[token.loc.start..token.loc.end];
 }
 
 /// return the current token in the sequence. without **advancing**

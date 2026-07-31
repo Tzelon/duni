@@ -361,6 +361,7 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
 
 const Expected = union(enum) {
     number_literal,
+    identifier,
     form: struct {
         op: NullTerminatedString,
         args: []const Expected,
@@ -384,6 +385,10 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
     switch (expected) {
         .number_literal => try std.testing.expectEqual(
             Node.Tag.number_literal,
+            tree.nodeTag(node),
+        ),
+        .identifier => try std.testing.expectEqual(
+            Node.Tag.identifier,
             tree.nodeTag(node),
         ),
         .form => |f| {
@@ -487,6 +492,34 @@ test "block" {
         .{ .form = .{ .op = .block, .args = &.{ .number_literal, .number_literal } } },
     );
     // zig fmt: on
+}
+
+test "fn declaration" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var tree = try Ast.parse(gpa, "fn add(x number, y number) number {}", &ip);
+    defer tree.deinit(gpa);
+    try std.testing.expect(tree.errors.len == 0);
+
+    // Dedup guarantee: interning the same bytes yields the handle the parser used.
+    const add_op = try ip.getString(gpa, "add");
+
+    const decls = tree.rootDecls();
+    try std.testing.expectEqual(1, decls.len);
+    try expectNode(&tree, decls[0], .{ .form = .{ .op = .@"fn", .args = &.{
+        .{ .form = .{ .op = add_op, .args = &.{
+            .{ .form = .{ .op = .params, .args = &.{
+                .{ .form = .{ .op = .param, .args = &.{ .identifier, .identifier } } },
+                .{ .form = .{ .op = .param, .args = &.{ .identifier, .identifier } } },
+            } } },
+            .{ .form = .{ .op = .ret, .args = &.{.identifier} } },
+        } } },
+        .{ .form = .{ .op = .block, .args = &.{} } },
+    } } });
 }
 
 test "dump" {

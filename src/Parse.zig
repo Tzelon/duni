@@ -239,7 +239,8 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
     _ = self;
     const rule = switch (tag) {
         .keyword_fn => comptime ParseRule.init(Parse.function, null, .prec_none),
-        .l_paren => comptime ParseRule.init(Parse.grouping, null, .prec_call),
+        .keyword_extern => comptime ParseRule.init(Parse.externFunction, null, .prec_none),
+        .l_paren => comptime ParseRule.init(Parse.grouping, Parse.call, .prec_call),
         .r_paren => comptime ParseRule.init(null, null, .prec_none),
         .l_brace => comptime ParseRule.init(Parse.block, null, .prec_none),
         .r_brace => comptime ParseRule.init(null, null, .prec_none),
@@ -254,6 +255,7 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .identifier => comptime ParseRule.init(Parse.identifier, null, .prec_none),
         .eof => comptime ParseRule.init(null, null, .prec_none),
         .newline => comptime ParseRule.init(null, null, .prec_none),
+        .comma => comptime ParseRule.init(null, null, .prec_none),
         else => {
             log.err("no rule for token {}", .{tag});
             unreachable;
@@ -348,6 +350,16 @@ fn function(p: *Parse) !Node.Index {
     });
 }
 
+fn externFunction(p: *Parse) !Node.Index {
+    const main_token = p.advance();
+    _ = try p.consume(.keyword_fn);
+    const proto = try p.parseProto();
+
+    const span = try p.listToSpan(&.{proto});
+    const args = try p.addExtra(span);
+    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .extern_fn, .args = args } } });
+}
+
 fn block(p: *Parse) !Node.Index {
     const main_token = p.advance();
     const span = try p.parseBlock();
@@ -363,6 +375,40 @@ fn grouping(p: *Parse) !Node.Index {
     _ = try p.consume(.r_paren);
 
     return inner;
+}
+
+fn call(p: *Parse, lhs: Node.Index) !Node.Index {
+    const scratch_top = p.scratch.items.len;
+    defer p.scratch.shrinkRetainingCapacity(scratch_top);
+    _ = p.advance();
+
+    const main_token = p.nodes.items(.main_token)[@intFromEnum(lhs)];
+
+    const name_token = switch (p.nodes.items(.tag)[@intFromEnum(lhs)]) {
+        .identifier => main_token,
+        else => return p.failMsg(.{
+            .tag = .expected_callee,
+            .token = main_token,
+        }),
+    };
+
+    const op = try p.ip.getString(p.gpa, p.tokenSlice(name_token));
+
+    while (true) {
+        if (p.check(.r_paren)) break;
+        const arg = try p.expression();
+        try p.scratch.append(p.gpa, arg);
+
+        if (!p.check(.comma)) break;
+        _ = p.advance();
+    }
+
+    _ = try p.consume(.r_paren);
+
+    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
+    const args = try p.addExtra(span);
+
+    return p.addNode(.{ .tag = .form, .main_token = name_token, .data = .{ .form = .{ .op = op, .args = args } } });
 }
 
 // example: x = 1

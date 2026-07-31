@@ -270,6 +270,7 @@ pub const Error = struct {
         expected_comma_after_param,
         expected_fn,
         expected_newline,
+        expected_callee,
     };
 };
 
@@ -519,6 +520,51 @@ test "fn declaration" {
             .{ .form = .{ .op = .ret, .args = &.{.identifier} } },
         } } },
         .{ .form = .{ .op = .block, .args = &.{} } },
+    } } });
+}
+
+test "extern fn declaration" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var tree = try Ast.parse(gpa, "extern fn print(x number) number", &ip);
+    defer tree.deinit(gpa);
+    try std.testing.expect(tree.errors.len == 0);
+
+    const print_op = try ip.getString(gpa, "print");
+
+    const decls = tree.rootDecls();
+    try std.testing.expectEqual(1, decls.len);
+    try expectNode(&tree, decls[0], .{ .form = .{ .op = .extern_fn, .args = &.{
+        .{ .form = .{ .op = print_op, .args = &.{
+            .{ .form = .{ .op = .params, .args = &.{
+                .{ .form = .{ .op = .param, .args = &.{ .identifier, .identifier } } },
+            } } },
+            .{ .form = .{ .op = .ret, .args = &.{.identifier} } },
+        } } },
+    } } });
+}
+
+test "fn call" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var tree = try Ast.parse(gpa, "add(1, 2)", &ip);
+    defer tree.deinit(gpa);
+    try std.testing.expect(tree.errors.len == 0);
+
+    const add_op = try ip.getString(gpa, "add");
+
+    const decls = tree.rootDecls();
+    try std.testing.expectEqual(1, decls.len);
+    try expectNode(&tree, decls[0], .{ .form = .{ .op = add_op, .args = &.{
+        .number_literal, .number_literal,
     } } });
 }
 

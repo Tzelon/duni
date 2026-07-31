@@ -54,15 +54,15 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
 
     std.debug.print("source \n {s} :source \n", .{source});
 
-    var tree = try Ast.parse(allocator, source);
+    var ip: InternPool = .{};
+    try ip.init(allocator);
+    defer ip.deinit(allocator);
+
+    var tree = try Ast.parse(allocator, source, &ip);
     defer tree.deinit(allocator);
 
     var dir = try AstGen.generate(allocator, tree);
     defer dir.deinit(allocator);
-
-    var ip: InternPool = .{};
-    try ip.init(allocator);
-    defer ip.deinit(allocator);
 
     var air = try Sema.analyze(allocator, dir, &ip);
     defer air.deinit(allocator);

@@ -697,9 +697,14 @@ const GenDir = struct {
 
 fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     const Print = @import("print_dir.zig");
+    const InternPool = @import("InternPool.zig");
     const gpa = std.testing.allocator;
 
-    var tree = try Ast.parse(gpa, source);
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var tree = try Ast.parse(gpa, source, &ip);
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
@@ -797,8 +802,14 @@ test "negation" {
 }
 
 test "negative zero int is rejected" {
+    const InternPool = @import("InternPool.zig");
     const gpa = std.testing.allocator;
-    var tree = try Ast.parse(gpa, "-0");
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var tree = try Ast.parse(gpa, "-0", &ip);
     defer tree.deinit(gpa);
     try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
 }

@@ -19,6 +19,8 @@ const Parse = @import("Parse.zig");
 const string = @import("string.zig");
 const NullTerminatedString = string.NullTerminatedString;
 
+const InternPool = @import("InternPool.zig");
+
 pub const Node = @import("./Ast/Node.zig");
 
 /// Reference to externally-owned data.
@@ -80,7 +82,9 @@ pub const OptionalTokenOffset = enum(i32) {
 
 /// Result should be freed with tree.deinit() when there are
 /// no more references to any of the tokens or nodes.
-pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
+/// `ip` outlives the Ast: dynamic form operators (proto heads, call heads)
+/// are interned into it at parse time.
+pub fn parse(gpa: Allocator, source: [:0]const u8, ip: *InternPool) !Ast {
     var tokens = Ast.TokenList{};
     defer tokens.deinit(gpa);
 
@@ -110,6 +114,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
     var parser: Parse = .{
         .source = source,
         .gpa = gpa,
+        .ip = ip,
         .tokens = tokens_slice,
         .errors = .empty,
         .nodes = .empty,
@@ -363,7 +368,11 @@ const Expected = union(enum) {
 };
 
 fn expectAst(source: [:0]const u8, expected: Expected) !void {
-    var tree = try Ast.parse(std.testing.allocator, source);
+    var ip: InternPool = .{};
+    try ip.init(std.testing.allocator);
+    defer ip.deinit(std.testing.allocator);
+
+    var tree = try Ast.parse(std.testing.allocator, source, &ip);
     defer tree.deinit(std.testing.allocator);
     try std.testing.expect(tree.errors.len == 0);
     for (tree.rootDecls()) |statement| {
@@ -390,7 +399,11 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
 }
 
 fn expectParse(source: [:0]const u8, expected: []const Node.Tag) !void {
-    var tree = try Ast.parse(std.testing.allocator, source);
+    var ip: InternPool = .{};
+    try ip.init(std.testing.allocator);
+    defer ip.deinit(std.testing.allocator);
+
+    var tree = try Ast.parse(std.testing.allocator, source, &ip);
     defer tree.deinit(std.testing.allocator);
     try std.testing.expect(tree.errors.len == 0);
     try std.testing.expectEqualSlices(Node.Tag, expected, tree.nodes.items(.tag));
@@ -477,7 +490,11 @@ test "block" {
 }
 
 test "dump" {
-    var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3");
+    var ip: InternPool = .{};
+    try ip.init(std.testing.allocator);
+    defer ip.deinit(std.testing.allocator);
+
+    var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3", &ip);
     defer tree.deinit(std.testing.allocator);
     try tree.dump();
 }

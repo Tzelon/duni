@@ -12,6 +12,7 @@ const Ast = @import("./Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 
+const InternPool = @import("InternPool.zig");
 const NullTerminatedString = @import("string.zig").NullTerminatedString;
 
 const log = std.log.scoped(.parser);
@@ -19,6 +20,8 @@ const log = std.log.scoped(.parser);
 pub const Error = error{ParseError} || Allocator.Error;
 
 gpa: Allocator,
+/// intern pool for dynamic form operators (proto heads, call heads)
+ip: *InternPool,
 /// source text
 source: [:0]const u8,
 

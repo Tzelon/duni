@@ -75,6 +75,10 @@ pub const Scanner = struct {
                     result.tag = .string_literal;
                     continue :state .string_literal;
                 },
+                ',' => {
+                    result.tag = .comma;
+                    self.index += 1;
+                },
                 '(' => {
                     result.tag = .l_paren;
                     self.index += 1;
@@ -267,6 +271,7 @@ pub const Token = struct {
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "fn", .keyword_fn },
+        .{ "extern", .keyword_extern },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -289,6 +294,8 @@ pub const Token = struct {
         star,
         slash,
 
+        comma,
+
         // Single-character tokens.
         l_paren,
         r_paren,
@@ -297,6 +304,7 @@ pub const Token = struct {
 
         // keywords
         keyword_fn,
+        keyword_extern,
 
         // Expression end
         newline,
@@ -316,11 +324,13 @@ pub const Token = struct {
                 => null,
 
                 .keyword_fn => "fn",
+                .keyword_extern => "extern",
                 .equal => "=",
                 .plus => "+",
                 .minus => "-",
                 .star => "*",
                 .slash => "/",
+                .comma => ",",
                 .l_paren => "(",
                 .r_paren => ")",
                 .l_brace => "{",
@@ -358,4 +368,5 @@ test "tokenizer" {
     try expectToken("\"a\nb", &.{ .invalid, .identifier });
     try expectToken("\"a\\\"b\"", &.{.string_literal});
     try expectToken("}\nx", &.{ .r_brace, .newline, .identifier });
+    try expectToken("extern fn add(x number, y number) number", &.{ .keyword_extern, .keyword_fn, .identifier, .l_paren, .identifier, .identifier, .comma, .identifier, .identifier, .r_paren, .identifier });
 }

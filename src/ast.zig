@@ -16,11 +16,6 @@ const Token = scan.Token;
 
 const Parse = @import("Parse.zig");
 
-const string = @import("string.zig");
-const NullTerminatedString = string.NullTerminatedString;
-
-const InternPool = @import("InternPool.zig");
-
 pub const Node = @import("./Ast/Node.zig");
 
 /// Reference to externally-owned data.
@@ -82,9 +77,7 @@ pub const OptionalTokenOffset = enum(i32) {
 
 /// Result should be freed with tree.deinit() when there are
 /// no more references to any of the tokens or nodes.
-/// `ip` outlives the Ast: dynamic form operators (proto heads, call heads)
-/// are interned into it at parse time.
-pub fn parse(gpa: Allocator, source: [:0]const u8, ip: *InternPool) !Ast {
+pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
     var tokens = Ast.TokenList{};
     defer tokens.deinit(gpa);
 
@@ -114,7 +107,6 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, ip: *InternPool) !Ast {
     var parser: Parse = .{
         .source = source,
         .gpa = gpa,
-        .ip = ip,
         .tokens = tokens_slice,
         .errors = .empty,
         .nodes = .empty,
@@ -161,15 +153,28 @@ pub fn nodeData(tree: *const Ast, node: Node.Index) Node.Data {
     return tree.nodes.items(.data)[@intFromEnum(node)];
 }
 
-pub fn formOp(tree: *const Ast, node: Node.Index) NullTerminatedString {
-    assert(tree.nodeTag(node) == .form);
-    return tree.nodeData(node).form.op;
+pub fn blockExpressions(tree: *const Ast, node: Node.Index) []const Node.Index {
+    assert(tree.nodeTag(node) == .block);
+    return tree.extraDataSlice(tree.nodeData(node).extra_range, Node.Index);
 }
 
-pub fn formArgs(tree: *const Ast, node: Node.Index) []const Node.Index {
-    assert(tree.nodeTag(node) == .form);
-    const extra = tree.extraData(tree.nodeData(node).form.args, Node.SubRange);
-    return tree.extraDataSlice(extra, Node.Index);
+pub fn callArgs(tree: *const Ast, node: Node.Index) []const Node.Index {
+    assert(tree.nodeTag(node) == .call);
+    const args_index = tree.nodeData(node).node_and_extra[1];
+    return tree.extraDataSlice(tree.extraData(args_index, Node.SubRange), Node.Index);
+}
+
+/// The prototype's parameter type expression nodes. A parameter's name is
+/// the token before its type's first token.
+pub fn fnProtoParams(tree: *const Ast, node: Node.Index) []const Node.Index {
+    assert(tree.nodeTag(node) == .fn_proto);
+    const params_index = tree.nodeData(node).extra_and_opt_node[0];
+    return tree.extraDataSlice(tree.extraData(params_index, Node.SubRange), Node.Index);
+}
+
+pub fn fnProtoReturnType(tree: *const Ast, node: Node.Index) Node.OptionalIndex {
+    assert(tree.nodeTag(node) == .fn_proto);
+    return tree.nodeData(node).extra_and_opt_node[1];
 }
 
 // Helpers extra data
@@ -317,64 +322,80 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
     while (true) switch (tree.nodeTag(n)) {
         .root => return 0,
 
-        .string_literal, .number_literal, .identifier => return tree.nodeMainToken(n),
+        .string_literal,
+        .number_literal,
+        .identifier,
+        .negation,
+        .block,
+        .fn_decl,
+        .grouped_expression,
+        => return tree.nodeMainToken(n),
 
-        .form => {
-            const args = tree.formArgs(n);
-
-            // Unary form: operator (main_token) sits to the left of its single arg.
-            if (args.len == 1) return tree.nodeMainToken(n);
-
-            const op = tree.formOp(n);
-            switch (op) {
-                .block => return tree.nodeMainToken(n),
-                else => {
-                    n = args[0];
-                },
-            }
+        .fn_proto => {
+            // The `extern` keyword, when present, is the token before `fn`.
+            const main_token = tree.nodeMainToken(n);
+            if (main_token > 0 and tree.tokenTag(main_token - 1) == .keyword_extern) return main_token - 1;
+            return main_token;
         },
+
+        .add, .sub, .mul, .div, .assign => n = tree.nodeData(n).node_and_node[0],
+
+        .call => n = tree.nodeData(n).node_and_extra[0],
     };
 }
 
 pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
     var n = node;
+    std.debug.print(">>>>>> nodetag: {}\n", .{tree.nodeTag(n)});
     while (true) switch (tree.nodeTag(n)) {
         .root => return @intCast(tree.tokens.len - 1),
         .identifier, .string_literal, .number_literal => return tree.nodeMainToken(n),
 
-        .form => {
-            const args = tree.formArgs(n);
-            const op = tree.formOp(n);
+        .negation => n = tree.nodeData(n).node,
 
-            switch (op) {
-                .block => {
-                    var tok = tree.nodeMainToken(node);
-                    while (tree.tokenTag(tok) != .r_brace) : (tok += 1) {}
-                    return tok;
-                },
-                else => {
-                    n = args[args.len - 1];
-                },
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .assign,
+        .fn_decl,
+        => n = tree.nodeData(n).node_and_node[1],
+
+        .grouped_expression => return tree.nodeData(n).node_and_token[1],
+
+        .block => {
+            const extra_index = tree.nodeData(n).extra;
+            const block = tree.extraData(extra_index, Node.Block);
+            return block.rbrace;
+        },
+
+        .call => {
+            _, const extra_index = tree.nodeData(n).node_and_extra;
+            const call = tree.extraData(extra_index, Node.Call);
+            return call.rparen;
+        },
+
+        .fn_proto => {
+            if (tree.fnProtoReturnType(n).unwrap()) |return_type| {
+                n = return_type;
+                continue;
             }
+            // No return type (recoverable error): the params `)` ends the proto.
+            const extra_index = tree.nodeData(n).extra_and_opt_node[0];
+            return tree.extraData(extra_index, Node.FnProto).rparen;
         },
     };
 }
 
-const Expected = union(enum) {
-    number_literal,
-    identifier,
-    form: struct {
-        op: NullTerminatedString,
-        args: []const Expected,
-    },
+/// A node shape for structural test assertions: the expected tag plus the
+/// expected shapes of the node's children in source order.
+const Expected = struct {
+    tag: Node.Tag,
+    children: []const Expected = &.{},
 };
 
 fn expectAst(source: [:0]const u8, expected: Expected) !void {
-    var ip: InternPool = .{};
-    try ip.init(std.testing.allocator);
-    defer ip.deinit(std.testing.allocator);
-
-    var tree = try Ast.parse(std.testing.allocator, source, &ip);
+    var tree = try Ast.parse(std.testing.allocator, source);
     defer tree.deinit(std.testing.allocator);
     try std.testing.expect(tree.errors.len == 0);
     for (tree.rootDecls()) |statement| {
@@ -383,197 +404,209 @@ fn expectAst(source: [:0]const u8, expected: Expected) !void {
 }
 
 fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
-    switch (expected) {
-        .number_literal => try std.testing.expectEqual(
-            Node.Tag.number_literal,
-            tree.nodeTag(node),
-        ),
-        .identifier => try std.testing.expectEqual(
-            Node.Tag.identifier,
-            tree.nodeTag(node),
-        ),
-        .form => |f| {
-            try std.testing.expectEqual(Node.Tag.form, tree.nodeTag(node));
-            try std.testing.expectEqual(f.op, tree.formOp(node));
-            const args = tree.formArgs(node);
-            try std.testing.expectEqual(f.args.len, args.len);
-            for (f.args, args) |exp_child, actual_child| {
-                try expectNode(tree, actual_child, exp_child);
+    try std.testing.expectEqual(expected.tag, tree.nodeTag(node));
+
+    switch (tree.nodeTag(node)) {
+        .root => unreachable, // the root is never a child
+
+        .identifier, .number_literal, .string_literal => {
+            try std.testing.expectEqual(0, expected.children.len);
+        },
+
+        .negation => {
+            try std.testing.expectEqual(1, expected.children.len);
+            try expectNode(tree, tree.nodeData(node).node, expected.children[0]);
+        },
+
+        .grouped_expression => {
+            try std.testing.expectEqual(1, expected.children.len);
+            try expectNode(tree, tree.nodeData(node).node_and_token[0], expected.children[0]);
+        },
+
+        .add, .sub, .mul, .div, .assign, .fn_decl => {
+            try std.testing.expectEqual(2, expected.children.len);
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            try expectNode(tree, lhs, expected.children[0]);
+            try expectNode(tree, rhs, expected.children[1]);
+        },
+
+        .block => {
+            const statements = tree.blockExpressions(node);
+            try std.testing.expectEqual(expected.children.len, statements.len);
+            for (statements, expected.children) |statement, expected_child| {
+                try expectNode(tree, statement, expected_child);
+            }
+        },
+
+        // Children are the callee followed by the args.
+        .call => {
+            const callee = tree.nodeData(node).node_and_extra[0];
+            const args = tree.callArgs(node);
+            try std.testing.expectEqual(expected.children.len, 1 + args.len);
+            try expectNode(tree, callee, expected.children[0]);
+            for (args, expected.children[1..]) |arg, expected_child| {
+                try expectNode(tree, arg, expected_child);
+            }
+        },
+
+        // Children are the param types followed by the return type, if any.
+        .fn_proto => {
+            const params = tree.fnProtoParams(node);
+            const return_type = tree.fnProtoReturnType(node).unwrap();
+            const expected_len = params.len + @intFromBool(return_type != null);
+            try std.testing.expectEqual(expected.children.len, expected_len);
+            for (params, expected.children[0..params.len]) |param, expected_child| {
+                try expectNode(tree, param, expected_child);
+            }
+            if (return_type) |return_type_node| {
+                try expectNode(tree, return_type_node, expected.children[params.len]);
             }
         },
     }
 }
 
-fn expectParse(source: [:0]const u8, expected: []const Node.Tag) !void {
-    var ip: InternPool = .{};
-    try ip.init(std.testing.allocator);
-    defer ip.deinit(std.testing.allocator);
-
-    var tree = try Ast.parse(std.testing.allocator, source, &ip);
-    defer tree.deinit(std.testing.allocator);
-    try std.testing.expect(tree.errors.len == 0);
-    try std.testing.expectEqualSlices(Node.Tag, expected, tree.nodes.items(.tag));
+test "parser" {
+    try expectAst("42", .{ .tag = .number_literal });
 }
 
-test "parser" {
-    try expectAst("42", .number_literal);
+/// Parses a single root declaration and asserts the token index `lastToken`
+/// returns for it. Asserting the index (not the lexeme) is the point: the
+/// failure modes return the wrong instance of the same lexeme.
+fn expectLastToken(source: [:0]const u8, expected: TokenIndex) !void {
+    var tree = try Ast.parse(std.testing.allocator, source);
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expect(tree.errors.len == 0);
+
+    const decls = tree.rootDecls();
+    try std.testing.expectEqual(1, decls.len);
+    try std.testing.expectEqual(expected, tree.lastToken(decls[0]));
+}
+
+test "lastToken" {
+    // try expectLastToken("42", 0); // leaf
+    // try expectLastToken("1 + 2", 2); // rhs walk
+    // try expectLastToken("-x", 1); // operand walk
+    // try expectLastToken("(1 + 2)", 4); // stored `)`
+    // try expectLastToken("{}", 1); // empty block
+    // try expectLastToken("(1 + 2) * (2 / (4 - 1))", 14); // empty block
+    // // `{`(0) `1`(1) newline(2) `}`(3) — the `\n` after `{` is swallowed by
+    // // automatic newline insertion, the one after `1` is not.
+    // try expectLastToken("{\n1\n}", 3); // scan past the newline
+    // try expectLastToken("f()", 2); // empty call
+    // try expectLastToken("f(1,)", 4); // scan past the trailing comma
+    // try expectLastToken("f((1+1))", 7); // the call's `)`, not the grouping's (4)
+    // try expectLastToken("fn f() t {}", 6); // body walk
+    try expectLastToken("extern fn f() t", 5); // return type walk
 }
 
 test "left associative & precedence" {
-    // zig fmt: off
-    try expectAst("1 + 1 * 2", .{ 
-        .form = .{ 
-            .op = .plus,
-            .args = &.{ 
-                .number_literal, .{ 
-                    .form = .{ 
-                        .op = .star,
-                        .args = &.{ .number_literal, .number_literal } 
-                    } 
-                }
-            }
-        } 
-    });
-    // zig fmt: on
+    try expectAst("1 + 1 * 2", .{ .tag = .add, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .mul, .children = &.{
+            .{ .tag = .number_literal },
+            .{ .tag = .number_literal },
+        } },
+    } });
 
-    // zig fmt: off
-    try expectAst("1 + (1 - 2) * 2", .{
-        .form = .{
-            .op = .plus,
-            .args = &.{
-                .number_literal,
-                .{
-                    .form = .{
-                        .op = .star,
-                        .args = &.{
-                            .{
-                                .form = .{
-                                    .op = .minus,
-                                    .args = &.{ .number_literal, .number_literal },
-                                },
-                            },
-                            .number_literal
+    try expectAst("1 + (1 - 2) * 2", .{ .tag = .add, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .mul, .children = &.{
+            .{ .tag = .sub, .children = &.{
+                .{ .tag = .number_literal },
+                .{ .tag = .number_literal },
+            } },
+            .{ .tag = .number_literal },
+        } },
+    } });
 
-                        }
-                    },
-                },
-            },
-        },
-    });
-    // zig fmt: on
-
-    // zig fmt: off
-      try expectAst("1 - 2 - 3", .{
-          .form = .{
-              .op = .minus,
-              .args = &.{
-                  .{
-                      .form = .{
-                          .op = .minus,
-                          .args = &.{ .number_literal, .number_literal },
-                      },
-                  },
-                  .number_literal,
-              },
-          },
-      });
-      // zig fmt: on
+    try expectAst("1 - 2 - 3", .{ .tag = .sub, .children = &.{
+        .{ .tag = .sub, .children = &.{
+            .{ .tag = .number_literal },
+            .{ .tag = .number_literal },
+        } },
+        .{ .tag = .number_literal },
+    } });
 }
 
 test "block" {
-    try expectAst("{}", .{ .form = .{ .op = .block, .args = &.{} } });
+    try expectAst("{}", .{ .tag = .block });
 
-    // zig fmt: off
     try expectAst(
         \\{
         \\  1
         \\  2
         \\}
-        ,
-        .{ .form = .{ .op = .block, .args = &.{ .number_literal, .number_literal } } },
+    ,
+        .{ .tag = .block, .children = &.{
+            .{ .tag = .number_literal },
+            .{ .tag = .number_literal },
+        } },
     );
-    // zig fmt: on
 }
 
 test "fn declaration" {
     const gpa = std.testing.allocator;
 
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    var tree = try Ast.parse(gpa, "fn add(x number, y number) number {}", &ip);
+    var tree = try Ast.parse(gpa, "fn add(x number, y number) number {}");
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
-    // Dedup guarantee: interning the same bytes yields the handle the parser used.
-    const add_op = try ip.getString(gpa, "add");
-
     const decls = tree.rootDecls();
     try std.testing.expectEqual(1, decls.len);
-    try expectNode(&tree, decls[0], .{ .form = .{ .op = .@"fn", .args = &.{
-        .{ .form = .{ .op = add_op, .args = &.{
-            .{ .form = .{ .op = .params, .args = &.{
-                .{ .form = .{ .op = .param, .args = &.{ .identifier, .identifier } } },
-                .{ .form = .{ .op = .param, .args = &.{ .identifier, .identifier } } },
-            } } },
-            .{ .form = .{ .op = .ret, .args = &.{.identifier} } },
-        } } },
-        .{ .form = .{ .op = .block, .args = &.{} } },
-    } } });
+    try expectNode(&tree, decls[0], .{
+        .tag = .fn_decl,
+        .children = &.{
+            .{
+                .tag = .fn_proto,
+                .children = &.{
+                    .{ .tag = .identifier }, // x's type
+                    .{ .tag = .identifier }, // y's type
+                    .{ .tag = .identifier }, // return type
+                },
+            },
+            .{ .tag = .block },
+        },
+    });
+
+    // Names are not nodes: the fn name follows the `fn` token, a param
+    // name precedes its type expression.
+    const proto = tree.nodeData(decls[0]).node_and_node[0];
+    try std.testing.expectEqualStrings("add", tree.tokenSlice(tree.nodeMainToken(proto) + 1));
+    const first_param = tree.fnProtoParams(proto)[0];
+    try std.testing.expectEqualStrings("x", tree.tokenSlice(tree.firstToken(first_param) - 1));
 }
 
 test "extern fn declaration" {
     const gpa = std.testing.allocator;
 
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    var tree = try Ast.parse(gpa, "extern fn print(x number) number", &ip);
+    var tree = try Ast.parse(gpa, "extern fn print(x number) number");
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
-    const print_op = try ip.getString(gpa, "print");
-
     const decls = tree.rootDecls();
     try std.testing.expectEqual(1, decls.len);
-    try expectNode(&tree, decls[0], .{ .form = .{ .op = .extern_fn, .args = &.{
-        .{ .form = .{ .op = print_op, .args = &.{
-            .{ .form = .{ .op = .params, .args = &.{
-                .{ .form = .{ .op = .param, .args = &.{ .identifier, .identifier } } },
-            } } },
-            .{ .form = .{ .op = .ret, .args = &.{.identifier} } },
-        } } },
-    } } });
+    try expectNode(&tree, decls[0], .{
+        .tag = .fn_proto,
+        .children = &.{
+            .{ .tag = .identifier }, // x's type
+            .{ .tag = .identifier }, // return type
+        },
+    });
+
+    // The extern-ness of a bare proto lives in the token before its `fn`.
+    try std.testing.expectEqual(Token.Tag.keyword_extern, tree.tokenTag(tree.firstToken(decls[0])));
 }
 
 test "fn call" {
-    const gpa = std.testing.allocator;
-
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    var tree = try Ast.parse(gpa, "add(1, 2)", &ip);
-    defer tree.deinit(gpa);
-    try std.testing.expect(tree.errors.len == 0);
-
-    const add_op = try ip.getString(gpa, "add");
-
-    const decls = tree.rootDecls();
-    try std.testing.expectEqual(1, decls.len);
-    try expectNode(&tree, decls[0], .{ .form = .{ .op = add_op, .args = &.{
-        .number_literal, .number_literal,
-    } } });
+    try expectAst("add(1, 2)", .{ .tag = .call, .children = &.{
+        .{ .tag = .identifier },
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
 }
 
 test "dump" {
-    var ip: InternPool = .{};
-    try ip.init(std.testing.allocator);
-    defer ip.deinit(std.testing.allocator);
-
-    var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3", &ip);
+    var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3");
     defer tree.deinit(std.testing.allocator);
     try tree.dump();
 }

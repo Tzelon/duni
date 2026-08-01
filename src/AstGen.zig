@@ -90,16 +90,31 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
 fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const tree = gd.astgen.tree;
 
-    switch (tree.nodeTag(node)) {
-        .number_literal => return numberLiteral(gd, node, node, .positive),
-        .string_literal => return stringLiteral(gd, node),
+    var inner_node = tree.nodeTag(node);
 
-        .identifier => return identifier(gd, node),
+    while (true) {
+        switch (inner_node) {
+            .number_literal => return numberLiteral(gd, node, node, .positive),
+            .string_literal => return stringLiteral(gd, node),
 
-        .form => return formExpr(gd, node),
-        else => {
-            unreachable;
-        },
+            .identifier => return identifier(gd, node),
+
+            .add => return simpleBinOp(gd, node, .add),
+            .sub => return simpleBinOp(gd, node, .sub),
+            .mul => return simpleBinOp(gd, node, .mul),
+            .div => return simpleBinOp(gd, node, .div),
+            .negation => return negation(gd, node),
+            .assign => return bind(gd, node),
+            .block => return blockExpr(gd, node),
+
+            .grouped_expression => {
+                inner_node = tree.nodeData(inner_node).node_and_token[0];
+                continue;
+            },
+
+            // Not lowered yet.
+            .root, .call, .fn_decl, .fn_proto => unreachable,
+        }
     }
 }
 
@@ -174,31 +189,10 @@ fn stringLiteral(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     });
 }
 
-fn formExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+fn negation(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const tree = gd.astgen.tree;
 
-    const op = tree.formOp(node);
-    const args = tree.formArgs(node);
-
-    switch (op) {
-        .star => return simpleBinOp(gd, node, args, .mul),
-        .plus => return simpleBinOp(gd, node, args, .add),
-        .minus => switch (args.len) {
-            1 => return negation(gd, node, args),
-            2 => return simpleBinOp(gd, node, args, .sub),
-            else => unreachable,
-        },
-        .slash => return simpleBinOp(gd, node, args, .div),
-        .equal => return bind(gd, node, args),
-        .block => return blockExpr(gd, node, args),
-        else => unreachable,
-    }
-}
-
-fn negation(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
-    const tree = gd.astgen.tree;
-
-    const operand_node = args[0];
+    const operand_node = tree.nodeData(node).node;
 
     // Check for float literal as the sub-expression because we want to preserve
     // its negativity rather than having it go through comptime subtraction.
@@ -210,18 +204,17 @@ fn negation(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerEr
     return gd.addUnNode(.negate, operand, node);
 }
 
-fn simpleBinOp(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index, op_inst_tag: Dir.Inst.Tag) InnerError!Dir.Inst.Ref {
-    const lhs = try expr(gd, args[0]);
-    const rhs = try expr(gd, args[1]);
+fn simpleBinOp(gd: *GenDir, node: Ast.Node.Index, op_inst_tag: Dir.Inst.Tag) InnerError!Dir.Inst.Ref {
+    const lhs_node, const rhs_node = gd.astgen.tree.nodeData(node).node_and_node;
+    const lhs = try expr(gd, lhs_node);
+    const rhs = try expr(gd, rhs_node);
     return gd.addPlNode(op_inst_tag, node, Dir.Inst.Bin{ .lhs = lhs, .rhs = rhs });
 }
 
-fn bind(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
+fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const astgen = gd.astgen;
     const tree = astgen.tree;
-    _ = node;
-    const lhs_node = args[0];
-    const rhs_node = args[1];
+    const lhs_node, const rhs_node = tree.nodeData(node).node_and_node;
 
     // The lhs is a pattern; today only a plain identifier is supported.
     if (tree.nodeTag(lhs_node) != .identifier) {
@@ -251,8 +244,9 @@ fn bind(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!
     return rhs;
 }
 
-fn blockExpr(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerError!Dir.Inst.Ref {
+fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const astgen = gd.astgen;
+    const statements = astgen.tree.blockStatements(node);
 
     // Since this block is unlabeled, its control flow is effectively linear and we
     // can *almost* get away with inlining the block here. However, we actually need
@@ -265,7 +259,7 @@ fn blockExpr(gd: *GenDir, node: Ast.Node.Index, args: []const Node.Index) InnerE
     var block_scope = gd.makeSubBlock();
     defer block_scope.unstack();
 
-    for (args) |statement| {
+    for (statements) |statement| {
         _ = try expr(&block_scope, statement);
     }
 
@@ -697,14 +691,9 @@ const GenDir = struct {
 
 fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     const Print = @import("print_dir.zig");
-    const InternPool = @import("InternPool.zig");
     const gpa = std.testing.allocator;
 
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    var tree = try Ast.parse(gpa, source, &ip);
+    var tree = try Ast.parse(gpa, source);
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
@@ -802,14 +791,9 @@ test "negation" {
 }
 
 test "negative zero int is rejected" {
-    const InternPool = @import("InternPool.zig");
     const gpa = std.testing.allocator;
 
-    var ip: InternPool = .{};
-    try ip.init(gpa);
-    defer ip.deinit(gpa);
-
-    var tree = try Ast.parse(gpa, "-0", &ip);
+    var tree = try Ast.parse(gpa, "-0");
     defer tree.deinit(gpa);
     try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
 }

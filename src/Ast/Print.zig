@@ -50,14 +50,32 @@ fn visit(self: *Print, node: Node.Index) !void {
 
         // leaf nodes: no children to visit.
         .identifier, .number_literal, .string_literal => {},
-        .form => {
-            const form = datas[i].form;
-            const sr_pos = @intFromEnum(form.args);
-            const start = tree.extra_data[sr_pos];
-            const end = tree.extra_data[sr_pos + 1];
-            for (start..end) |j| {
-                const child: Node.Index = @enumFromInt(tree.extra_data[j]);
-                try self.visit(child);
+
+        .negation => try self.visit(datas[i].node),
+
+        .add, .sub, .mul, .div, .assign, .fn_decl => {
+            const lhs, const rhs = datas[i].node_and_node;
+            try self.visit(lhs);
+            try self.visit(rhs);
+        },
+
+        .block => for (tree.blockStatements(node)) |statement| {
+            try self.visit(statement);
+        },
+
+        .call => {
+            try self.visit(datas[i].node_and_extra[0]);
+            for (tree.callArgs(node)) |arg| {
+                try self.visit(arg);
+            }
+        },
+
+        .fn_proto => {
+            for (tree.fnProtoParams(node)) |param| {
+                try self.visit(param);
+            }
+            if (tree.fnProtoReturnType(node).unwrap()) |return_type| {
+                try self.visit(return_type);
             }
         },
     }

@@ -58,7 +58,7 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     try ip.init(allocator);
     defer ip.deinit(allocator);
 
-    var tree = try Ast.parse(allocator, source, &ip);
+    var tree = try Ast.parse(allocator, source);
     defer tree.deinit(allocator);
 
     var dir = try AstGen.generate(allocator, tree);

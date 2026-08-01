@@ -9,17 +9,6 @@ const InternPool = @import("InternPool.zig");
 pub const NullTerminatedString = enum(u32) {
     /// An empty string.
     empty = 0,
-    plus = 1,
-    minus = 2,
-    star = 3,
-    slash = 4,
-    equal = 5,
-    block = 6,
-    @"fn" = 7,
-    extern_fn = 8,
-    param = 9,
-    ret = 10,
-    params = 11,
     _,
 
     pub const static_len = @typeInfo(@This()).@"enum".fields.len;
@@ -128,15 +117,4 @@ pub const OptionalNullTerminatedString = enum(u32) {
 
 pub const static_strings: [NullTerminatedString.static_len][]const u8 = .{
     "",
-    "+",
-    "-",
-    "*",
-    "/",
-    "=",
-    "{", //block
-    "fn",
-    "extern",
-    "param",
-    "ret",
-    "params",
 };

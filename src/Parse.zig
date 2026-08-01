@@ -14,16 +14,11 @@ const Ast = @import("./Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 
-const InternPool = @import("InternPool.zig");
-const NullTerminatedString = @import("string.zig").NullTerminatedString;
-
 const log = std.log.scoped(.parser);
 
 pub const Error = error{ParseError} || Allocator.Error;
 
 gpa: Allocator,
-/// intern pool for dynamic form operators (proto heads, call heads)
-ip: *InternPool,
 /// source text
 source: [:0]const u8,
 
@@ -99,30 +94,35 @@ fn parseBlock(p: *Parse) !Node.SubRange {
     return span;
 }
 
-fn parseProto(p: *Parse) !Node.Index {
-    const name_token = try p.consume(.identifier);
-    const op = try p.ip.getString(p.gpa, p.tokenSlice(name_token));
-    const params = try p.parseParams();
-    const return_type_expr = try p.parseRetType();
+fn parseProto(p: *Parse, fn_token: TokenIndex) !Node.Index {
+    _ = try p.consume(.identifier); // the fn name, always at fn_token + 1
 
-    const span = if (return_type_expr) |ret|
-        try p.listToSpan(&.{ params, ret })
+    const params = try p.parseParams();
+    // consume r_paren here so we can store it in the node
+    const r_paren = try p.consume(.r_paren);
+
+    const return_type: Node.OptionalIndex = if (try p.parseTypeExpr()) |type_node|
+        type_node.toOptional()
     else blk: {
         try p.warn(.expected_return_type);
-        break :blk try p.listToSpan(&.{params});
+        break :blk .none;
     };
 
-    const args = try p.addExtra(span);
+    const params_index = try p.addExtra(Node.FnProto{
+        .rparen = r_paren,
+        .params_start = params.start,
+        .params_end = params.end,
+    });
 
     return p.addNode(.{
-        .tag = .form,
-        .main_token = name_token,
-        .data = .{ .form = .{ .op = op, .args = args } },
+        .tag = .fn_proto,
+        .main_token = fn_token,
+        .data = .{ .extra_and_opt_node = .{ params_index, return_type } },
     });
 }
 
-fn parseParams(p: *Parse) !Node.Index {
-    const main_token = try p.consume(.l_paren);
+fn parseParams(p: *Parse) !Node.SubRange {
+    _ = try p.consume(.l_paren);
 
     const scratch_top = p.scratch.items.len;
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
@@ -136,35 +136,14 @@ fn parseParams(p: *Parse) !Node.Index {
         _ = p.advance();
     }
 
-    _ = try p.consume(.r_paren);
-
-    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
-    const args = try p.addExtra(span);
-
-    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .params, .args = args } } });
+    return p.listToSpan(p.scratch.items[scratch_top..]);
 }
 
+/// A parameter is `name type`. Only the type expression gets a node; the
+/// name is the token before the type's first token.
 fn parseParamDecl(p: *Parse) !Node.Index {
-    const name_token = try p.consume(.identifier);
-    const name_node = try p.addNode(.{
-        .tag = .identifier,
-        .main_token = name_token,
-        .data = undefined,
-    });
-    const type_node = try p.parseTypeExpr() orelse return p.failMsg(.{ .tag = .expected_type_expr, .token = p.token_index });
-
-    const span = try p.listToSpan(&.{ name_node, type_node });
-    const args = try p.addExtra(span);
-    return p.addNode(.{ .tag = .form, .main_token = name_token, .data = .{ .form = .{ .op = .param, .args = args } } });
-}
-
-fn parseRetType(p: *Parse) !?Node.Index {
-    const type_token = p.token_index;
-    const type_node = (try p.parseTypeExpr()) orelse return null;
-
-    const span = try p.listToSpan(&.{type_node});
-    const args = try p.addExtra(span);
-    return try p.addNode(.{ .tag = .form, .main_token = type_token, .data = .{ .form = .{ .op = .ret, .args = args } } });
+    _ = try p.consume(.identifier);
+    return try p.parseTypeExpr() orelse return p.failMsg(.{ .tag = .expected_type_expr, .token = p.token_index });
 }
 
 fn parseTypeExpr(p: *Parse) !?Node.Index {
@@ -294,27 +273,24 @@ fn string(p: *Parse) !Node.Index {
 
 /// example: -1
 fn unary(p: *Parse) !Node.Index {
-    const op_nts: NullTerminatedString = switch (p.current()) {
-        .minus => .minus,
+    const tag: Node.Tag = switch (p.current()) {
+        .minus => .negation,
         else => unreachable,
     };
 
     const main_token = p.advance();
     const operand = try p.parsePrecedence(.prec_unary);
 
-    const span = try p.listToSpan(&.{operand});
-    const args = try p.addExtra(span);
-
-    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = op_nts, .args = args } } });
+    return p.addNode(.{ .tag = tag, .main_token = main_token, .data = .{ .node = operand } });
 }
 
 /// example: 1 + 1
 fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
-    const op_nts: NullTerminatedString = switch (p.current()) {
-        .plus => .plus,
-        .minus => .minus,
-        .star => .star,
-        .slash => .slash,
+    const tag: Node.Tag = switch (p.current()) {
+        .plus => .add,
+        .minus => .sub,
+        .star => .mul,
+        .slash => .div,
         else => unreachable,
     };
 
@@ -323,76 +299,79 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
     // We use one higher level of precedence for the right operand because the binary operators are left-associative.
     const rhs = try p.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1));
 
-    const span = try p.listToSpan(&.{ lhs, rhs });
-    const args = try p.addExtra(span);
-
     return p.addNode(.{
-        .tag = .form,
+        .tag = tag,
         .main_token = main_token,
-        .data = .{ .form = .{ .op = op_nts, .args = args } },
+        .data = .{ .node_and_node = .{ lhs, rhs } },
     });
 }
 
 fn function(p: *Parse) !Node.Index {
-    const main_token = p.advance();
-    const proto = try p.parseProto();
+    const fn_token = p.advance();
+    const proto = try p.parseProto(fn_token);
 
     if (!p.check(.l_brace)) return p.failExpected(.l_brace);
     const body = try p.block();
 
-    const span = try p.listToSpan(&.{ proto, body });
-    const args = try p.addExtra(span);
-
     return p.addNode(.{
-        .tag = .form,
-        .main_token = main_token,
-        .data = .{ .form = .{ .op = .@"fn", .args = args } },
+        .tag = .fn_decl,
+        .main_token = fn_token,
+        .data = .{ .node_and_node = .{ proto, body } },
     });
 }
 
+/// An extern function is a bare `fn_proto` with no body; the `extern`
+/// keyword is the token before the proto's `fn` token.
 fn externFunction(p: *Parse) !Node.Index {
-    const main_token = p.advance();
-    _ = try p.consume(.keyword_fn);
-    const proto = try p.parseProto();
-
-    const span = try p.listToSpan(&.{proto});
-    const args = try p.addExtra(span);
-    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .extern_fn, .args = args } } });
+    _ = p.advance(); // `extern`
+    const fn_token = try p.consume(.keyword_fn);
+    return p.parseProto(fn_token);
 }
 
 fn block(p: *Parse) !Node.Index {
     const main_token = p.advance();
     const span = try p.parseBlock();
-    const args = try p.addExtra(span);
-    _ = try p.consume(.r_brace);
+    const r_brace = try p.consume(.r_brace);
 
-    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .block, .args = args } } });
+    return p.addNode(.{
+        .tag = .block,
+        .main_token = main_token,
+        .data = .{
+            .extra = try p.addExtra(Node.Block{
+                .expressions_start = span.start,
+                .expressions_end = span.end,
+                .rbrace = r_brace,
+            }),
+        },
+    });
 }
 
 fn grouping(p: *Parse) !Node.Index {
-    _ = p.advance();
+    const main_token = p.advance();
     const inner = try p.expression();
-    _ = try p.consume(.r_paren);
+    const r_paren = try p.consume(.r_paren);
 
-    return inner;
+    return p.addNode(.{
+        .tag = .grouped_expression,
+        .main_token = main_token,
+        .data = .{ .node_and_token = .{ inner, r_paren } },
+    });
 }
 
 fn call(p: *Parse, lhs: Node.Index) !Node.Index {
     const scratch_top = p.scratch.items.len;
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
-    _ = p.advance();
+    const lparen = p.advance();
 
-    const main_token = p.nodes.items(.main_token)[@intFromEnum(lhs)];
-
-    const name_token = switch (p.nodes.items(.tag)[@intFromEnum(lhs)]) {
-        .identifier => main_token,
+    // Only a plain identifier callee is supported today; AstGen has no
+    // error reporting yet, so the check stays in the parser.
+    switch (p.nodes.items(.tag)[@intFromEnum(lhs)]) {
+        .identifier => {},
         else => return p.failMsg(.{
             .tag = .expected_callee,
-            .token = main_token,
+            .token = p.nodes.items(.main_token)[@intFromEnum(lhs)],
         }),
-    };
-
-    const op = try p.ip.getString(p.gpa, p.tokenSlice(name_token));
+    }
 
     while (true) {
         if (p.check(.r_paren)) break;
@@ -403,12 +382,20 @@ fn call(p: *Parse, lhs: Node.Index) !Node.Index {
         _ = p.advance();
     }
 
-    _ = try p.consume(.r_paren);
+    const r_paren = try p.consume(.r_paren);
 
     const span = try p.listToSpan(p.scratch.items[scratch_top..]);
-    const args = try p.addExtra(span);
+    const args = try p.addExtra(Node.Call{
+        .args_start = span.start,
+        .args_end = span.end,
+        .rparen = r_paren,
+    });
 
-    return p.addNode(.{ .tag = .form, .main_token = name_token, .data = .{ .form = .{ .op = op, .args = args } } });
+    return p.addNode(.{
+        .tag = .call,
+        .main_token = lparen,
+        .data = .{ .node_and_extra = .{ lhs, args } },
+    });
 }
 
 // example: x = 1
@@ -418,10 +405,7 @@ fn bind(p: *Parse, lhs: Node.Index) !Node.Index {
     // `=` is right-associative: `a = b = c` parses as `a = (b = c)`.
     const rhs = try p.parsePrecedence(.prec_assignment);
 
-    const span = try p.listToSpan(&.{ lhs, rhs });
-    const args = try p.addExtra(span);
-
-    return p.addNode(.{ .tag = .form, .main_token = main_token, .data = .{ .form = .{ .op = .equal, .args = args } } });
+    return p.addNode(.{ .tag = .assign, .main_token = main_token, .data = .{ .node_and_node = .{ lhs, rhs } } });
 }
 
 const ParsePrefixFn = *const fn (parser: *Parse) Error!Node.Index;

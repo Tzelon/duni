@@ -90,27 +90,25 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
 fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const tree = gd.astgen.tree;
 
-    var inner_node = tree.nodeTag(node);
+    var current_node = node;
 
     while (true) {
-        switch (inner_node) {
-            .number_literal => return numberLiteral(gd, node, node, .positive),
-            .string_literal => return stringLiteral(gd, node),
+        switch (tree.nodeTag(current_node)) {
+            .number_literal => return numberLiteral(gd, current_node, current_node, .positive),
+            .string_literal => return stringLiteral(gd, current_node),
 
-            .identifier => return identifier(gd, node),
+            .identifier => return identifier(gd, current_node),
 
-            .add => return simpleBinOp(gd, node, .add),
-            .sub => return simpleBinOp(gd, node, .sub),
-            .mul => return simpleBinOp(gd, node, .mul),
-            .div => return simpleBinOp(gd, node, .div),
-            .negation => return negation(gd, node),
-            .assign => return bind(gd, node),
-            .block => return blockExpr(gd, node),
+            .add => return simpleBinOp(gd, current_node, .add),
+            .sub => return simpleBinOp(gd, current_node, .sub),
+            .mul => return simpleBinOp(gd, current_node, .mul),
+            .div => return simpleBinOp(gd, current_node, .div),
+            .negation => return negation(gd, current_node),
+            .assign => return bind(gd, current_node),
+            .block => return blockExpr(gd, current_node),
 
-            .grouped_expression => {
-                inner_node = tree.nodeData(inner_node).node_and_token[0];
-                continue;
-            },
+            // Grouping is transparent to lowering: unwrap and go again.
+            .grouped_expression => current_node = tree.nodeData(current_node).node_and_token[0],
 
             // Not lowered yet.
             .root, .call, .fn_decl, .fn_proto => unreachable,
@@ -246,7 +244,7 @@ fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
 
 fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const astgen = gd.astgen;
-    const statements = astgen.tree.blockStatements(node);
+    const statements = astgen.tree.blockExpressions(node);
 
     // Since this block is unlabeled, its control flow is effectively linear and we
     // can *almost* get away with inlining the block here. However, we actually need
@@ -759,7 +757,7 @@ test "simple binary op" {
         \\%1 = int(2)
         \\%2 = int(5)
         \\%3 = sub(%1, %2) node_offset:1:6 to :1:11
-        \\%4 = mul(%0, %3) node_offset:1:1 to :1:11
+        \\%4 = mul(%0, %3) node_offset:1:1 to :1:12
         \\%5 = int(10)
         \\%6 = div(%4, %5) node_offset:1:1 to :1:17
         \\
@@ -778,14 +776,13 @@ test "negation" {
         \\%0 = float(-3.14)
         \\
     );
-    // non-literal operand: general path. The negate span excludes the closing
-    // paren: parens produce no AST node, so `lastToken` stops at the inner `2`.
-    // See TODO(tzelon) on Parse.grouping.
+    // non-literal operand: general path. The negate span includes the closing
+    // paren via the grouped_expression's stored rparen.
     try expect("-(1 + 2)",
         \\%0 = int(1)
         \\%1 = int(2)
         \\%2 = add(%0, %1) node_offset:1:3 to :1:8
-        \\%3 = negate(%2) node_offset:1:1 to :1:8
+        \\%3 = negate(%2) node_offset:1:1 to :1:9
         \\
     );
 }

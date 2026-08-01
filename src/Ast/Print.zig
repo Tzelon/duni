@@ -53,6 +53,8 @@ fn visit(self: *Print, node: Node.Index) !void {
 
         .negation => try self.visit(datas[i].node),
 
+        .grouped_expression => try self.visit(datas[i].node_and_token[0]),
+
         .add, .sub, .mul, .div, .assign, .fn_decl => {
             const lhs, const rhs = datas[i].node_and_node;
             try self.visit(lhs);

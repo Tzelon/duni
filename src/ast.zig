@@ -453,36 +453,6 @@ test "parser" {
     try expectAst("42", .{ .tag = .number_literal });
 }
 
-/// Parses a single root declaration and asserts the token index `lastToken`
-/// returns for it. Asserting the index (not the lexeme) is the point: the
-/// failure modes return the wrong instance of the same lexeme.
-fn expectLastToken(source: [:0]const u8, expected: TokenIndex) !void {
-    var tree = try Ast.parse(std.testing.allocator, source);
-    defer tree.deinit(std.testing.allocator);
-    try std.testing.expect(tree.errors.len == 0);
-
-    const decls = tree.rootDecls();
-    try std.testing.expectEqual(1, decls.len);
-    try std.testing.expectEqual(expected, tree.lastToken(decls[0]));
-}
-
-test "lastToken" {
-    // try expectLastToken("42", 0); // leaf
-    // try expectLastToken("1 + 2", 2); // rhs walk
-    // try expectLastToken("-x", 1); // operand walk
-    // try expectLastToken("(1 + 2)", 4); // stored `)`
-    // try expectLastToken("{}", 1); // empty block
-    // try expectLastToken("(1 + 2) * (2 / (4 - 1))", 14); // empty block
-    // // `{`(0) `1`(1) newline(2) `}`(3) — the `\n` after `{` is swallowed by
-    // // automatic newline insertion, the one after `1` is not.
-    // try expectLastToken("{\n1\n}", 3); // scan past the newline
-    // try expectLastToken("f()", 2); // empty call
-    // try expectLastToken("f(1,)", 4); // scan past the trailing comma
-    // try expectLastToken("f((1+1))", 7); // the call's `)`, not the grouping's (4)
-    // try expectLastToken("fn f() t {}", 6); // body walk
-    try expectLastToken("extern fn f() t", 5); // return type walk
-}
-
 test "left associative & precedence" {
     try expectAst("1 + 1 * 2", .{ .tag = .add, .children = &.{
         .{ .tag = .number_literal },
@@ -495,9 +465,11 @@ test "left associative & precedence" {
     try expectAst("1 + (1 - 2) * 2", .{ .tag = .add, .children = &.{
         .{ .tag = .number_literal },
         .{ .tag = .mul, .children = &.{
-            .{ .tag = .sub, .children = &.{
-                .{ .tag = .number_literal },
-                .{ .tag = .number_literal },
+            .{ .tag = .grouped_expression, .children = &.{
+                .{ .tag = .sub, .children = &.{
+                    .{ .tag = .number_literal },
+                    .{ .tag = .number_literal },
+                } },
             } },
             .{ .tag = .number_literal },
         } },

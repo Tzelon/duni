@@ -59,23 +59,27 @@ fn visit(self: *Print, node: Node.Index) !void {
             try self.visit(rhs);
         },
 
-        .block => for (tree.blockStatements(node)) |statement| {
-            try self.visit(statement);
+        .block => for (tree.blockExpressions(node)) |expression| {
+            try self.visit(expression);
         },
 
         .call => {
-            try self.visit(datas[i].node_and_extra[0]);
-            for (tree.callArgs(node)) |arg| {
+            const callee, const extra_index = datas[i].node_and_extra;
+            const call = tree.extraData(extra_index, Node.Call);
+            try self.visit(callee);
+            for (tree.extraDataSlice(.{ .start = call.args_start, .end = call.args_end }, Node.Index)) |arg| {
                 try self.visit(arg);
             }
         },
 
         .fn_proto => {
-            for (tree.fnProtoParams(node)) |param| {
+            const extra_index, const return_type = datas[i].extra_and_opt_node;
+            const proto = tree.extraData(extra_index, Node.FnProto);
+            for (tree.extraDataSlice(.{ .start = proto.params_start, .end = proto.params_end }, Node.Index)) |param| {
                 try self.visit(param);
             }
-            if (tree.fnProtoReturnType(node).unwrap()) |return_type| {
-                try self.visit(return_type);
+            if (return_type.unwrap()) |return_type_node| {
+                try self.visit(return_type_node);
             }
         },
     }

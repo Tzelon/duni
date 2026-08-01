@@ -155,26 +155,8 @@ pub fn nodeData(tree: *const Ast, node: Node.Index) Node.Data {
 
 pub fn blockExpressions(tree: *const Ast, node: Node.Index) []const Node.Index {
     assert(tree.nodeTag(node) == .block);
-    return tree.extraDataSlice(tree.nodeData(node).extra_range, Node.Index);
-}
-
-pub fn callArgs(tree: *const Ast, node: Node.Index) []const Node.Index {
-    assert(tree.nodeTag(node) == .call);
-    const args_index = tree.nodeData(node).node_and_extra[1];
-    return tree.extraDataSlice(tree.extraData(args_index, Node.SubRange), Node.Index);
-}
-
-/// The prototype's parameter type expression nodes. A parameter's name is
-/// the token before its type's first token.
-pub fn fnProtoParams(tree: *const Ast, node: Node.Index) []const Node.Index {
-    assert(tree.nodeTag(node) == .fn_proto);
-    const params_index = tree.nodeData(node).extra_and_opt_node[0];
-    return tree.extraDataSlice(tree.extraData(params_index, Node.SubRange), Node.Index);
-}
-
-pub fn fnProtoReturnType(tree: *const Ast, node: Node.Index) Node.OptionalIndex {
-    assert(tree.nodeTag(node) == .fn_proto);
-    return tree.nodeData(node).extra_and_opt_node[1];
+    const block = tree.extraData(tree.nodeData(node).extra, Node.Block);
+    return tree.extraDataSlice(.{ .start = block.expressions_start, .end = block.expressions_end }, Node.Index);
 }
 
 // Helpers extra data
@@ -346,7 +328,6 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
 
 pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
     var n = node;
-    std.debug.print(">>>>>> nodetag: {}\n", .{tree.nodeTag(n)});
     while (true) switch (tree.nodeTag(n)) {
         .root => return @intCast(tree.tokens.len - 1),
         .identifier, .string_literal, .number_literal => return tree.nodeMainToken(n),
@@ -376,12 +357,12 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
         },
 
         .fn_proto => {
-            if (tree.fnProtoReturnType(n).unwrap()) |return_type| {
-                n = return_type;
+            const extra_index, const return_type = tree.nodeData(n).extra_and_opt_node;
+            if (return_type.unwrap()) |return_type_node| {
+                n = return_type_node;
                 continue;
             }
             // No return type (recoverable error): the params `)` ends the proto.
-            const extra_index = tree.nodeData(n).extra_and_opt_node[0];
             return tree.extraData(extra_index, Node.FnProto).rparen;
         },
     };
@@ -440,8 +421,9 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
 
         // Children are the callee followed by the args.
         .call => {
-            const callee = tree.nodeData(node).node_and_extra[0];
-            const args = tree.callArgs(node);
+            const callee, const extra_index = tree.nodeData(node).node_and_extra;
+            const call = tree.extraData(extra_index, Node.Call);
+            const args = tree.extraDataSlice(.{ .start = call.args_start, .end = call.args_end }, Node.Index);
             try std.testing.expectEqual(expected.children.len, 1 + args.len);
             try expectNode(tree, callee, expected.children[0]);
             for (args, expected.children[1..]) |arg, expected_child| {
@@ -451,8 +433,10 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
 
         // Children are the param types followed by the return type, if any.
         .fn_proto => {
-            const params = tree.fnProtoParams(node);
-            const return_type = tree.fnProtoReturnType(node).unwrap();
+            const extra_index, const return_type_opt = tree.nodeData(node).extra_and_opt_node;
+            const proto = tree.extraData(extra_index, Node.FnProto);
+            const params = tree.extraDataSlice(.{ .start = proto.params_start, .end = proto.params_end }, Node.Index);
+            const return_type = return_type_opt.unwrap();
             const expected_len = params.len + @intFromBool(return_type != null);
             try std.testing.expectEqual(expected.children.len, expected_len);
             for (params, expected.children[0..params.len]) |param, expected_child| {
@@ -572,8 +556,9 @@ test "fn declaration" {
     // name precedes its type expression.
     const proto = tree.nodeData(decls[0]).node_and_node[0];
     try std.testing.expectEqualStrings("add", tree.tokenSlice(tree.nodeMainToken(proto) + 1));
-    const first_param = tree.fnProtoParams(proto)[0];
-    try std.testing.expectEqualStrings("x", tree.tokenSlice(tree.firstToken(first_param) - 1));
+    const proto_extra = tree.extraData(tree.nodeData(proto).extra_and_opt_node[0], Node.FnProto);
+    const params = tree.extraDataSlice(.{ .start = proto_extra.params_start, .end = proto_extra.params_end }, Node.Index);
+    try std.testing.expectEqualStrings("x", tree.tokenSlice(tree.firstToken(params[0]) - 1));
 }
 
 test "extern fn declaration" {

@@ -6,6 +6,35 @@ before implementation. Functions are the feature that ends the fold-only era —
 parameters are the first runtime values, so this arc eventually touches every
 stage.
 
+> **Update (2026-08-01): the AST-shape layer of this note is superseded.**
+> The open-form design below was implemented, then reversed with the general
+> move to Zig-style closed node tags (status note in `ast_structure.md`).
+> What stands today:
+>
+> - `fn_decl` — `node_and_node` {proto, body block}; main_token = `fn`.
+> - `fn_proto` — main_token = `fn`; the fn name is the token at
+>   `main_token + 1`, not a node. data = `extra_and_opt_node`
+>   {ExtraIndex → `Node.FnProto` {params_start, params_end, rparen},
+>   optional return-type node}. The params span holds the param *type
+>   expression* nodes only; a param's name is the token before its type's
+>   first token. The `params`/`param`/`ret` wrappers are gone.
+> - `extern fn` — a bare `fn_proto` decl (no body, no `extern_fn` node);
+>   the `extern` keyword is the token before the proto's `fn` (Zig's model).
+> - `call` — `node_and_extra` {callee node, ExtraIndex → `Node.Call`
+>   {args_start, args_end, rparen}}; main_token = `(`. Identifier callees
+>   only for now, checked in the parser (AstGen has no error reporting yet).
+> - The closing `)`/`}` are stored in the extra structs (`rparen`/`rbrace`,
+>   also `Node.Block`) so `lastToken` returns stored tokens or child answers,
+>   never derived offsets or scans — required for correct spans under error
+>   recovery (`{ + }` skips tokens no derivation can see).
+> - **The parser takes no InternPool** (`Ast.parse(gpa, source)`); names
+>   live in tokens and are interned by AstGen (`identAsString`). The
+>   macro/quote rationale in "Dynamic ops" moves to a later lowering stage
+>   rather than being the AST's shape.
+>
+> The Syntax, Multi-clause, Lowering plan, Extern semantics, and Staging
+> sections still stand. Stage A is done.
+
 ## Syntax
 
 ```duni
@@ -23,6 +52,9 @@ fn add(x number, y number) number {
 
 ## AST shape — mimic Elixir's `def`
 
+> **Superseded — see the update at the top.** Kept as the record of the
+> form-based design and its reasoning.
+
 Elixir:
 
 ```elixir
@@ -37,10 +69,11 @@ Duni, same idea in the DoD representation:
 
 ```
 form      op="fn"     main_token=`fn`      children: [proto, body]
-├─ form  op="add"    main_token=`add`      children: [param, param, ret]
-│   ├─ form  op="param"  main_token=`x`      children: [symbol x, symbol number]
-│   ├─ form  op="param"  main_token=`y`      children: [symbol y, symbol number]
-│   └─ form  op="ret"    main_token=`number` children: [symbol number]
+├─ form  op="add"    main_token=`add`      children: [params, ret]
+│   ├─ form  op="params"  main_token=`(`       children: [param, param]
+│   │   ├─ form  op="param"  main_token=`x`    children: [symbol x, symbol number]
+│   │   └─ form  op="param"  main_token=`y`    children: [symbol y, symbol number]
+│   └─ form  op="ret"     main_token=`number`  children: [symbol number]
 └─ block { form op="+" [symbol x, symbol y] }
 ```
 
@@ -56,14 +89,19 @@ form      op="fn"     main_token=`fn`      children: [proto, body]
   static `NullTerminatedString` entries, an identifier op is a dynamic
   string interned at parse time. See "Dynamic ops" below for the decision.
 - **Every proto child announces what it is — no positional decode rule.**
-  Params are `form{op="param"}`; the return type is `form{op="ret",
-  [typeExpr]}` with main_token at the type token. Consumers and macros match
-  on op, never on child index. The wrapper costs one node per function and
-  was chosen over a "last child is the ret type" positional rule because
-  the proto's tail is about to get crowded: literal patterns in param
-  position (multi-clause), guards (`when`), and a possibly-optional ret
-  type under inference would each have forced a new positional convention.
-  With wrappers, each future head element just gets its own op.
+  The proto has exactly two children: a `form{op="params"}` wrapper
+  (main_token at the `(`) holding the `form{op="param"}` pairs, and
+  `form{op="ret", [typeExpr]}` with main_token at the type token. Consumers
+  and macros match on op, never on child index. The wrappers cost a couple
+  of nodes per function and were chosen over positional rules ("last child
+  is the ret type") because the proto's tail is about to get crowded:
+  literal patterns in param position (multi-clause), guards (`when`), and a
+  possibly-optional ret type under inference would each have forced a new
+  positional convention. With wrappers, each future head element just gets
+  its own op. The params wrapper also keeps `parseParams` a self-contained
+  scratch-region owner in the parser — no cross-function appending contract.
+  If the return type is missing, the parser warns (recoverable) and emits a
+  one-child proto; AstGen detects the absent `ret` form structurally.
 - A param is a `form` with synthetic op `"param"`, children
   `[name symbol, type symbol]`, main_token at the name. There is no colon
   token to serve as a natural operator, and flattening pairs into the proto
@@ -71,6 +109,10 @@ form      op="fn"     main_token=`fn`      children: [proto, body]
 - The body is the existing block node — nothing new.
 
 ## Why not Zig's shape
+
+> **Superseded — the reversal adopted Zig's shape.** Duni now discards
+> names to tokens exactly as described below (one `fn_proto` variant with a
+> `FnProto` extra struct instead of Zig's four packed variants).
 
 Zig's fn AST is shaped by two forces Duni rejects:
 
@@ -86,12 +128,17 @@ Zig's fn AST is shaped by two forces Duni rejects:
   shape in the AST, so Duni stores names as symbols and the fn name as the
   proto's op — consciously paying nodes for homoiconicity.
 
-Closest thing Zig has to `form_dyn`: `builtin_call` — the operator (`@foo`)
+Closest thing Zig has to an open-operator form: `builtin_call` — the operator (`@foo`)
 is not a tag, it's recovered from the main token's text, and args live in
 `extra_data`. Zig allows that open-operator shape only for builtins; Duni
 makes it the universal rule.
 
 ## Dynamic ops — the InternPool is threaded into Parse
+
+> **Superseded — reversed with the form design.** The parser no longer
+> touches the InternPool; AstGen interns names from tokens. The quote/macro
+> argument below is real but now lands at the macro-expansion layer
+> (generated AST without tokens), not at parse time.
 
 **Decision: `Ast.parse` takes a `*InternPool`, and the parser interns
 identifier-derived ops (proto heads, call heads) at first sight.** The
@@ -149,7 +196,7 @@ Consequences recorded now, ahead of implementation:
 ## Lowering plan (Zig's pattern, Duni's machinery)
 
 - **Collector pass** (Zig's `scanContainer`, `AstGen.zig:12835`): scan all
-  top-level `fn` forms and register names into a `Namespace` scope *before*
+  top-level fn decls and register names into a `Namespace` scope *before*
   lowering any body. This is what makes forward references and mutual
   recursion work. Duplicate-name detection happens here (see multi-clause
   above). The parked `decl_val` instruction + `str_tok` data are for exactly
@@ -199,20 +246,14 @@ Proto, no body, newline-terminated.
   (`extern "wasi_snapshot_preview1" fn fd_write(...)`) is only ever needed
   for interfaces whose module name we don't control — WASI. That's a later,
   purely additive arc.
-- **AST shape:**
-
-  ```
-  form  op="extern_fn"  main_token=`extern`  children: [proto, module?]
-  ├─ form  op="print"  children: [param..., ret]   (same proto as fn)
-  └─ (optional str_lit — .none today, AstGen defaults to "host")
-  ```
-
-  The proto node is reused verbatim from `fn` — the collector, fn-type
-  interning, and call sites don't care which declaration form a name came
-  from. Extern gets its own operator instead of an optional body on `"fn"`,
-  keeping `"fn"` at exactly two children (Zig's precedent: extern fns
-  are proto-only `fn_proto` nodes, never `fn_decl`; Zig's `lib_name` string
-  is the import-module analog).
+- **AST shape** (updated with the reversal): a bare `fn_proto` decl, no
+  wrapper node — Zig's exact model (extern fns are proto-only `fn_proto`,
+  never `fn_decl`). The `extern` keyword is the token before the proto's
+  `fn`; `firstToken` reaches back over it. The collector, fn-type interning,
+  and call sites don't care which declaration form a name came from — a
+  root-level proto without a body *is* the extern declaration. When the
+  explicit module string arc lands, the string gets a slot in `Node.FnProto`
+  (Zig's `lib_name` is the analog); `.none` defaults to `"host"`.
 - **Lowering:** collector registers the name identically to `fn`; AstGen
   emits a fn-type-only decl and skips body lowering (Zig's exact split,
   `AstGen.zig:4052`); Sema interns the fn type, nothing to analyze; WatGen
@@ -230,9 +271,10 @@ see above; only the explicit module string is deferred.)
 
 ## Staging
 
-- **A — syntax.** Scanner: `keyword_fn`, `comma`. Parser: `parseFnDecl` in
-  the root loop, param list via `listToSpan`, call suffix at the Pratt `call`
-  precedence. Parser tests assert node structure.
+- **A — syntax. Done.** Scanner: `keyword_fn`, `comma`. Parser: fn decl /
+  extern fn / call suffix at the Pratt `call` precedence, plus
+  `grouped_expression` and the stored-closer spans. Parser tests assert
+  node structure.
 - **B — AstGen.** Namespace scope + collector, `func`/`param`/`call` Dir
   instructions, `decl_val` gets its producer, bodies as sub-bodies.
 - **B½ — extern end-to-end.** `extern fn print(x number) number` +

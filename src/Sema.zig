@@ -48,7 +48,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     defer sema.deinit();
 
     try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
-    const body = code.bodySlice(code.main_body_start, code.main_body_len);
+    const body = code.mainBody();
 
     try analyzeBody(&sema, ip, body);
 
@@ -95,6 +95,9 @@ fn analyzeBody(
             .str => try sema.dirStr(ip, inst_idx),
             .block => try sema.dirBlock(ip, inst_idx),
             .decl_val => unreachable,
+            // The module instruction is never inside a body; a nested-module
+            // mistake should trap here, not be skipped.
+            .extended => unreachable,
         };
 
         sema.inst_map.putAssumeCapacity(inst_idx, air_ref);
@@ -399,8 +402,10 @@ pub const CompileError = error{
 // Test helpers
 
 /// Build a `Dir` from hand-written instructions. `bin_extra` holds the callers'
-/// `Bin` payloads; the body (every instruction, in order) is appended after it,
-/// mirroring AstGen.generate's main-body layout.
+/// `Bin` payloads. The `module_decl` at index 0 is built here, so the test
+/// instructions start at index 1 (`instRef` accounts for the shift); its
+/// payload and body are appended after `bin_extra`, mirroring
+/// `AstGen.setModule`'s layout.
 fn buildTestDir(
     gpa: Allocator,
     insts: []const Dir.Inst,
@@ -409,19 +414,26 @@ fn buildTestDir(
 ) !Dir {
     var list: std.MultiArrayList(Dir.Inst) = .{};
     errdefer list.deinit(gpa);
+
+    try list.append(gpa, .{ .tag = .extended, .data = .{ .extended = .{
+        .opcode = .module_decl,
+        .small = @bitCast(Dir.Inst.ModuleDecl.Small{}),
+        .operand = @intCast(bin_extra.len),
+    } } });
     for (insts) |inst| try list.append(gpa, inst);
 
-    const extra = try gpa.alloc(u32, bin_extra.len + insts.len);
+    // extra: bin payloads, then ModuleDecl{src_node, body_len}, then the body.
+    const extra = try gpa.alloc(u32, bin_extra.len + 2 + insts.len);
     errdefer gpa.free(extra);
     @memcpy(extra[0..bin_extra.len], bin_extra);
-    for (0..insts.len) |i| extra[bin_extra.len + i] = @intCast(i);
+    extra[bin_extra.len] = 0; // ModuleDecl.src_node = .root
+    extra[bin_extra.len + 1] = @intCast(insts.len); // body_len
+    for (0..insts.len) |i| extra[bin_extra.len + 2 + i] = @intCast(i + 1);
 
     return .{
         .instructions = list.toOwnedSlice(),
         .extra = extra,
         .string_bytes = try gpa.dupe(u8, string_bytes),
-        .main_body_start = @intCast(bin_extra.len),
-        .main_body_len = @intCast(insts.len),
     };
 }
 
@@ -454,8 +466,10 @@ fn expectAnalyzed(
     try std.testing.expectEqual(try ip.get(gpa, expected), actual);
 }
 
+/// Ref to the i-th hand-written test instruction. `buildTestDir` prepends the
+/// `module_decl` at index 0, so test instruction `i` lives at index `i + 1`.
 fn instRef(i: u32) Dir.Inst.Ref {
-    return @as(Dir.Inst.Index, @enumFromInt(i)).toRef();
+    return @as(Dir.Inst.Index, @enumFromInt(i + 1)).toRef();
 }
 
 test "analyze int literal" {
@@ -600,23 +614,29 @@ test "analyze block" {
     // { 1\n 2 } — block evaluates to its last expression, not the first
     var list: std.MultiArrayList(Dir.Inst) = .{};
     defer list.deinit(gpa);
+    try list.append(gpa, .{ .tag = .extended, .data = .{ .extended = .{
+        .opcode = .module_decl,
+        .small = @bitCast(Dir.Inst.ModuleDecl.Small{}),
+        .operand = 3,
+    } } });
     try list.append(gpa, .{ .tag = .block, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } });
     try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
     try list.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
 
-    // extra[0] = body_len=2, extra[1]=%1, extra[2]=%2 (block body), extra[3]=%0 (main body)
-    const extra = try gpa.alloc(u32, 4);
-    extra[0] = 2; // body_len
-    extra[1] = 1; // %1
-    extra[2] = 2; // %2
-    extra[3] = 0; // main body: %0
+    // extra[0..3]: block payload — body_len=2, %2, %3
+    // extra[3..6]: ModuleDecl{src_node, body_len=1} + main body %1
+    const extra = try gpa.alloc(u32, 6);
+    extra[0] = 2; // block body_len
+    extra[1] = 2; // %2
+    extra[2] = 3; // %3
+    extra[3] = 0; // ModuleDecl.src_node = .root
+    extra[4] = 1; // ModuleDecl.body_len
+    extra[5] = 1; // main body: %1
 
     var dir: Dir = .{
         .instructions = list.toOwnedSlice(),
         .extra = extra,
         .string_bytes = try gpa.dupe(u8, &.{}),
-        .main_body_start = 3,
-        .main_body_len = 1,
     };
     defer dir.deinit(gpa);
 

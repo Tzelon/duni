@@ -1,21 +1,23 @@
 program -> declaration* EOF ;
 
 # *** Top level ***
-declaration -> testDecl | funDecl | comptimeDecl;
+declaration -> testDecl | funDecl | externDecl | comptimeDecl;
 
+
+externDecl -> "KEYWORD_extern" "KEYWORD_fn" IDENTIFIER "(" parameters? ")" typeExpr NEWLINE ;
 testDecl -> "KEYWORD_test" STRING? block ;
 comptimeDecl -> "KEYWORD_comptime" block ;
 funDecl -> "KEYWORD_fn" function ;
 function -> IDENTIFIER "(" parameters? ")" typeExpr block ;
-parameters -> IDENTIFIER ( paramDecl "," )*  paramDecl;
-paramDecl -> IDENTIFIER ":" typeExpr ; 
+parameters -> ( paramDecl "," )*  paramDecl;
+paramDecl -> IDENTIFIER typeExpr  
 typeExpr -> IDENTIFIER ;
 
 # *** Block level ***
 statement -> exprStmt | printStmt | returnStmt | ifStmt | block;
 
 # Not sure I want returnStmt
-returnStmt -> "return" expression? ";" ;
+returnStmt -> "return" expression? NEWLINE ;
 ifStmt -> "if" "(" expression ")" statement ( "else" statement )? ;
 
 block -> "{" statement* "}" ;

@@ -1,5 +1,16 @@
 # AST structure — homoiconic shape over a small Zig enum
 
+> **Status (2026-07-31): superseded.** This design was implemented and then
+> reversed: the AST now uses Zig-style closed per-construct `Node.Tag`s
+> (`add`, `assign`, `call`, `fn_decl`, `fn_proto`, `block`, ...) with compact
+> `Data` payloads, mirroring `lib/std/zig/Ast.zig`. The open-operator `form`
+> node is gone. Consequences: the parser no longer needs the InternPool
+> (names — fn name, param names, callee — are recovered from tokens,
+> Zig-style), and a future macro system must build its quoted-form
+> representation at a later lowering stage instead of reading it directly off
+> the AST. The rest of this note is kept as the record of the form-based
+> design and its rationale.
+
 This note covers the AST layout decision for Duni: why operators are *not* Zig
 enum variants, what the trade-offs look like in memory, and what the concrete
 node / form layout looks like in the DoD representation.
@@ -365,3 +376,64 @@ leaked across an abstraction boundary.
 A single `.form` whose `op` is always a `Node.Index` and the callee is a child
 node. Everything is a node, no `.form_dyn` split. Cost: an extra `symbol` node
 per named call (the Approach B math: ~1.3× nodes).
+
+## Rethinking (2026-07) — closed tags are more viable than this note claims
+
+Revisited while building `fn` declarations (the first construct where forms
+got genuinely fiddly: proto/params/ret wrappers, dynamic op interning). Two
+corrections to the argument above, then why the design stands anyway.
+
+### Correction 1: "End of design" is overstated
+
+The macro argument above attacks Zig-*verbatim* closed tags — where names
+live in the token stream. That version really is dead: macro-generated AST
+has no tokens, so token-resident names can't represent macro output. But a
+closed-tag AST that stores names as interned `StrId`s **in node data**
+(`.call` carries its callee handle, `.fn_decl` its name handle) doesn't have
+that problem. The InternPool-in-parser plumbing is needed either way.
+
+### Correction 2: the open universe is only unexpanded macro heads
+
+When does a head the compiler doesn't know actually appear in the tree? Only
+as an *unexpanded macro call* — and a macro call is syntactically just a
+call. One `.call` tag represents the entire open universe. After full
+expansion, every remaining head must be something the compiler understands —
+**a closed set of primitives, by definition**. Elixir works the same way: its
+special forms are a closed list, and the expander errors on unknown non-call
+heads. Elixir's uniform tuple exists so *macro authors* get uniform pattern
+matching — a property of the **quoted layer** (what macros see), which can be
+projected from either storage format:
+
+- forms → quoted: one generic walk, ~50 lines, finished forever
+- closed tags → quoted: a per-tag reflect arm + a per-tag reify arm, growing
+  with every primitive
+
+### The real residual trade
+
+| | forms (B′, current) | closed tags + StrId names |
+|---|---|---|
+| quote/reify | generic, written once | per-tag arms forever |
+| AstGen dispatch | op-handle compare + lookup | exhaustive `switch` — compiler-checked coverage |
+| new primitive form | static string + parse code | tag + parse code + reflect arm + reify arm |
+| representations in your head | one | two (storage tags ↔ quoted shapes) |
+
+### Performance (measured against the layouts above)
+
+Closed tags win, but not decisively: `1 + 2` is 13 B with inline children vs
+~29 B through the span (the Approach A vs B′ math, plus one dependent
+`extra_data` load per child access on walks). Dispatch is a wash (dense-u8
+jump table vs comptime-known u32 switch). Strings favor forms: Zig's
+`tokenSlice` *re-tokenizes source* every time a name is asked for; an
+interned op is a u32 compare forever. And parsing/AST walking is well under
+10% of compile time — Sema dominates. The specialise-hot-ops escape hatch
+(above, "Does any of it matter?") still caps the downside, and the quoted
+layer keeps macros uniform even over specialised tags.
+
+### Decision: stay with forms; revisit on evidence, not theory
+
+The forms parser is built, green, and tested. Both designs converge at the
+quoted layer, and the honest test arrives in AstGen: fn lowering is exactly
+where closed tags would shine (exhaustive switch vs op dispatch). If the
+op-dispatch style proves genuinely worse there, the conversion is bounded —
+only parser node construction and AstGen dispatch change; Dir, Sema, and
+WatGen never see the AST. Switch then, with evidence, if at all.

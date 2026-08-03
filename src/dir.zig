@@ -33,10 +33,6 @@ string_bytes: []u8,
 /// The first few indexes are reserved. See `ExtraIndex` for the values.
 extra: []u32,
 
-// TODO: temp until we have body tag
-main_body_start: u32,
-main_body_len: u32,
-
 /// These are untyped instructions generated from an Abstract Syntax Tree.
 /// The data here is immutable because it is possible to have multiple
 /// analyses on the same DIR happening at the same time.
@@ -76,13 +72,33 @@ pub const Inst = struct {
         /// A block of code, which return a value.
         /// Uses the `pl_node` union field. Payload is `Block`.
         block,
+
+        /// The DIR instruction tag is one of the `Extended` ones.
+        /// Uses the `extended` union field.
+        extended,
+    };
+
+    /// Rarer instructions are here; ones that do not fit in the 8-bit `Tag` enum.
+    /// `noreturn` instructions may not go here; they must be part of the main `Tag` enum.
+    pub const Extended = enum(u16) {
+        /// A module type definition. Contains references to DIR instructions for
+        /// the field types.
+        /// `operand` is payload index to `ModuleDecl`.
+        /// `small` is `ModuleDecl.Small`.
+        module_decl,
+
+        pub const InstData = struct {
+            opcode: Extended,
+            small: u16,
+            operand: u32,
+        };
     };
 
     /// The position of a DIR instruction within the `Dir` instructions array.
     pub const Index = enum(u32) {
-        /// DIR is structured so that the outermost "main" struct of any file
+        /// DIR is structured so that the outermost "main" module of any file
         /// is always at index 0.
-        main_struct_inst = 0,
+        main_module_inst = 0,
         _,
 
         pub fn toRef(i: Index) Inst.Ref {
@@ -95,7 +111,7 @@ pub const Inst = struct {
     };
 
     pub const OptionalIndex = enum(u32) {
-        main_struct_inst = 0,
+        main_module_inst = 0,
         none = std.math.maxInt(u32),
         _,
 
@@ -148,6 +164,10 @@ pub const Inst = struct {
     pub const Data = union {
         int: u64,
         float: f64,
+
+        /// Used for `Tag.extended`. The extended opcode determines the meaning
+        /// of the `small` and `operand` fields.
+        extended: Extended.InstData,
 
         /// Used for unary operators, with an AST node source location.
         un_node: struct {
@@ -213,6 +233,17 @@ pub const Inst = struct {
     pub const Block = struct {
         body_len: u32,
     };
+
+    /// This data is stored inside extra, with trailing operands according to `body_len`.
+    /// Each operand is an `Index`.
+    pub const ModuleDecl = struct {
+        /// This node provides a new absolute baseline node for all instructions within this struct.
+        src_node: Ast.Node.Index,
+        body_len: u32,
+        pub const Small = packed struct(u16) {
+            _: u16 = 0,
+        };
+    };
 };
 
 fn ExtraData(comptime T: type) type {
@@ -250,6 +281,16 @@ pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
 
 pub fn bodySlice(dir: Dir, start: usize, len: usize) []Inst.Index {
     return @ptrCast(dir.extra[start..][0..len]);
+}
+
+/// Returns the body of a module
+/// TODO(tzelon): this will change we might not allow body in module
+pub fn mainBody(dir: Dir) []const Inst.Index {
+    assert(dir.instructions.items(.tag)[0] == .extended);
+    const extended = dir.instructions.items(.data)[0].extended;
+    assert(extended.opcode == .module_decl);
+    const module = dir.extraData(Inst.ModuleDecl, extended.operand);
+    return dir.bodySlice(module.end, module.data.body_len);
 }
 
 pub const NullTerminatedString = enum(u32) {

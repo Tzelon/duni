@@ -30,12 +30,20 @@ string_bytes: ArrayList(u8) = .empty,
 /// Owns all scopes
 scope_arena: std.heap.ArenaAllocator,
 
+/// Used for temporary allocations; freed after AstGen is complete.
+/// The resulting DIR code has no references to anything in this arena.
+arena: Allocator,
+
 /// dedupe table of strings
 string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
 
 pub fn generate(gpa: Allocator, tree: Ast) !Dir {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
     var astgen = AstGen{
         .tree = &tree,
+        .arena = arena.allocator(),
         .gpa = gpa,
         .scope_arena = std.heap.ArenaAllocator.init(gpa),
     };
@@ -63,17 +71,8 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
         .instructions_top = 0,
     };
 
-    for (tree.rootDecls()) |statement| {
-        _ = try expr(&main_gd, statement);
-    }
-
-    const body = main_gd.instructionsSlice();
-    const main_body_start: u32 = @intCast(astgen.extra.items.len);
-    const main_body_len: u32 = @intCast(body.len);
-    try astgen.extra.ensureUnusedCapacity(gpa, main_body_len);
-    for (body) |idx| {
-        astgen.extra.appendAssumeCapacity(@intFromEnum(idx));
-    }
+    const module_ref = try rootModuleDecl(&main_gd, .root, tree.rootDecls());
+    assert(module_ref.toIndex().? == .main_module_inst);
 
     try astgen.extra.shrinkToLen(gpa);
     try astgen.string_bytes.shrinkToLen(gpa);
@@ -82,9 +81,61 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
         .instructions = astgen.instructions.toOwnedSlice(),
         .extra = astgen.extra.toOwnedSliceAssert(),
         .string_bytes = astgen.string_bytes.toOwnedSliceAssert(),
-        .main_body_start = main_body_start,
-        .main_body_len = main_body_len,
     };
+}
+
+fn rootModuleDecl(
+    gd: *GenDir,
+    node: Ast.Node.Index,
+    container_decl: []const Node.Index,
+) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const gpa = astgen.gpa;
+    const tree = astgen.tree;
+
+    const decl_inst = try gd.reserveInstructionIndex();
+
+    var namespace: Scope.Namespace = .{
+        .parent = gd.cursor.tip,
+        .node = node,
+        // .inst = decl_inst,
+        // .declaring_gd = gd,
+    };
+    defer namespace.deinit(gpa);
+
+    // TODO(tzelon) rephrase this comment
+    // The struct_decl instruction introduces a scope in which the decls of the struct
+    // are in scope, so that field types, alignments, and default value expressions
+    // can refer to decls within the struct itself.
+    var block_scope: GenDir = .{
+        // .parent = &namespace.base,
+        .decl_node_index = node,
+        .decl_line = gd.decl_line,
+        .cursor = .{ .tip = &namespace.base },
+        .astgen = astgen,
+        .instructions = gd.instructions,
+        .instructions_top = gd.instructions.items.len,
+    };
+    defer block_scope.unstack();
+
+    try astgen.scanContainer(&namespace, container_decl, .module);
+
+    // Declarations first, then the implicit main body: Sema walks the body
+    // in order, so every extern_func must precede the first call.
+    for (container_decl) |member| switch (tree.nodeTag(member)) {
+        .fn_proto => unreachable, // try externFnDecl(&block_scope, member),
+        .fn_decl => unreachable, // stage B
+        else => {},
+    };
+    for (container_decl) |member| switch (tree.nodeTag(member)) {
+        .fn_proto, .fn_decl => {},
+        else => _ = try expr(&block_scope, member),
+    };
+
+    try block_scope.setModule(decl_inst, .{ .src_node = node });
+
+    // block_scope.unstack();
+    return decl_inst.toRef();
 }
 
 fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -285,6 +336,9 @@ fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) 
     const astgen = gd.astgen;
     const name_str_index = try astgen.identAsString(ident_token);
     find_scope: switch (gd.cursor.tip.unwrap()) {
+        .namespace => |ns| {
+            continue :find_scope ns.parent.unwrap();
+        },
         .local_val => |local_val| {
             if (local_val.name == name_str_index) {
                 // rebinding pushes the newest binding nearest the tip, so first match IS the shadowing semantics.
@@ -453,6 +507,149 @@ fn reserveExtra(astgen: *AstGen, size: usize) Allocator.Error!u32 {
     return extra_index;
 }
 
+const ScanContainerResult = struct {
+    decls_len: u32,
+};
+
+/// Detects name conflicts for decls and fields, and populates `namespace.decls` with all named declarations.
+fn scanContainer(
+    astgen: *AstGen,
+    namespace: *Scope.Namespace,
+    members: []const Ast.Node.Index,
+    container_kind: enum { module },
+) !void {
+    const gpa = astgen.gpa;
+    const tree = astgen.tree;
+
+    var any_invalid_declarations = false;
+
+    // This type forms a linked list of source tokens declaring the same name.
+    const NameEntry = struct {
+        tok: Ast.TokenIndex,
+        /// Using a linked list here simplifies memory management, and is acceptable since
+        /// entries are only allocated in error situations. The entries are allocated into the AstGen arena.
+        next: ?*@This(),
+    };
+
+    //TODO(tzelon): replace sfba with bfa in next zig version
+    // The maps below are allocated into this BFA to avoid using the GPA for small namespaces.
+    // var bfa_buf: [512]u8 = undefined;
+    // var bfa_state: std.heap.stackFallback = .init(&bfa_buf, astgen.gpa);
+    // const bfa = bfa_state.allocator();
+    // The maps below are allocated into this SFBA to avoid using the GPA for small namespaces.
+    var sfba_state = std.heap.stackFallback(512, astgen.gpa);
+    const sfba = sfba_state.get();
+
+    var names: std.array_hash_map.Auto(Dir.NullTerminatedString, NameEntry) = .empty;
+    defer {
+        names.deinit(sfba);
+    }
+
+    var any_duplicates = false;
+    var decl_count: u32 = 0;
+    for (members) |member_node| {
+        const Kind = enum { decl };
+        const kind: Kind, const name_token = switch (tree.nodeTag(member_node)) {
+            .fn_proto,
+            .fn_decl,
+            => blk: {
+                decl_count += 1;
+                const ident = tree.nodeMainToken(member_node) + 1;
+                if (tree.tokenTag(ident) != .identifier) {
+                    std.log.err("missing function name", .{});
+                    // try astgen.appendErrorNode(member_node, "missing function name", .{});
+                    any_invalid_declarations = true;
+                    continue;
+                }
+                break :blk .{ .decl, ident };
+            },
+
+            // Statements: not declarations — they lower as the implicit
+            // main body, nothing to scan.
+            else => continue,
+        };
+
+        const name_str_index = try astgen.identAsString(name_token);
+
+        if (kind == .decl) {
+            // Put the name straight into `decls`, even if there are compile errors.
+            // This avoids incorrect "undeclared identifier" errors later on.
+            try namespace.decls.put(gpa, name_str_index, member_node);
+        }
+
+        {
+            const gop = try names.getOrPut(sfba, name_str_index);
+            const new_ent: NameEntry = .{
+                .tok = name_token,
+                .next = null,
+            };
+            if (gop.found_existing) {
+                var e = gop.value_ptr;
+                while (e.next) |n| e = n;
+                e.next = try astgen.arena.create(NameEntry);
+                e.next.?.* = new_ent;
+                any_duplicates = true;
+                continue;
+            } else {
+                gop.value_ptr.* = new_ent;
+            }
+        }
+
+        // const token_bytes = astgen.tree.tokenSlice(name_token);
+
+        find_scope: switch (namespace.parent.unwrap()) {
+            .local_val => |local_val| {
+                if (local_val.name == name_str_index) {
+                    std.log.err("declaration shadows", .{});
+                    // try astgen.appendErrorTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
+                    //     token_bytes, @tagName(local_val.id_cat),
+                    // }, &.{
+                    //     try astgen.errNoteTok(
+                    //         local_val.token_src,
+                    //         "previous declaration here",
+                    //         .{},
+                    //     ),
+                    // });
+                    any_invalid_declarations = true;
+                    break :find_scope;
+                }
+                continue :find_scope local_val.parent.unwrap();
+            },
+            .namespace => |ns| continue :find_scope ns.parent.unwrap(),
+            .top => break :find_scope,
+        }
+    }
+
+    if (!any_duplicates) {
+        if (any_invalid_declarations) return error.AnalysisFail;
+        return;
+        // return .{
+        //     .decls_len = decl_count,
+        //     .fields_len = @intCast(members.len - decl_count),
+        // };
+    }
+
+    for (names.keys(), names.values()) |_, first| {
+        if (first.next == null) continue;
+        // var notes: std.ArrayList(u32) = .empty;
+        var prev: NameEntry = first;
+        while (prev.next) |cur| : (prev = cur.*) {
+            std.log.err("duplicate name here", .{});
+            // try notes.append(astgen.arena, try astgen.errNoteTok(cur.tok, "duplicate name here", .{}));
+        }
+        // try notes.append(astgen.arena, try astgen.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
+        // const name_duped = try astgen.arena.dupe(u8, mem.span(astgen.nullTerminatedString(name)));
+
+        std.log.err("duplicate {s} member name", .{@tagName(container_kind)});
+        // try astgen.appendErrorTokNotes(first.tok, "duplicate {s} member name '{s}'", .{ @tagName(container_kind), name_duped }, notes.items);
+
+        any_invalid_declarations = true;
+    }
+
+    assert(any_invalid_declarations);
+    return error.AnalysisFail;
+}
+
 const primitive_instrs = std.StaticStringMap(Dir.Inst.Ref).initComptime(.{
     // .{ "bool", .bool_type },
     .{ "comptime_float", .comptime_float_type },
@@ -483,7 +680,7 @@ fn deinit(astgen: *AstGen, gpa: Allocator) void {
 
 /// This is a temporary structure; references to it are valid only
 /// while constructing a `Dir`.
-const GenDir = struct {
+pub const GenDir = struct {
     /// The containing decl AST node.
     decl_node_index: Ast.Node.Index,
     /// The containing decl line index, absolute.
@@ -568,6 +765,40 @@ const GenDir = struct {
         gd.unstack();
     }
 
+    fn setModule(gd: *GenDir, inst: Dir.Inst.Index, args: struct {
+        src_node: Ast.Node.Index,
+    }) !void {
+        const astgen = gd.astgen;
+        const gpa = astgen.gpa;
+
+        // Only the root module exists today.
+        assert(args.src_node == .root);
+
+        const body = gd.instructionsSlice();
+        const body_len: u32 = @intCast(body.len);
+
+        try astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Dir.Inst.ModuleDecl).@"struct".fields.len + body.len);
+
+        const payload_index = astgen.addExtraAssumeCapacity(Dir.Inst.ModuleDecl{
+            .src_node = args.src_node,
+            .body_len = body_len,
+        });
+
+        // if (body_len != 0) astgen.extra.appendAssumeCapacity(body_len);
+        for (body) |instruction| astgen.extra.appendAssumeCapacity(@intFromEnum(instruction));
+
+        astgen.instructions.set(@intFromEnum(inst), .{
+            .tag = .extended,
+            .data = .{ .extended = .{
+                .opcode = .module_decl,
+                .small = @bitCast(Dir.Inst.ModuleDecl.Small{}),
+                .operand = payload_index,
+            } },
+        });
+
+        gd.unstack();
+    }
+
     fn nodeIndexToRelative(gd: GenDir, node_index: Ast.Node.Index) Ast.Node.Offset {
         return gd.decl_node_index.toOffset(node_index);
     }
@@ -578,6 +809,17 @@ const GenDir = struct {
 
     fn srcToken(gd: GenDir) Ast.TokenIndex {
         return gd.astgen.tree.firstToken(gd.decl_node_index);
+    }
+
+    fn reserveInstructionIndex(gd: *GenDir) !Dir.Inst.Index {
+        const gpa = gd.astgen.gpa;
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+        try gd.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        gd.astgen.instructions.len += 1;
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index;
     }
 
     fn add(gd: *GenDir, inst: Dir.Inst) !Dir.Inst.Ref {
@@ -707,59 +949,66 @@ fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
 
 test "int literal" {
     try expect("42",
-        \\%0 = int(42)
+        \\%0 = module_decl(%1)
+        \\%1 = int(42)
         \\
     );
 }
 
 test "float literal" {
     try expect("3.14",
-        \\%0 = float(3.14)
+        \\%0 = module_decl(%1)
+        \\%1 = float(3.14)
         \\
     );
 }
 
 test "big int literal" {
     try expect("18446744073709551616", // 2^64, one past u64
-        \\%0 = int_big(18446744073709551616)
+        \\%0 = module_decl(%1)
+        \\%1 = int_big(18446744073709551616)
         \\
     );
 }
 
 test "string literal" {
     try expect("\"hello world\"",
-        \\%0 = str(hello world)
+        \\%0 = module_decl(%1)
+        \\%1 = str(hello world)
         \\
     );
 }
 
 test "simple binary op" {
     try expect("1 + 2",
-        \\%0 = int(1)
-        \\%1 = int(2)
-        \\%2 = add(%0, %1) node_offset:1:1 to :1:6
+        \\%0 = module_decl(%1, %2, %3)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = add(%1, %2) node_offset:1:1 to :1:6
         \\
     );
 
     try expect("1 + 2 * 5 / 10",
-        \\%0 = int(1)
-        \\%1 = int(2)
-        \\%2 = int(5)
-        \\%3 = mul(%1, %2) node_offset:1:5 to :1:10
-        \\%4 = int(10)
-        \\%5 = div(%3, %4) node_offset:1:5 to :1:15
-        \\%6 = add(%0, %5) node_offset:1:1 to :1:15
+        \\%0 = module_decl(%1, %2, %3, %4, %5, %6, %7)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = int(5)
+        \\%4 = mul(%2, %3) node_offset:1:5 to :1:10
+        \\%5 = int(10)
+        \\%6 = div(%4, %5) node_offset:1:5 to :1:15
+        \\%7 = add(%1, %6) node_offset:1:1 to :1:15
         \\
     );
 
     try expect("1 * (2 - 5) / 10",
-        \\%0 = int(1)
-        \\%1 = int(2)
-        \\%2 = int(5)
-        \\%3 = sub(%1, %2) node_offset:1:6 to :1:11
-        \\%4 = mul(%0, %3) node_offset:1:1 to :1:12
-        \\%5 = int(10)
-        \\%6 = div(%4, %5) node_offset:1:1 to :1:17
+        \\%0 = module_decl(%1, %2, %3, %4, %5, %6, %7)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = int(5)
+        \\%4 = sub(%2, %3) node_offset:1:6 to :1:11
+        \\%5 = mul(%1, %4) node_offset:1:1 to :1:12
+        \\%6 = int(10)
+        \\%7 = div(%5, %6) node_offset:1:1 to :1:17
         \\
     );
 }
@@ -767,22 +1016,25 @@ test "simple binary op" {
 test "negation" {
     // int literal: stored positive, sign is a negate instruction
     try expect("-5",
-        \\%0 = int(5)
-        \\%1 = negate(%0) node_offset:1:1 to :1:3
+        \\%0 = module_decl(%1, %2)
+        \\%1 = int(5)
+        \\%2 = negate(%1) node_offset:1:1 to :1:3
         \\
     );
     // float literal: sign folds into the constant, no negate
     try expect("-3.14",
-        \\%0 = float(-3.14)
+        \\%0 = module_decl(%1)
+        \\%1 = float(-3.14)
         \\
     );
     // non-literal operand: general path. The negate span includes the closing
     // paren via the grouped_expression's stored rparen.
     try expect("-(1 + 2)",
-        \\%0 = int(1)
-        \\%1 = int(2)
-        \\%2 = add(%0, %1) node_offset:1:3 to :1:8
-        \\%3 = negate(%2) node_offset:1:1 to :1:9
+        \\%0 = module_decl(%1, %2, %3, %4)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = add(%1, %2) node_offset:1:3 to :1:8
+        \\%4 = negate(%3) node_offset:1:1 to :1:9
         \\
     );
 }
@@ -797,7 +1049,8 @@ test "negative zero int is rejected" {
 
 test "bind expression" {
     try expect("x = 1",
-        \\%0 = int(1)
+        \\%0 = module_decl(%1)
+        \\%1 = int(1)
         \\
     );
 }
@@ -808,9 +1061,10 @@ test "bind lookup and rebinding" {
         \\x = x + 2
         \\x
     ,
-        \\%0 = int(1)
-        \\%1 = int(2)
-        \\%2 = add(%0, %1) node_offset:2:5 to :2:10
+        \\%0 = module_decl(%1, %2, %3)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = add(%1, %2) node_offset:2:5 to :2:10
         \\
     );
 }
@@ -820,27 +1074,30 @@ test "rebind rhs sees the previous binding" {
         \\x = 1
         \\x = x + 1
     ,
-        \\%0 = int(1)
+        \\%0 = module_decl(%1, %2, %3)
         \\%1 = int(1)
-        \\%2 = add(%0, %1) node_offset:2:5 to :2:10
+        \\%2 = int(1)
+        \\%3 = add(%1, %2) node_offset:2:5 to :2:10
         \\
     );
 }
 
 test "block" {
     try expect("{ 1 }",
-        \\%0 = block(%1) node_offset:1:1 to :1:6
-        \\%1 = int(1)
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:6
+        \\%2 = int(1)
         \\
     );
 
     try expect(
         \\{
-        \\  1 
+        \\  1
         \\}
     ,
-        \\%0 = block(%1) node_offset:1:1 to :1:2
-        \\%1 = int(1)
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:2
+        \\%2 = int(1)
         \\
     );
 }

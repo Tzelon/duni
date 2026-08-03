@@ -86,6 +86,9 @@ pub fn print(code: *const Dir, tree: ?*const Ast, w: *std.Io.Writer, gpa: Alloca
 }
 
 fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
+    // Extended instructions print their opcode, not the `extended` wrapper.
+    if (tag == .extended) return self.writeExtended(data);
+
     try self.w.print("{s}(", .{@tagName(tag)});
     switch (tag) {
         .int_big => try self.writeIntBig(data),
@@ -96,7 +99,27 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .decl_val => try self.writeStrTok(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),
         .block => try self.writeBlock(data),
+        .extended => unreachable,
     }
+}
+
+fn writeExtended(self: *Print, data: Dir.Inst.Data) !void {
+    const extended = data.extended;
+    try self.w.print("{s}(", .{@tagName(extended.opcode)});
+    switch (extended.opcode) {
+        .module_decl => try self.writeModuleDecl(),
+    }
+}
+
+fn writeModuleDecl(self: *Print) !void {
+    // Only the root module exists today, so `mainBody` (Dir's one payload
+    // decoder) is the body.
+    const body = self.code.mainBody();
+    for (body, 0..) |inst, i| {
+        if (i > 0) try self.w.writeAll(", ");
+        try self.writeRef(inst.toRef());
+    }
+    try self.w.writeAll(")");
 }
 
 fn writeBlock(self: *Print, data: Dir.Inst.Data) !void {

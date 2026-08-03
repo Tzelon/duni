@@ -1,5 +1,9 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
 const Dir = @import("../Dir.zig");
 const Ast = @import("../Ast.zig");
+const GenDir = @import("../AstGen.zig").GenDir;
 
 const Scope = @This();
 
@@ -14,6 +18,7 @@ pub fn cast(base: *Scope, comptime T: type) ?*T {
 
 pub fn parent(base: *Scope) ?*Scope {
     return switch (base.tag) {
+        .namespace => base.cast(Namespace).?.parent,
         .local_val => base.cast(LocalVal).?.parent,
         .top => null,
     };
@@ -34,11 +39,13 @@ pub const Cursor = struct {
 };
 
 pub const Unwrapped = union(Tag) {
+    namespace: *Namespace,
     local_val: *LocalVal,
     top: *Top,
 };
 
 pub const Tag = enum {
+    namespace,
     local_val,
     top,
 };
@@ -62,6 +69,34 @@ pub const LocalVal = struct {
     /// String table index.
     name: Dir.NullTerminatedString,
     id_cat: IdCat,
+};
+
+/// Represents a global scope that has any number of declarations in it.
+/// Each declaration has this as the parent scope.
+pub const Namespace = struct {
+    const base_tag: Tag = .namespace;
+    base: Scope = Scope{ .tag = base_tag },
+
+    /// Parents can be: `LocalVal`, `GenDir`, `Namespace`.
+    parent: *Scope,
+    /// Maps string table index to the source location of declaration,
+    /// for the purposes of reporting name shadowing compile errors.
+    decls: std.AutoHashMapUnmanaged(Dir.NullTerminatedString, Ast.Node.Index) = .empty,
+    node: Ast.Node.Index,
+    // inst: Dir.Inst.Index,
+    //
+    /// The astgen scope containing this namespace.
+    /// Only valid during astgen.
+    // declaring_gd: ?*GenDir,
+    //
+    // /// Set of captures used by this namespace.
+    // captures: std.array_hash_map.Auto(Zir.Inst.Capture, Zir.NullTerminatedString) = .empty,
+    //
+    pub fn deinit(self: *Namespace, gpa: Allocator) void {
+        self.decls.deinit(gpa);
+        // self.captures.deinit(gpa);
+        self.* = undefined;
+    }
 };
 
 pub const Top = struct {

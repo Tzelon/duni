@@ -101,6 +101,11 @@ pub const Inst = struct {
         /// Uses the `pl_tok` field. Token is the parameter name, payload is a `Param`.
         param,
 
+        /// Function call.
+        /// Uses the `pl_node` union field with payload `Call`.
+        /// AST node is the function call.
+        call,
+
         /// Returns a function type, or a function instance, depending on whether
         /// the body_len is 0. Calling convention is auto.
         /// Uses the `pl_node` union field. `payload_index` points to a `Func`.
@@ -410,6 +415,12 @@ pub const Inst = struct {
             body_len: u31,
             _: u1 = 0,
         };
+    };
+
+    /// Stored inside extra, with trailing arguments according to `args_len`.
+    pub const Call = struct {
+        args_len: u32,
+        callee: Ref,
     };
 };
 

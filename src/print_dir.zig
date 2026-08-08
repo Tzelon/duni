@@ -103,6 +103,7 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .declaration => try self.writeDeclaration(data),
         .func => try self.writeFunc(data),
         .param => try self.writeParam(data),
+        .call => try self.writeCall(data),
         .extended => unreachable,
     }
 }
@@ -249,8 +250,37 @@ fn writeStr(self: *Print, data: Dir.Inst.Data) !void {
 }
 
 fn writeStrTok(self: *Print, data: Dir.Inst.Data) !void {
-    const str = data.str.get(self.code);
+    const str = data.str_tok.get(self.code);
     try self.w.print("{s})", .{str});
+}
+
+fn writeCall(self: *Print, data: Dir.Inst.Data) !void {
+    // Call payload: { callee, args_len }, then `args_len` body end-offsets
+    // (each relative to the start of this trailing region), then the arg
+    // bodies. Body 0 begins just past the offset table; arg i's body ends at
+    // `offsets[i]`.
+    const payload_index = data.pl_node.payload_index;
+    const args_len = self.code.extra[payload_index];
+    const callee: Dir.Inst.Ref = @enumFromInt(self.code.extra[payload_index + 1]);
+
+    try self.writeRef(callee);
+
+    const table_start = payload_index + 2;
+    var body_start = args_len;
+    for (0..args_len) |i| {
+        const body_end = self.code.extra[table_start + i];
+        try self.w.writeAll(", {");
+        for (body_start..body_end) |j| {
+            if (j > body_start) try self.w.writeAll(", ");
+            const inst: Dir.Inst.Index = @enumFromInt(self.code.extra[table_start + j]);
+            try self.writeRef(inst.toRef());
+        }
+        try self.w.writeAll("}");
+        body_start = body_end;
+    }
+
+    try self.w.writeAll(")");
+    try self.writeSrcNode(data.pl_node.src_node);
 }
 
 fn writePlNodeBin(self: *Print, data: Dir.Inst.Data) !void {

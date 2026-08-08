@@ -432,6 +432,16 @@ pub const full = struct {
             };
         }
     };
+
+    pub const Call = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            lparen: TokenIndex,
+            fn_expr: Node.Index,
+            params: []const Node.Index,
+        };
+    };
 };
 
 pub fn fullFnProto(tree: Ast, node: Ast.Node.Index) full.FnProto {
@@ -479,6 +489,16 @@ pub fn fullFnProto(tree: Ast, node: Ast.Node.Index) full.FnProto {
     assert(tree.tokenTag(result.lparen) == .l_paren);
 
     return result;
+}
+
+pub fn fullCall(tree: Ast, node: Node.Index) full.Call {
+    const fn_expr, const extra_index = tree.nodeData(node).node_and_extra;
+    const params = tree.extraDataSlice(tree.extraData(extra_index, Node.SubRange), Node.Index);
+    return .{ .ast = .{
+        .lparen = tree.nodeMainToken(node),
+        .fn_expr = fn_expr,
+        .params = params,
+    } };
 }
 
 /// A node shape for structural test assertions: the expected tag plus the

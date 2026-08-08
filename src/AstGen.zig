@@ -114,8 +114,10 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             // Grouping is transparent to lowering: unwrap and go again.
             .grouped_expression => current_node = tree.nodeData(current_node).node_and_token[0],
 
+            .call => return callExpr(gd, current_node, tree.fullCall(current_node)),
+
             // Not lowered yet.
-            .root, .call, .fn_decl, .fn_proto => unreachable,
+            .root, .fn_decl, .fn_proto => unreachable,
         }
     }
 }
@@ -423,6 +425,60 @@ fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     return block_inst.toRef();
 }
 
+fn callExpr(
+    gd: *GenDir,
+    node: Ast.Node.Index,
+    call: Ast.full.Call,
+) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+
+    const callee = try expr(gd, call.ast.fn_expr);
+
+    const call_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
+    const call_inst = call_index.toRef();
+    try gd.astgen.instructions.append(astgen.gpa, undefined);
+    try gd.instructions.append(astgen.gpa, call_index);
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+
+    var scratch_index = scratch_top;
+    try astgen.scratch.resize(astgen.gpa, scratch_top + call.ast.params.len);
+
+    for (call.ast.params) |param_node| {
+        var arg_block = gd.makeSubBlock();
+        defer arg_block.unstack();
+
+        // `call_inst` is reused to provide the param type.
+        const arg_ref = try expr(&arg_block, param_node);
+        // const arg_ref = try fullBodyExpr(&arg_block, &arg_block.base, .{ .rl = .{ .coerced_ty = call_inst }, .ctx = .fn_arg }, param_node, .normal);
+        _ = try arg_block.addBreakWithSrcNode(.break_inline, call_index, arg_ref, param_node);
+
+        const body = arg_block.instructionsSlice();
+        try astgen.scratch.ensureUnusedCapacity(astgen.gpa, @intCast(body.len));
+        for (body) |inst| astgen.scratch.appendAssumeCapacity(@intFromEnum(inst));
+
+        astgen.scratch.items[scratch_index] = @intCast(astgen.scratch.items.len - scratch_top);
+        scratch_index += 1;
+    }
+
+    const payload_index = try addExtra(astgen, Dir.Inst.Call{ .callee = callee, .args_len = @intCast(call.ast.params.len) });
+
+    if (call.ast.params.len != 0) {
+        try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+    }
+
+    gd.astgen.instructions.set(@intFromEnum(call_index), .{
+        .tag = .call,
+        .data = .{ .pl_node = .{
+            .src_node = gd.nodeIndexToRelative(node),
+            .payload_index = payload_index,
+        } },
+    });
+
+    return call_inst;
+}
+
 fn fnProtoExpr(
     gd: *GenDir,
     node: Ast.Node.Index,
@@ -491,6 +547,12 @@ fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) 
     const name_str_index = try astgen.identAsString(ident_token);
     find_scope: switch (gd.cursor.tip.unwrap()) {
         .namespace => |ns| {
+            if (ns.decls.get(name_str_index)) |_| {
+                // A decl reference resolves by name; Sema binds it against the
+                // namespace. This is `decl_val`'s only producer.
+                return try gd.addStrTok(.decl_val, name_str_index, ident_token);
+            }
+
             continue :find_scope ns.parent.unwrap();
         },
         .local_val => |local_val| {
@@ -1396,7 +1458,7 @@ fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     var dir = try AstGen.generate(gpa, tree);
     defer dir.deinit(gpa);
 
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try Print.print(&dir, &tree, &w, gpa);
 
@@ -1570,6 +1632,27 @@ test "extern fn" {
         \\%5 = func(%2, ret_ty=f64_type) node_offset:1:1 to :1:33
         \\%6 = break_inline(%2, %5)
         \\%7 = break_inline(%1, %2)
+        \\
+    );
+}
+
+test "call" {
+    try expect(
+        \\extern fn print(x number) number
+        \\print(42)
+    ,
+        \\%0 = module_decl(%8, %9)
+        \\%1 = declaration()
+        \\%2 = block_inline(%4, %5, %6) node_offset:1:1 to :1:7
+        \\%3 = break_inline(%4, f64_type)
+        \\%4 = param(x, {%3})
+        \\%5 = func(%2, ret_ty=f64_type) node_offset:1:1 to :1:7
+        \\%6 = break_inline(%2, %5)
+        \\%7 = break_inline(%1, %2)
+        \\%8 = decl_val(print)
+        \\%9 = call(%8, {%10, %11}) node_offset:2:1 to :2:10
+        \\%10 = int(42)
+        \\%11 = break_inline(%9, %10)
         \\
     );
 }

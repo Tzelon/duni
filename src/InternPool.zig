@@ -48,6 +48,8 @@ pub const Index = enum(u32) {
     comptime_float_type,
     f64_type,
     string_type,
+    //TODO(tzelon): should duni have void_type?
+    void_type,
     /// `0` (comptime_int)
     zero,
     /// `1` (comptime_int)
@@ -109,6 +111,7 @@ pub const Key = union(enum) {
         comptime_float = @intFromEnum(Index.comptime_float_type),
         f64 = @intFromEnum(Index.f64_type),
         string = @intFromEnum(Index.string_type),
+        void = @intFromEnum(Index.void_type),
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
@@ -587,6 +590,7 @@ pub const static_keys: [static_len]Key = .{
     .{ .simple_type = .comptime_float },
     .{ .simple_type = .f64 },
     .{ .simple_type = .string },
+    .{ .simple_type = .void },
     .{ .int = .{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = 0 },

@@ -72,6 +72,39 @@ pub const Inst = struct {
         /// A block of code, which return a value.
         /// Uses the `pl_node` union field. Payload is `Block`.
         block,
+        /// A list of instructions which are analyzed in the parent context, without
+        /// generating a runtime block. Must terminate with an "inline" variant of
+        /// a noreturn instruction.
+        /// Uses the `pl_node` union field. Payload is `Block`.
+        block_inline,
+
+        /// Return a value from a block. This instruction is used as the terminator
+        /// of a `block_inline`. It allows using the return value from `Sema.analyzeBody`.
+        /// This instruction may also be used when it is known that there is only one
+        /// break instruction in a block, and the target block is the parent.
+        /// Uses the `break` union field.
+        break_inline,
+
+        /// This instruction may only ever appear in the list of declarations for a
+        /// namespace type, e.g. within a `module_decl` instruction. It represents a
+        /// single source declaration (`fn`), containing the name,
+        /// attributes, type, and value of the declaration.
+        /// Uses the `declaration` union field. Payload is `Declaration`.
+        declaration,
+
+        /// Declares a parameter of the current function. Used for:
+        /// * debug info
+        /// * checking shadowing against declarations in the current namespace
+        /// * parameter type expressions referencing other parameters
+        /// These occur in the block outside a function body (the same block as
+        /// contains the func instruction).
+        /// Uses the `pl_tok` field. Token is the parameter name, payload is a `Param`.
+        param,
+
+        /// Returns a function type, or a function instance, depending on whether
+        /// the body_len is 0. Calling convention is auto.
+        /// Uses the `pl_node` union field. `payload_index` points to a `Func`.
+        func,
 
         /// The DIR instruction tag is one of the `Extended` ones.
         /// Uses the `extended` union field.
@@ -132,9 +165,12 @@ pub const Inst = struct {
         comptime_float_type,
         f64_type,
         string_type,
+        //TODO(tzelon): should duni have void_type?
+        void_type,
         zero,
         one,
         negative_one,
+
         /// This Ref does not correspond to any DIR instruction or constant
         /// value and may instead be used as a sentinel to indicate null.
         none = std.math.maxInt(u32),
@@ -186,7 +222,21 @@ pub const Inst = struct {
             payload_index: u32,
         },
 
+        pl_tok: struct {
+            /// Offset from Decl AST token index.
+            src_tok: Ast.TokenOffset,
+            /// index into extra.
+            /// `Tag` determines what lives there.
+            payload_index: u32,
+        },
+
         bin: Bin,
+
+        @"break": struct {
+            operand: Ref,
+            /// Index of a `Break` payload.
+            payload_index: u32,
+        },
 
         /// For strings which may contain null bytes.
         str: struct {
@@ -211,6 +261,13 @@ pub const Inst = struct {
                 return code.nullTerminatedString(self.start);
             }
         },
+
+        declaration: struct {
+            /// This node provides a new absolute baseline node for all instructions within this module.
+            src_node: Ast.Node.Index,
+            /// index into extra to a `Declaration` payload.
+            payload_index: u32,
+        },
     };
 
     // Make sure we don't accidentally add a field to make this union
@@ -221,6 +278,11 @@ pub const Inst = struct {
             assert(@sizeOf(Data) == 8);
         }
     }
+
+    pub const Break = struct {
+        operand_src_node: Ast.Node.OptionalOffset,
+        block_inst: Index,
+    };
 
     /// The meaning of these operands depends on the corresponding `Tag`.
     pub const Bin = struct {
@@ -234,6 +296,87 @@ pub const Inst = struct {
         body_len: u32,
     };
 
+    /// Trailing: inst: Index // for every body_len
+    pub const Param = struct {
+        /// Null-terminated string index.
+        name: NullTerminatedString,
+        type: Type,
+
+        pub const Type = packed struct(u32) {
+            /// The body contains the type of the parameter.
+            body_len: u31,
+            _: u1 = 0,
+        };
+    };
+
+    /// Trailing:
+    /// 0. name: NullTerminatedString      // if `flags.id.hasName()`
+    /// 1. lib_name: NullTerminatedString  // if `flags.id.hasLibName()`
+    /// 2. type_body_len: u32              // if `flags.id.hasTypeBody()`
+    /// 3. value_body_len: u32             // if `flags.id.hasValueBody()`
+    /// 4. type_body_inst: Zir.Inst.Index
+    ///    - for each `type_body_len`
+    ///    - body to be exited via `break_inline` to this `declaration` instruction
+    /// 5. value_body_inst: Zir.Inst.Index
+    ///    - for each `value_body_len`
+    ///    - body to be exited via `break_inline` to this `declaration` instruction
+    ///    - within this body, the `declaration` instruction refers to the resolved type from the type body
+    pub const Declaration = struct {
+        pub const Unwrapped = struct {
+            pub const Kind = enum {
+                @"const",
+                @"var",
+            };
+
+            pub const Linkage = enum {
+                normal,
+                @"extern",
+            };
+
+            src_node: Ast.Node.Index,
+
+            kind: Kind,
+            /// Always `.empty` for `kind` of `unnamed_test`, `.@"comptime"`
+            name: NullTerminatedString,
+            /// Always `.normal` for `kind != .@"const" and kind != .@"var"`.
+            linkage: Linkage,
+            /// Always `.empty` for `linkage != .@"extern"`.
+            lib_name: NullTerminatedString,
+
+            /// Always populated for `linkage == .@"extern".
+            type_body: ?[]const Inst.Index,
+            /// Always populated for `linkage != .@"extern".
+            value_body: ?[]const Inst.Index,
+        };
+
+        pub const Bodies = struct {
+            type_body: ?[]const Index,
+            value_body: ?[]const Index,
+        };
+
+        pub fn getBodies(declaration: Declaration, extra_end: u32, dir: Dir) Bodies {
+            var extra_index: u32 = extra_end;
+            const value_body_len = declaration.value_body_len;
+            const type_body_len: u32 = len: {
+                const len = dir.extra[extra_index];
+                extra_index += 1;
+                break :len len;
+            };
+            return .{
+                .type_body = if (type_body_len == 0) null else b: {
+                    const b = dir.bodySlice(extra_index, type_body_len);
+                    extra_index += type_body_len;
+                    break :b b;
+                },
+                .value_body = if (value_body_len == 0) null else b: {
+                    const b = dir.bodySlice(extra_index, value_body_len);
+                    extra_index += value_body_len;
+                    break :b b;
+                },
+            };
+        }
+    };
+
     /// This data is stored inside extra, with trailing operands according to `body_len`.
     /// Each operand is an `Index`.
     pub const ModuleDecl = struct {
@@ -242,6 +385,30 @@ pub const Inst = struct {
         body_len: u32,
         pub const Small = packed struct(u16) {
             _: u16 = 0,
+        };
+    };
+
+    /// Trailing:
+    /// if (ret_ty.body_len == 1) {
+    ///   0. return_type: Ref
+    /// }
+    /// if (ret_ty.body_len > 1) {
+    ///   1. return_type: Index // for each ret_ty.body_len
+    /// }
+    /// 2. body: Index // for each body_len
+    pub const Func = struct {
+        ret_ty: RetTy,
+        /// Points to the block that contains the param instructions for this function.
+        /// If this is a `declaration`, it refers to the declaration's value body.
+        param_block: Index,
+        body_len: u32,
+
+        pub const RetTy = packed struct(u32) {
+            /// 0 means `void`.
+            /// 1 means the type is a simple `Ref`.
+            /// Otherwise, the length of a trailing body.
+            body_len: u31,
+            _: u1 = 0,
         };
     };
 };

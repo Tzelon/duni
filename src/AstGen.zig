@@ -4,10 +4,14 @@ const AstGen = @This();
 
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
+const full = Ast.full;
 
 const Dir = @import("Dir.zig");
 
 const Scope = @import("AstGen/Scope.zig");
+
+const WipDecls = @import("AstGen/scratch.zig").WipDecls;
+const Scratch = @import("AstGen/scratch.zig").Scratch;
 
 const std = @import("std");
 const log = std.log.scoped(.astgen);
@@ -26,6 +30,9 @@ instructions: std.MultiArrayList(Dir.Inst) = .{},
 extra: ArrayList(u32) = .empty,
 
 string_bytes: ArrayList(u8) = .empty,
+
+/// Used for temporary storage when building payloads.
+scratch: std.ArrayList(u32) = .empty,
 
 /// Owns all scopes
 scope_arena: std.heap.ArenaAllocator,
@@ -84,60 +91,6 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     };
 }
 
-fn rootModuleDecl(
-    gd: *GenDir,
-    node: Ast.Node.Index,
-    container_decl: []const Node.Index,
-) InnerError!Dir.Inst.Ref {
-    const astgen = gd.astgen;
-    const gpa = astgen.gpa;
-    const tree = astgen.tree;
-
-    const decl_inst = try gd.reserveInstructionIndex();
-
-    var namespace: Scope.Namespace = .{
-        .parent = gd.cursor.tip,
-        .node = node,
-        // .inst = decl_inst,
-        // .declaring_gd = gd,
-    };
-    defer namespace.deinit(gpa);
-
-    // TODO(tzelon) rephrase this comment
-    // The struct_decl instruction introduces a scope in which the decls of the struct
-    // are in scope, so that field types, alignments, and default value expressions
-    // can refer to decls within the struct itself.
-    var block_scope: GenDir = .{
-        // .parent = &namespace.base,
-        .decl_node_index = node,
-        .decl_line = gd.decl_line,
-        .cursor = .{ .tip = &namespace.base },
-        .astgen = astgen,
-        .instructions = gd.instructions,
-        .instructions_top = gd.instructions.items.len,
-    };
-    defer block_scope.unstack();
-
-    try astgen.scanContainer(&namespace, container_decl, .module);
-
-    // Declarations first, then the implicit main body: Sema walks the body
-    // in order, so every extern_func must precede the first call.
-    for (container_decl) |member| switch (tree.nodeTag(member)) {
-        .fn_proto => unreachable, // try externFnDecl(&block_scope, member),
-        .fn_decl => unreachable, // stage B
-        else => {},
-    };
-    for (container_decl) |member| switch (tree.nodeTag(member)) {
-        .fn_proto, .fn_decl => {},
-        else => _ = try expr(&block_scope, member),
-    };
-
-    try block_scope.setModule(decl_inst, .{ .src_node = node });
-
-    // block_scope.unstack();
-    return decl_inst.toRef();
-}
-
 fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const tree = gd.astgen.tree;
 
@@ -165,6 +118,159 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             .root, .call, .fn_decl, .fn_proto => unreachable,
         }
     }
+}
+
+fn rootModuleDecl(
+    gd: *GenDir,
+    node: Ast.Node.Index,
+    container_decl: []const Node.Index,
+) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const gpa = astgen.gpa;
+    const tree = astgen.tree;
+
+    const decl_inst = try gd.reserveInstructionIndex();
+
+    var namespace: Scope.Namespace = .{
+        .parent = gd.cursor.tip,
+        .node = node,
+        // .inst = decl_inst,
+        // .declaring_gd = gd,
+    };
+    defer namespace.deinit(gpa);
+
+    // TODO(tzelon) rephrase this comment
+    // The struct_decl instruction introduces a scope in which the decls of the struct
+    // are in scope, so that field types, alignments, and default value expressions
+    // can refer to decls within the struct itself.
+    var block_scope: GenDir = .{
+        .decl_node_index = node,
+        .decl_line = gd.decl_line,
+        .cursor = .{ .tip = &namespace.base },
+        .astgen = astgen,
+        .instructions = gd.instructions,
+        .instructions_top = gd.instructions.items.len,
+    };
+    defer block_scope.unstack();
+
+    const scan_result = try astgen.scanContainer(&namespace, container_decl, .module);
+
+    var scratch: Scratch = .init(astgen);
+    defer scratch.reset();
+
+    // Replicate the structure of the DIR trailing data in `scratch`
+    var wip_decls: WipDecls = try .init(&scratch, scan_result.decls_len);
+
+    // Declarations first, then the implicit main body: Sema walks the body
+    // in order, so every extern_func must precede the first call.
+    for (container_decl) |member| switch (tree.nodeTag(member)) {
+        .fn_proto,
+        .fn_decl,
+        => {
+            const full_proto = if (tree.nodeTag(member) == .fn_decl)
+                tree.fullFnProto(tree.nodeData(member).node_and_node[0])
+            else
+                tree.fullFnProto(member);
+
+            const body: Ast.Node.OptionalIndex = if (tree.nodeTag(member) == .fn_decl)
+                tree.nodeData(member).node_and_node[1].toOptional()
+            else
+                .none;
+
+            const prev_decl_index = wip_decls.index;
+            astgen.fnDecl(&block_scope, &wip_decls, member, body, full_proto) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.AnalysisFail => {
+                    wip_decls.index = prev_decl_index;
+                    std.log.err("boooooom", .{});
+                    // try addFailedDeclaration(
+                    //     wip_decls,
+                    //     gz,
+                    //     .@"const",
+                    //     try astgen.identAsString(full.name_token.?),
+                    //     full.ast.proto_node,
+                    //     full.visib_token != null,
+                    // );
+                },
+            };
+        },
+        else => {},
+    };
+    for (container_decl) |member| switch (tree.nodeTag(member)) {
+        .fn_proto, .fn_decl => {},
+        else => _ = try expr(&block_scope, member),
+    };
+
+    try block_scope.setModule(decl_inst, .{ .src_node = node });
+
+    // block_scope.unstack();
+    return decl_inst.toRef();
+}
+
+fn fnDecl(
+    astgen: *AstGen,
+    gd: *GenDir,
+    wip_decls: *WipDecls,
+    decl_node: Ast.Node.Index,
+    body_node: Ast.Node.OptionalIndex,
+    fn_proto: Ast.full.FnProto,
+) InnerError!void {
+    const fn_name_token = fn_proto.name_token;
+
+    // We insert this at the beginning so that its instruction index marks the
+    // start of the top level declaration.
+    const decl_inst = try gd.makeDeclaration(fn_proto.ast.proto_node);
+    // store the decl_inst in scratch
+    wip_decls.nextDecl(decl_inst);
+
+    const is_extern = if (fn_proto.extern_token) |_| true else false;
+
+    if (body_node == .none) {
+        if (!is_extern) {
+            std.log.err("non-extern function has no body", .{});
+            // return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
+        }
+    }
+
+    //TODO(tzelon): extract the lib_name l:4013 in zig
+    const lib_name = .empty;
+
+    var type_gz: GenDir = .{
+        .decl_node_index = fn_proto.ast.proto_node,
+        // TODO(tzelon): should be something like .decl_line = astgen.source_line,
+        .decl_line = 0,
+        .cursor = .{ .tip = gd.cursor.tip },
+        .astgen = astgen,
+        .instructions = gd.instructions,
+        .instructions_top = gd.instructions.items.len,
+    };
+    defer type_gz.unstack();
+
+    if (is_extern) {
+        // We include a function *type*, not a value.
+        const type_inst = try fnProtoExpr(&type_gz, decl_node, fn_proto);
+        _ = try type_gz.addBreakWithSrcNode(.break_inline, decl_inst, type_inst, decl_node);
+    }
+
+    var value_gz = type_gz.makeSubBlock();
+    defer value_gz.unstack();
+
+    if (!is_extern) {
+        unreachable;
+        // We include a function *value*, not a type.
+        // astgen.restoreSourceCursor(saved_cursor);
+        // try astgen.fnDeclInner(&value_gz, &value_gz.base, saved_cursor, decl_inst, decl_node, body_node.unwrap().?, fn_proto);
+    }
+
+    try setDeclaration(decl_inst, .{
+        .kind = .@"const",
+        .name = try astgen.identAsString(fn_name_token),
+        .linkage = if (is_extern) .@"extern" else .normal,
+        .lib_name = lib_name,
+
+        .type_gd = &type_gz,
+        .value_gd = &value_gz,
+    });
 }
 
 const Sign = enum { negative, positive };
@@ -313,6 +419,54 @@ fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     }
 
     try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+fn fnProtoExpr(
+    gd: *GenDir,
+    node: Ast.Node.Index,
+    fn_proto: Ast.full.FnProto,
+) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const tree = gd.astgen.tree;
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const block_inst = try gd.makeBlockInst(.block_inline, node);
+
+    var param_type_i: usize = 0;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| : (param_type_i += 1) {
+        const param_type_node = param.type_expr.?;
+        var param_gd = block_scope.makeSubBlock();
+        defer param_gd.unstack();
+        const param_type = try comptimeExpr(&param_gd, param_type_node);
+        const param_inst_expected: Dir.Inst.Index = @enumFromInt(astgen.instructions.len + 1);
+        _ = try param_gd.addBreakWithSrcNode(.break_inline, param_inst_expected, param_type, param_type_node);
+        const name_token = param.name_token orelse tree.nodeMainToken(param_type_node);
+        const param_name = try astgen.identAsString(name_token);
+        const param_inst = try block_scope.addParam(&param_gd, .param, name_token, param_name);
+        assert(param_inst_expected == param_inst);
+    }
+
+    const ret_ty_node = fn_proto.ast.return_type.unwrap().?;
+    const ret_ty = try comptimeExpr(&block_scope, ret_ty_node);
+
+    const result = try block_scope.addFunc(.{
+        .src_node = fn_proto.ast.proto_node,
+
+        .ret_ref = ret_ty,
+        .ret_gd = null,
+
+        .param_block = block_inst,
+        .body_gd = null,
+    });
+
+    _ = try block_scope.addBreak(.break_inline, block_inst, result);
+    try block_scope.setBlockBody(block_inst);
+    try gd.instructions.append(astgen.gpa, block_inst);
 
     return block_inst.toRef();
 }
@@ -483,7 +637,7 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
 
             Dir.Inst.Ref,
             Dir.Inst.Index,
-            // Dir.NullTerminatedString,
+            Dir.NullTerminatedString,
             // Ast.TokenIndex is missing because it is a u32.
             Ast.Node.Index,
             => @intFromEnum(@field(extra, field.name)),
@@ -493,6 +647,8 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
             => @bitCast(@intFromEnum(@field(extra, field.name))),
 
             i32,
+            Dir.Inst.Func.RetTy,
+            Dir.Inst.Param.Type,
             => @bitCast(@field(extra, field.name)),
 
             else => @compileError("bad field type"),
@@ -507,9 +663,7 @@ fn reserveExtra(astgen: *AstGen, size: usize) Allocator.Error!u32 {
     return extra_index;
 }
 
-const ScanContainerResult = struct {
-    decls_len: u32,
-};
+const ScanContainerResult = struct { decls_len: u32, fields_len: u32 };
 
 /// Detects name conflicts for decls and fields, and populates `namespace.decls` with all named declarations.
 fn scanContainer(
@@ -517,7 +671,7 @@ fn scanContainer(
     namespace: *Scope.Namespace,
     members: []const Ast.Node.Index,
     container_kind: enum { module },
-) !void {
+) !ScanContainerResult {
     const gpa = astgen.gpa;
     const tree = astgen.tree;
 
@@ -622,11 +776,10 @@ fn scanContainer(
 
     if (!any_duplicates) {
         if (any_invalid_declarations) return error.AnalysisFail;
-        return;
-        // return .{
-        //     .decls_len = decl_count,
-        //     .fields_len = @intCast(members.len - decl_count),
-        // };
+        return .{
+            .decls_len = decl_count,
+            .fields_len = @intCast(members.len - decl_count),
+        };
     }
 
     for (names.keys(), names.values()) |_, first| {
@@ -664,6 +817,8 @@ const primitive_instrs = std.StaticStringMap(Dir.Inst.Ref).initComptime(.{
     // .{ "f16", .f16_type },
     // .{ "f32", .f32_type },
     .{ "f64", .f64_type },
+    .{ "number", .f64_type },
+    .{ "void", .void_type },
     // .{ "u32", .u32_type },
     // .{ "i32", .i32_type },
     // .{ "u64", .u64_type },
@@ -675,6 +830,7 @@ fn deinit(astgen: *AstGen, gpa: Allocator) void {
     astgen.extra.deinit(gpa);
     astgen.string_bytes.deinit(gpa);
     astgen.string_table.deinit(gpa);
+    astgen.scratch.deinit(gpa);
     astgen.scope_arena.deinit();
 }
 
@@ -715,6 +871,23 @@ pub const GenDir = struct {
             &[0]Dir.Inst.Index{}
         else
             self.instructions.items[self.instructions_top..];
+    }
+
+    fn instructionsSliceUpto(self: *const GenDir, stacked_gd: *GenDir) []Dir.Inst.Index {
+        return if (self.instructions_top == unstacked_top)
+            &[0]Dir.Inst.Index{}
+        else if (self.instructions == stacked_gd.instructions and stacked_gd.instructions_top != unstacked_top)
+            self.instructions.items[self.instructions_top..stacked_gd.instructions_top]
+        else
+            self.instructions.items[self.instructions_top..];
+    }
+
+    fn instructionsSliceUptoOpt(gd: *const GenDir, maybe_stacked_gd: ?*GenDir) []Dir.Inst.Index {
+        if (maybe_stacked_gd) |stacked_gd| {
+            return gd.instructionsSliceUpto(stacked_gd);
+        } else {
+            return gd.instructionsSlice();
+        }
     }
 
     /// Note that this returns a `Dir.Inst.Index` not a ref.
@@ -765,6 +938,82 @@ pub const GenDir = struct {
         gd.unstack();
     }
 
+    fn addBreak(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        block_inst: Dir.Inst.Index,
+        operand: Dir.Inst.Ref,
+    ) !Dir.Inst.Index {
+        const gpa = gd.astgen.gpa;
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+
+        const new_index = try gd.makeBreak(tag, block_inst, operand);
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index;
+    }
+
+    fn addBreakWithSrcNode(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        block_inst: Dir.Inst.Index,
+        operand: Dir.Inst.Ref,
+        operand_src_node: Ast.Node.Index,
+    ) !Dir.Inst.Index {
+        const gpa = gd.astgen.gpa;
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+
+        const new_index = try gd.makeBreakWithSrcNode(tag, block_inst, operand, operand_src_node);
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index;
+    }
+
+    fn makeBreak(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        block_inst: Dir.Inst.Index,
+        operand: Dir.Inst.Ref,
+    ) !Dir.Inst.Index {
+        return gd.makeBreakCommon(tag, block_inst, operand, null);
+    }
+
+    fn makeBreakWithSrcNode(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        block_inst: Dir.Inst.Index,
+        operand: Dir.Inst.Ref,
+        operand_src_node: Ast.Node.Index,
+    ) !Dir.Inst.Index {
+        return gd.makeBreakCommon(tag, block_inst, operand, operand_src_node);
+    }
+
+    fn makeBreakCommon(
+        gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        block_inst: Dir.Inst.Index,
+        operand: Dir.Inst.Ref,
+        operand_src_node: ?Ast.Node.Index,
+    ) !Dir.Inst.Index {
+        const gpa = gd.astgen.gpa;
+        try gd.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+        try gd.astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Dir.Inst.Break).@"struct".fields.len);
+
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        gd.astgen.instructions.appendAssumeCapacity(.{
+            .tag = tag,
+            .data = .{ .@"break" = .{
+                .operand = operand,
+                .payload_index = gd.astgen.addExtraAssumeCapacity(Dir.Inst.Break{
+                    .operand_src_node = if (operand_src_node) |src_node|
+                        gd.nodeIndexToRelative(src_node).toOptional()
+                    else
+                        .none,
+                    .block_inst = block_inst,
+                }),
+            } },
+        });
+        return new_index;
+    }
+
     fn setModule(gd: *GenDir, inst: Dir.Inst.Index, args: struct {
         src_node: Ast.Node.Index,
     }) !void {
@@ -797,6 +1046,21 @@ pub const GenDir = struct {
         });
 
         gd.unstack();
+    }
+
+    /// Note that this returns a `Dir.Inst.Index` not a ref.
+    /// Does *not* append the block instruction to the scope.
+    /// Leaves the `payload_index` field undefined. Use `setDeclaration` to finalize.
+    fn makeDeclaration(gd: *GenDir, node: Ast.Node.Index) !Dir.Inst.Index {
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        try gd.astgen.instructions.append(gd.astgen.gpa, .{
+            .tag = .declaration,
+            .data = .{ .declaration = .{
+                .src_node = node,
+                .payload_index = undefined,
+            } },
+        });
+        return new_index;
     }
 
     fn nodeIndexToRelative(gd: GenDir, node_index: Ast.Node.Index) Ast.Node.Offset {
@@ -927,7 +1191,199 @@ pub const GenDir = struct {
             } },
         });
     }
+
+    /// Supports `param_gd` stacked on `gd`. Assumes nothing stacked on `param_gd`. Unstacks `param_gd`.
+    fn addParam(
+        gd: *GenDir,
+        param_gd: *GenDir,
+        tag: Dir.Inst.Tag,
+        /// Absolute token index. This function does the conversion to Decl offset.
+        abs_tok_index: Ast.TokenIndex,
+        name: Dir.NullTerminatedString,
+    ) !Dir.Inst.Index {
+        const gpa = gd.astgen.gpa;
+        const param_body = param_gd.instructionsSlice();
+        try gd.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+        try gd.astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Dir.Inst.Param).@"struct".fields.len + param_body.len);
+
+        const payload_index = gd.astgen.addExtraAssumeCapacity(Dir.Inst.Param{
+            .name = name,
+            .type = .{
+                .body_len = @intCast(param_body.len),
+            },
+        });
+
+        for (param_body) |instruction| gd.astgen.extra.appendAssumeCapacity(@intFromEnum(instruction));
+        param_gd.unstack();
+
+        const new_index: Dir.Inst.Index = @enumFromInt(gd.astgen.instructions.len);
+        gd.astgen.instructions.appendAssumeCapacity(.{
+            .tag = tag,
+            .data = .{ .pl_tok = .{
+                .src_tok = gd.tokenIndexToRelative(abs_tok_index),
+                .payload_index = payload_index,
+            } },
+        });
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index;
+    }
+
+    /// Must be called with the following stack set up:
+    ///  * gd (bottom)
+    ///  * ret_gd
+    ///  * body_gd (top)
+    /// Unstacks all of those except for `gd`.
+    fn addFunc(
+        gd: *GenDir,
+        args: struct {
+            src_node: Ast.Node.Index,
+            lbrace_line: u32 = 0,
+            lbrace_column: u32 = 0,
+            param_block: Dir.Inst.Index,
+
+            ret_gd: ?*GenDir,
+            body_gd: ?*GenDir,
+
+            ret_ref: Dir.Inst.Ref,
+        },
+    ) !Dir.Inst.Ref {
+        assert(args.src_node != .root);
+        const astgen = gd.astgen;
+        const gpa = astgen.gpa;
+        //TODO(tzelon): should duni have void_type?
+        const ret_ref = if (args.ret_ref == .void_type) .none else args.ret_ref;
+        const new_index: Dir.Inst.Index = @enumFromInt(astgen.instructions.len);
+
+        try gd.instructions.ensureUnusedCapacity(gpa, 1);
+        try astgen.instructions.ensureUnusedCapacity(gpa, 1);
+
+        const body, const ret_body = bodies: {
+            var stacked_gd: ?*GenDir = null;
+            const body: []const Dir.Inst.Index = if (args.body_gd) |body_gd| body: {
+                const body = body_gd.instructionsSliceUptoOpt(stacked_gd);
+                stacked_gd = body_gd;
+                break :body body;
+            } else &.{};
+            const ret_body: []const Dir.Inst.Index = if (args.ret_gd) |ret_gd| body: {
+                const ret_body = ret_gd.instructionsSliceUptoOpt(stacked_gd);
+                stacked_gd = ret_gd;
+                break :body ret_body;
+            } else &.{};
+            break :bodies .{ body, ret_body };
+        };
+
+        const body_len = body.len;
+
+        const tag: Dir.Inst.Tag, const payload_index: u32 = inst_info: {
+            try astgen.extra.ensureUnusedCapacity(
+                gpa,
+                @typeInfo(Dir.Inst.Func).@"struct".fields.len + 1 +
+                    body_len + @intFromBool(ret_body.len > 0 or ret_ref != .none),
+            );
+
+            // FYI(tzelon): Duni does not support return body > 1
+            const ret_body_len = if (ret_body.len != 0) ret_body.len else @intFromBool(ret_ref != .none);
+
+            const payload_index = astgen.addExtraAssumeCapacity(Dir.Inst.Func{
+                .param_block = args.param_block,
+                .ret_ty = .{
+                    .body_len = @intCast(ret_body_len),
+                },
+                .body_len = @intCast(body_len),
+            });
+
+            if (ret_ref != .none) {
+                astgen.extra.appendAssumeCapacity(@intFromEnum(ret_ref));
+            }
+
+            break :inst_info .{ .func, payload_index };
+        };
+
+        // Order is important when unstacking.
+        if (args.body_gd) |body_gz| body_gz.unstack();
+        if (args.ret_gd) |ret_gz| ret_gz.unstack();
+
+        astgen.instructions.appendAssumeCapacity(.{
+            .tag = tag,
+            .data = .{ .pl_node = .{
+                .src_node = gd.nodeIndexToRelative(args.src_node),
+                .payload_index = payload_index,
+            } },
+        });
+        gd.instructions.appendAssumeCapacity(new_index);
+        return new_index.toRef();
+    }
 };
+
+//TODO(tzelon): should all comptime expression needs to go through this function?
+fn comptimeExpr(
+    gd: *GenDir,
+    node: Ast.Node.Index,
+) InnerError!Dir.Inst.Ref {
+    return expr(gd, node);
+}
+
+/// Sets all extra data for a `declaration` instruction.
+/// Unstacks `type_gd`, `linksection_gd`, and `value_gd`.
+fn setDeclaration(
+    decl_inst: Dir.Inst.Index,
+    args: struct {
+        kind: Dir.Inst.Declaration.Unwrapped.Kind,
+        name: Dir.NullTerminatedString,
+        linkage: Dir.Inst.Declaration.Unwrapped.Linkage,
+        lib_name: Dir.NullTerminatedString = .empty,
+
+        type_gd: *GenDir,
+        value_gd: *GenDir,
+    },
+) !void {
+    const astgen = args.value_gd.astgen;
+    const gpa = astgen.gpa;
+
+    const type_body = args.type_gd.instructionsSliceUptoOpt(null);
+    const value_body = args.value_gd.instructionsSlice();
+
+    const has_name = args.name != .empty;
+    const has_lib_name = args.lib_name != .empty;
+    const has_type_body = type_body.len != 0;
+    const has_value_body = value_body.len != 0;
+
+    const type_len = type_body.len;
+    const value_len = value_body.len;
+
+    const need_extra: usize =
+        @typeInfo(Dir.Inst.Declaration).@"struct".fields.len +
+        @as(usize, @intFromBool(has_name)) +
+        @as(usize, @intFromBool(has_lib_name)) +
+        @as(usize, @intFromBool(has_type_body)) +
+        @as(usize, @intFromBool(has_value_body)) +
+        type_len + value_len;
+
+    try astgen.extra.ensureUnusedCapacity(gpa, need_extra);
+
+    const extra: Dir.Inst.Declaration = .{};
+    astgen.instructions.items(.data)[@intFromEnum(decl_inst)].declaration.payload_index =
+        astgen.addExtraAssumeCapacity(extra);
+
+    if (has_name) {
+        astgen.extra.appendAssumeCapacity(@intFromEnum(args.name));
+    }
+    if (has_lib_name) {
+        astgen.extra.appendAssumeCapacity(@intFromEnum(args.lib_name));
+    }
+    if (has_type_body) {
+        astgen.extra.appendAssumeCapacity(@intCast(type_len));
+    }
+    if (has_value_body) {
+        astgen.extra.appendAssumeCapacity(@intCast(value_len));
+    }
+
+    for (type_body) |instruction| astgen.extra.appendAssumeCapacity(@intFromEnum(instruction));
+    for (value_body) |instruction| astgen.extra.appendAssumeCapacity(@intFromEnum(instruction));
+
+    args.value_gd.unstack();
+    args.type_gd.unstack();
+}
 
 fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     const Print = @import("print_dir.zig");
@@ -1098,6 +1554,22 @@ test "block" {
         \\%0 = module_decl(%1)
         \\%1 = block(%2) node_offset:1:1 to :1:2
         \\%2 = int(1)
+        \\
+    );
+}
+
+test "extern fn" {
+    try expect(
+        \\extern fn print(x number) number
+    ,
+        \\%0 = module_decl()
+        \\%1 = declaration()
+        \\%2 = block_inline(%4, %5, %6) node_offset:1:1 to :1:33
+        \\%3 = break_inline(%4, f64_type)
+        \\%4 = param(x, {%3})
+        \\%5 = func(%2, ret_ty=f64_type) node_offset:1:1 to :1:33
+        \\%6 = break_inline(%2, %5)
+        \\%7 = break_inline(%1, %2)
         \\
     );
 }

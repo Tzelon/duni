@@ -368,6 +368,119 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
     };
 }
 
+/// Fully assembled AST node information.
+pub const full = struct {
+    pub const FnProto = struct {
+        extern_token: ?TokenIndex,
+        lib_name: ?TokenIndex,
+        name_token: TokenIndex,
+        lparen: TokenIndex,
+        ast: Components,
+
+        pub const Components = struct {
+            proto_node: Node.Index,
+            fn_token: TokenIndex,
+            return_type: Node.OptionalIndex,
+            params: []const Node.Index,
+        };
+
+        pub const Param = struct {
+            name_token: ?TokenIndex,
+            type_expr: ?Node.Index,
+        };
+
+        pub fn firstToken(fn_proto: FnProto) TokenIndex {
+            return fn_proto.extern_token orelse
+                fn_proto.ast.fn_token;
+        }
+
+        /// iterate over the params and get the name token
+        pub const Iterator = struct {
+            tree: *const Ast,
+            fn_proto: *const FnProto,
+            /// next unconsumed index into fn_proto.ast.params
+            param_i: usize,
+
+            pub fn next(it: *Iterator) ?Param {
+                const tree = it.tree;
+                var name_token: ?TokenIndex = null;
+                if (it.param_i >= it.fn_proto.ast.params.len) {
+                    return null;
+                }
+                const param_type = it.fn_proto.ast.params[it.param_i];
+                it.param_i += 1;
+
+                while (true) {
+                    var tok_i = tree.firstToken(param_type) - 1;
+                    while (true) : (tok_i -= 1) switch (tree.tokenTag(tok_i)) {
+                        .identifier => name_token = tok_i,
+                        else => break,
+                    };
+                    return Param{
+                        .name_token = name_token,
+                        .type_expr = param_type,
+                    };
+                }
+            }
+        };
+
+        pub fn iterate(fn_proto: *const FnProto, tree: *const Ast) Iterator {
+            return .{
+                .tree = tree,
+                .fn_proto = fn_proto,
+                .param_i = 0,
+            };
+        }
+    };
+};
+
+pub fn fullFnProto(tree: Ast, node: Ast.Node.Index) full.FnProto {
+    assert(tree.nodeTag(node) == .fn_proto);
+
+    const extra_index, const return_type = tree.nodeData(node).extra_and_opt_node;
+    const extra = tree.extraData(extra_index, Node.FnProto);
+    const params = tree.extraDataSlice(.{ .start = extra.params_start, .end = extra.params_end }, Node.Index);
+    const fn_token = tree.nodeMainToken(node);
+
+    var result = full.FnProto{
+        .name_token = undefined,
+        .lparen = undefined,
+        .extern_token = null,
+        .lib_name = null,
+        .ast = .{
+            .params = params,
+            .return_type = return_type,
+            .fn_token = fn_token,
+            .proto_node = node,
+        },
+    };
+
+    // go backward and get the extern token if exists
+    var i = fn_token;
+    while (i > 0) {
+        i -= 1;
+        switch (tree.tokenTag(i)) {
+            .keyword_extern => result.extern_token = i,
+            .string_literal => result.lib_name = i,
+            else => break,
+        }
+    }
+
+    // go forward and get the function name and l_paren
+    const after_fn_token = fn_token + 1;
+    if (tree.tokenTag(after_fn_token) == .identifier) {
+        result.name_token = after_fn_token;
+        result.lparen = after_fn_token + 1;
+    } else {
+        std.log.err("missing function name", .{});
+        // TODO(tzelon): comptime time fail here. in Duni all functions must have names
+    }
+
+    assert(tree.tokenTag(result.lparen) == .l_paren);
+
+    return result;
+}
+
 /// A node shape for structural test assertions: the expected tag plus the
 /// expected shapes of the node's children in source order.
 const Expected = struct {
@@ -536,7 +649,7 @@ test "fn declaration" {
 test "extern fn declaration" {
     const gpa = std.testing.allocator;
 
-    var tree = try Ast.parse(gpa, "extern fn print(x number) number");
+    var tree = try Ast.parse(gpa, "extern fn print(x number) void");
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 

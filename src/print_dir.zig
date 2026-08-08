@@ -98,7 +98,11 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .str => try self.writeStr(data),
         .decl_val => try self.writeStrTok(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),
-        .block => try self.writeBlock(data),
+        .block, .block_inline => try self.writeBlock(data),
+        .break_inline => try self.writeBreak(data),
+        .declaration => try self.writeDeclaration(data),
+        .func => try self.writeFunc(data),
+        .param => try self.writeParam(data),
         .extended => unreachable,
     }
 }
@@ -130,6 +134,77 @@ fn writeBlock(self: *Print, data: Dir.Inst.Data) !void {
         const inst_idx: Dir.Inst.Index = @enumFromInt(self.code.extra[idx + 1 + i]);
         try self.writeRef(inst_idx.toRef());
     }
+    try self.w.writeAll(")");
+    try self.writeSrcNode(data.pl_node.src_node);
+}
+
+fn writeBreak(self: *Print, data: Dir.Inst.Data) !void {
+    // Break payload layout: { operand_src_node, block_inst }.
+    const payload_index = data.@"break".payload_index;
+    const block_inst: Dir.Inst.Index = @enumFromInt(self.code.extra[payload_index + 1]);
+    try self.writeRef(block_inst.toRef());
+    try self.w.writeAll(", ");
+    try self.writeRef(data.@"break".operand);
+    try self.w.writeAll(")");
+}
+
+fn writeDeclaration(self: *Print, data: Dir.Inst.Data) !void {
+    _ = data;
+    // TODO: decode the name and type/value bodies once the `Declaration` payload
+    // carries a flags word. Until then those fields are not decodable here.
+    try self.w.writeAll(")");
+}
+
+fn writeParam(self: *Print, data: Dir.Inst.Data) !void {
+    // Param payload: { name, type }, followed by `type.body_len` body instructions.
+    const payload_index = data.pl_tok.payload_index;
+    const name: Dir.NullTerminatedString = @enumFromInt(self.code.extra[payload_index]);
+    const param_type: Dir.Inst.Param.Type = @bitCast(self.code.extra[payload_index + 1]);
+
+    try self.w.print("{s}, {{", .{self.code.nullTerminatedString(name)});
+    const body_start = payload_index + 2;
+    for (0..param_type.body_len) |i| {
+        if (i > 0) try self.w.writeAll(", ");
+        const inst: Dir.Inst.Index = @enumFromInt(self.code.extra[body_start + i]);
+        try self.writeRef(inst.toRef());
+    }
+    try self.w.writeAll("})");
+}
+
+fn writeFunc(self: *Print, data: Dir.Inst.Data) !void {
+    // Func payload: { ret_ty, param_block, body_len }, then the trailing return
+    // type (per `ret_ty`) followed by `body_len` body instructions.
+    const payload_index = data.pl_node.payload_index;
+    const ret_ty: Dir.Inst.Func.RetTy = @bitCast(self.code.extra[payload_index]);
+    const param_block: Dir.Inst.Index = @enumFromInt(self.code.extra[payload_index + 1]);
+    const body_len = self.code.extra[payload_index + 2];
+    var extra_index = payload_index + 3;
+
+    try self.writeRef(param_block.toRef());
+
+    try self.w.writeAll(", ret_ty=");
+    switch (ret_ty.body_len) {
+        0 => try self.w.writeAll("void"),
+        1 => {
+            const ret_ref: Dir.Inst.Ref = @enumFromInt(self.code.extra[extra_index]);
+            extra_index += 1;
+            try self.writeRef(ret_ref);
+        },
+        // Duni never emits a multi-instruction return-type body.
+        else => unreachable,
+    }
+
+    if (body_len > 0) {
+        try self.w.writeAll(", body={");
+        for (0..body_len) |i| {
+            if (i > 0) try self.w.writeAll(", ");
+            const inst: Dir.Inst.Index = @enumFromInt(self.code.extra[extra_index]);
+            extra_index += 1;
+            try self.writeRef(inst.toRef());
+        }
+        try self.w.writeAll("}");
+    }
+
     try self.w.writeAll(")");
     try self.writeSrcNode(data.pl_node.src_node);
 }

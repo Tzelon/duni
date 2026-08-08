@@ -35,6 +35,46 @@ stage.
 > The Syntax, Multi-clause, Lowering plan, Extern semantics, and Staging
 > sections still stand. Stage A is done.
 
+> **Update (2026-08-08): extern fn + params lowered in AstGen — Zig-faithful
+> shape, not the `extern_func`/`call` single-instruction plan the old
+> Staging predicted.** The lowering follows Zig's `fnDecl` / `fnProtoExpr` /
+> `setDeclaration` / `addFunc` / `addParam` directly:
+>
+> - `rootModuleDecl` scans the container (`scanContainer` → `WipDecls` over a
+>   reusable `Scratch` region on `astgen.scratch`), lowers each
+>   `fn_proto`/`fn_decl` via `fnDecl`, then the implicit main body.
+> - **Extern = a body-less `fn_proto` → a function *type* only** (Zig's
+>   split): `fnDecl` emits a `declaration` envelope, and `fnProtoExpr`
+>   lowers each param (`addParam`, the param's type in its own
+>   `break_inline`-terminated sub-body) and the return type, then `addFunc`
+>   with `body_gd = null`. A non-extern body is still `unreachable`.
+> - **New DIR, mirroring ZIR:** `declaration` (envelope carrying optional
+>   type/value bodies), `func` (a *type* when `body_len == 0`), `param`
+>   (name + a type sub-body), and `block_inline`/`break_inline` (inline
+>   bodies exited by breaking to their block). Plus a `void_type` sentinel
+>   `Ref`/`Index` for "no return", a `pl_tok` data variant, and
+>   `number` → `.f64_type` in `primitive_instrs`.
+>
+> `extern fn print(x number) number` lowers as: a `declaration` whose
+> type-body is one `block_inline` holding the `param`, the `func`, and the
+> `break_inline` that yields the func. 21/21 AstGen tests green.
+>
+> **Call lowering done (2026-08-08):** `.call` in `expr` → `callExpr`. The
+> callee is lowered via `expr` (identifier → namespace hit → `decl_val` by
+> name); each arg is lowered into its own sub-block terminated by
+> `break_inline`, the arg bodies are staged through `astgen.scratch`, and a
+> `call` Dir instruction is emitted with `Call{callee, args_len}` plus the
+> trailing arg bodies. `extern fn print(x number) number` + `print(42)`
+> lowers to the expected DIR (test "call").
+>
+> **Not yet done, blocking end-to-end:** (1) `Sema.zig:86` is non-exhaustive
+> over the new tags (`block_inline`/`break_inline`/`declaration`/`param`/
+> `func`/`call`), so full `zig build test` doesn't build (AstGen tests pass
+> in isolation). (2) The `Declaration` payload has no flags word yet, so a
+> decl's name/linkage/bodies aren't decodable (print's `writeDeclaration`
+> is a stub); Zig's `Flags` (kind, linkage, has-name/-lib_name/-type_body/
+> -value_body) is the missing piece Sema needs to tell extern from normal.
+
 ## Syntax
 
 ```duni

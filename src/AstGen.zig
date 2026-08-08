@@ -163,8 +163,7 @@ fn rootModuleDecl(
     // Replicate the structure of the DIR trailing data in `scratch`
     var wip_decls: WipDecls = try .init(&scratch, scan_result.decls_len);
 
-    // Declarations first, then the implicit main body: Sema walks the body
-    // in order, so every extern_func must precede the first call.
+    // loop over decls
     for (container_decl) |member| switch (tree.nodeTag(member)) {
         .fn_proto,
         .fn_decl,
@@ -198,14 +197,29 @@ fn rootModuleDecl(
         },
         else => {},
     };
+    //loop over body
     for (container_decl) |member| switch (tree.nodeTag(member)) {
         .fn_proto, .fn_decl => {},
         else => _ = try expr(&block_scope, member),
     };
 
-    try block_scope.setModule(decl_inst, .{ .src_node = node });
+    const body = block_scope.instructionsSlice();
+    try astgen.scratch.ensureUnusedCapacity(astgen.gpa, body.len);
+    for (body) |body_inst| {
+        astgen.scratch.appendAssumeCapacity(@intFromEnum(body_inst));
+    }
 
-    // block_scope.unstack();
+    wip_decls.finish();
+
+    try block_scope.setModule(decl_inst, .{
+        .src_node = node,
+        .decls_len = scan_result.decls_len,
+        .body_len = @intCast(body.len),
+
+        .remaining = scratch.all().get(astgen),
+    });
+
+    block_scope.unstack();
     return decl_inst.toRef();
 }
 
@@ -726,7 +740,9 @@ fn reserveExtra(astgen: *AstGen, size: usize) Allocator.Error!u32 {
     return extra_index;
 }
 
-const ScanContainerResult = struct { decls_len: u32, fields_len: u32 };
+const ScanContainerResult = struct {
+    decls_len: u32,
+};
 
 /// Detects name conflicts for decls and fields, and populates `namespace.decls` with all named declarations.
 fn scanContainer(
@@ -841,7 +857,6 @@ fn scanContainer(
         if (any_invalid_declarations) return error.AnalysisFail;
         return .{
             .decls_len = decl_count,
-            .fields_len = @intCast(members.len - decl_count),
         };
     }
 
@@ -1079,6 +1094,11 @@ pub const GenDir = struct {
 
     fn setModule(gd: *GenDir, inst: Dir.Inst.Index, args: struct {
         src_node: Ast.Node.Index,
+        decls_len: u32,
+        body_len: u32,
+
+        /// The trailing declaration list, and body instructions.
+        remaining: []const u32,
     }) !void {
         const astgen = gd.astgen;
         const gpa = astgen.gpa;
@@ -1086,18 +1106,15 @@ pub const GenDir = struct {
         // Only the root module exists today.
         assert(args.src_node == .root);
 
-        const body = gd.instructionsSlice();
-        const body_len: u32 = @intCast(body.len);
-
-        try astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Dir.Inst.ModuleDecl).@"struct".fields.len + body.len);
+        try astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Dir.Inst.ModuleDecl).@"struct".fields.len + args.remaining.len);
 
         const payload_index = astgen.addExtraAssumeCapacity(Dir.Inst.ModuleDecl{
             .src_node = args.src_node,
-            .body_len = body_len,
+            .decls_len = args.decls_len,
+            .body_len = args.body_len,
         });
 
-        // if (body_len != 0) astgen.extra.appendAssumeCapacity(body_len);
-        for (body) |instruction| astgen.extra.appendAssumeCapacity(@intFromEnum(instruction));
+        astgen.extra.appendSliceAssumeCapacity(args.remaining);
 
         astgen.instructions.set(@intFromEnum(inst), .{
             .tag = .extended,
@@ -1107,8 +1124,6 @@ pub const GenDir = struct {
                 .operand = payload_index,
             } },
         });
-
-        gd.unstack();
     }
 
     /// Note that this returns a `Dir.Inst.Index` not a ref.

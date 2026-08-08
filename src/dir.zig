@@ -367,12 +367,14 @@ pub const Inst = struct {
         };
     };
 
-    /// This data is stored inside extra, with trailing operands according to `body_len`.
+    /// This data is stored inside extra, with trailing operands according to `decls_len`, and `body_len`.
     /// Each operand is an `Index`.
     pub const ModuleDecl = struct {
         /// This node provides a new absolute baseline node for all instructions within this struct.
         src_node: Ast.Node.Index,
+        decls_len: u32,
         body_len: u32,
+
         pub const Small = packed struct(u16) {
             _: u16 = 0,
         };
@@ -449,15 +451,29 @@ pub fn bodySlice(dir: Dir, start: usize, len: usize) []Inst.Index {
     return @ptrCast(dir.extra[start..][0..len]);
 }
 
-/// Returns the body of a module
 /// TODO(tzelon): this will change we might not allow body in module
-pub fn mainBody(dir: Dir) []const Inst.Index {
-    assert(dir.instructions.items(.tag)[0] == .extended);
-    const extended = dir.instructions.items(.data)[0].extended;
-    assert(extended.opcode == .module_decl);
-    const module = dir.extraData(Inst.ModuleDecl, extended.operand);
-    return dir.bodySlice(module.end, module.data.body_len);
+pub fn getModuleDecl(dir: Dir, module_decl: Inst.Index) UnwrappedModuleDecl {
+    const inst_data = dir.instructions.get(@intFromEnum(module_decl));
+    assert(inst_data.tag == .extended);
+    assert(inst_data.data.extended.opcode == .module_decl);
+
+    const extra = dir.extraData(Inst.ModuleDecl, inst_data.data.extended.operand);
+
+    var extra_index = extra.end;
+    const decls = dir.bodySlice(extra_index, extra.data.decls_len);
+    extra_index += extra.data.decls_len;
+    const body = dir.bodySlice(extra_index, extra.data.body_len);
+
+    return .{
+        .decls = decls,
+        .body = body,
+    };
 }
+
+const UnwrappedModuleDecl = struct {
+    body: []const Inst.Index,
+    decls: []const Inst.Index,
+};
 
 pub fn getDeclaration(dir: Dir, inst: Dir.Inst.Index) Inst.Declaration.Unwrapped {
     assert(dir.instructions.items(.tag)[@intFromEnum(inst)] == .declaration);

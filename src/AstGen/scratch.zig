@@ -40,7 +40,7 @@ pub const Scratch = struct {
     const Slice = struct {
         start: u32,
         len: u32,
-        fn get(s: Slice, astgen: *AstGen) []u32 {
+        pub fn get(s: Slice, astgen: *AstGen) []u32 {
             return astgen.scratch.items[s.start..][0..s.len];
         }
     };

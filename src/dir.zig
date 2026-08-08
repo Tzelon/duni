@@ -327,13 +327,15 @@ pub const Inst = struct {
     ///    - body to be exited via `break_inline` to this `declaration` instruction
     ///    - within this body, the `declaration` instruction refers to the resolved type from the type body
     pub const Declaration = struct {
+        flags: Flags,
+
         pub const Unwrapped = struct {
-            pub const Kind = enum {
+            pub const Kind = enum(u1) {
                 @"const",
                 @"var",
             };
 
-            pub const Linkage = enum {
+            pub const Linkage = enum(u1) {
                 normal,
                 @"extern",
             };
@@ -354,32 +356,15 @@ pub const Inst = struct {
             value_body: ?[]const Inst.Index,
         };
 
-        pub const Bodies = struct {
-            type_body: ?[]const Index,
-            value_body: ?[]const Index,
+        pub const Flags = packed struct(u32) {
+            kind: Unwrapped.Kind,
+            linkage: Unwrapped.Linkage,
+            has_name: bool,
+            has_lib_name: bool,
+            has_type_body: bool,
+            has_value_body: bool,
+            _: u26 = 0,
         };
-
-        pub fn getBodies(declaration: Declaration, extra_end: u32, dir: Dir) Bodies {
-            var extra_index: u32 = extra_end;
-            const value_body_len = declaration.value_body_len;
-            const type_body_len: u32 = len: {
-                const len = dir.extra[extra_index];
-                extra_index += 1;
-                break :len len;
-            };
-            return .{
-                .type_body = if (type_body_len == 0) null else b: {
-                    const b = dir.bodySlice(extra_index, type_body_len);
-                    extra_index += type_body_len;
-                    break :b b;
-                },
-                .value_body = if (value_body_len == 0) null else b: {
-                    const b = dir.bodySlice(extra_index, value_body_len);
-                    extra_index += value_body_len;
-                    break :b b;
-                },
-            };
-        }
     };
 
     /// This data is stored inside extra, with trailing operands according to `body_len`.
@@ -469,6 +454,54 @@ pub fn mainBody(dir: Dir) []const Inst.Index {
     assert(extended.opcode == .module_decl);
     const module = dir.extraData(Inst.ModuleDecl, extended.operand);
     return dir.bodySlice(module.end, module.data.body_len);
+}
+
+pub fn getDeclaration(dir: Dir, inst: Dir.Inst.Index) Inst.Declaration.Unwrapped {
+    assert(dir.instructions.items(.tag)[@intFromEnum(inst)] == .declaration);
+    const pl_node = dir.instructions.items(.data)[@intFromEnum(inst)].declaration;
+    const extra = dir.extraData(Inst.Declaration, pl_node.payload_index);
+
+    var extra_index = extra.end;
+
+    const name: NullTerminatedString = if (extra.data.flags.has_name) name: {
+        const name = dir.extra[extra_index];
+        extra_index += 1;
+        break :name @enumFromInt(name);
+    } else .empty;
+
+    const lib_name: NullTerminatedString = if (extra.data.flags.has_lib_name) lib_name: {
+        const lib_name = dir.extra[extra_index];
+        extra_index += 1;
+        break :lib_name @enumFromInt(lib_name);
+    } else .empty;
+
+    const type_body_len: u32 = if (extra.data.flags.has_type_body) len: {
+        const len = dir.extra[extra_index];
+        extra_index += 1;
+        break :len len;
+    } else 0;
+    const value_body_len: u32 = if (extra.data.flags.has_value_body) len: {
+        const len = dir.extra[extra_index];
+        extra_index += 1;
+        break :len len;
+    } else 0;
+
+    const type_body = dir.bodySlice(extra_index, type_body_len);
+    extra_index += type_body_len;
+    const value_body = dir.bodySlice(extra_index, value_body_len);
+    extra_index += value_body_len;
+
+    return .{
+        .src_node = pl_node.src_node,
+
+        .kind = extra.data.flags.kind,
+        .name = name,
+        .linkage = extra.data.flags.linkage,
+        .lib_name = lib_name,
+
+        .type_body = if (type_body_len == 0) null else type_body,
+        .value_body = if (value_body_len == 0) null else value_body,
+    };
 }
 
 pub const NullTerminatedString = enum(u32) {

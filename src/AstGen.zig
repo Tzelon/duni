@@ -711,6 +711,7 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
             i32,
             Dir.Inst.Func.RetTy,
             Dir.Inst.Param.Type,
+            Dir.Inst.Declaration.Flags,
             => @bitCast(@field(extra, field.name)),
 
             else => @compileError("bad field type"),
@@ -1386,7 +1387,7 @@ fn comptimeExpr(
 }
 
 /// Sets all extra data for a `declaration` instruction.
-/// Unstacks `type_gd`, `linksection_gd`, and `value_gd`.
+/// Unstacks `type_gd`, and `value_gd`.
 fn setDeclaration(
     decl_inst: Dir.Inst.Index,
     args: struct {
@@ -1423,7 +1424,15 @@ fn setDeclaration(
 
     try astgen.extra.ensureUnusedCapacity(gpa, need_extra);
 
-    const extra: Dir.Inst.Declaration = .{};
+    const extra: Dir.Inst.Declaration = .{ .flags = .{
+        .kind = args.kind,
+        .linkage = args.linkage,
+        .has_name = has_name,
+        .has_lib_name = has_lib_name,
+        .has_type_body = has_type_body,
+        .has_value_body = has_value_body,
+    } };
+
     astgen.instructions.items(.data)[@intFromEnum(decl_inst)].declaration.payload_index =
         astgen.addExtraAssumeCapacity(extra);
 

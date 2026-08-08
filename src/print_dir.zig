@@ -76,12 +76,67 @@ const LineColCursor = struct {
 
 pub fn print(code: *const Dir, tree: ?*const Ast, w: *std.Io.Writer, gpa: Allocator) !void {
     var printer = Print{ .w = w, .code = code, .tree = tree, .gpa = gpa };
+
+    // Each instruction's source offsets are relative to its owning declaration
+    // node. The linear walk can't tell which declaration an instruction belongs
+    // to, so precompute the baseline node per instruction.
+    const baselines = try printer.computeBaselines(gpa);
+    defer gpa.free(baselines);
+
     const tags = code.instructions.items(.tag);
     const datas = code.instructions.items(.data);
     for (tags, datas, 0..) |tag, data, i| {
+        printer.parent_decl_node = baselines[i];
         try printer.w.print("%{d} = ", .{i});
         try printer.writeInst(tag, data);
         try printer.w.writeByte('\n');
+    }
+}
+
+/// Assigns each instruction the declaration node its source offsets are relative
+/// to. Only `declaration` instructions shift the baseline; every instruction in
+/// a declaration's type/value body (transitively) is relative to that
+/// declaration's `src_node`. Everything else stays relative to `.root`.
+fn computeBaselines(self: *Print, gpa: Allocator) ![]Ast.Node.Index {
+    const baselines = try gpa.alloc(Ast.Node.Index, self.code.instructions.len);
+    @memset(baselines, .root);
+    for (self.code.instructions.items(.tag), 0..) |tag, i| {
+        if (tag != .declaration) continue;
+        const decl = self.code.getDeclaration(@enumFromInt(i));
+        if (decl.type_body) |b| self.markBody(baselines, b, decl.src_node);
+        if (decl.value_body) |b| self.markBody(baselines, b, decl.src_node);
+    }
+    return baselines;
+}
+
+/// Marks every instruction in `body` (and its nested sub-bodies) with `baseline`.
+fn markBody(self: *Print, baselines: []Ast.Node.Index, body: []const Dir.Inst.Index, baseline: Ast.Node.Index) void {
+    const tags = self.code.instructions.items(.tag);
+    const datas = self.code.instructions.items(.data);
+    for (body) |inst| {
+        baselines[@intFromEnum(inst)] = baseline;
+        switch (tags[@intFromEnum(inst)]) {
+            .block, .block_inline => {
+                const idx = datas[@intFromEnum(inst)].pl_node.payload_index;
+                const body_len = self.code.extra[idx];
+                self.markBody(baselines, self.code.bodySlice(idx + 1, body_len), baseline);
+            },
+            .param => {
+                const idx = datas[@intFromEnum(inst)].pl_tok.payload_index;
+                const ptype: Dir.Inst.Param.Type = @bitCast(self.code.extra[idx + 1]);
+                self.markBody(baselines, self.code.bodySlice(idx + 2, ptype.body_len), baseline);
+            },
+            .func => {
+                const idx = datas[@intFromEnum(inst)].pl_node.payload_index;
+                const ret_ty: Dir.Inst.Func.RetTy = @bitCast(self.code.extra[idx]);
+                const body_len = self.code.extra[idx + 2];
+                // `ret_ty.body_len` slots hold the return type (1 = a single Ref).
+                const body_start = idx + 3 + ret_ty.body_len;
+                self.markBody(baselines, self.code.bodySlice(body_start, body_len), baseline);
+            },
+            // `break_inline` and leaf instructions have no sub-body.
+            else => {},
+        }
     }
 }
 

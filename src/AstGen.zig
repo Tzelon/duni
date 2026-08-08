@@ -1652,10 +1652,10 @@ test "call" {
     ,
         \\%0 = module_decl(%8, %9)
         \\%1 = declaration()
-        \\%2 = block_inline(%4, %5, %6) node_offset:1:1 to :1:7
+        \\%2 = block_inline(%4, %5, %6) node_offset:1:1 to :1:33
         \\%3 = break_inline(%4, f64_type)
         \\%4 = param(x, {%3})
-        \\%5 = func(%2, ret_ty=f64_type) node_offset:1:1 to :1:7
+        \\%5 = func(%2, ret_ty=f64_type) node_offset:1:1 to :1:33
         \\%6 = break_inline(%2, %5)
         \\%7 = break_inline(%1, %2)
         \\%8 = decl_val(print)

@@ -432,6 +432,9 @@ pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
             Ast.Node.OptionalOffset,
             => @enumFromInt(@as(i32, @bitCast(code.extra[i]))),
 
+            Inst.Declaration.Flags,
+            => @bitCast(code.extra[i]),
+
             else => @compileError("bad field type"),
         };
         i += 1;

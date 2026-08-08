@@ -172,10 +172,21 @@ fn writeExtended(self: *Print, data: Dir.Inst.Data) !void {
 }
 
 fn writeModuleDecl(self: *Print) !void {
-    // Only the root module exists today, so `mainBody` (Dir's one payload
-    // decoder) is the body.
-    const body = self.code.mainBody();
-    for (body, 0..) |inst, i| {
+    // Only the root module exists today, so it always lives at index 0.
+    const module = self.code.getModuleDecl(.main_module_inst);
+
+    // Declarations first, as a distinct list, then the implicit main body.
+    if (module.decls.len > 0) {
+        try self.w.writeAll("decls={");
+        for (module.decls, 0..) |inst, i| {
+            if (i > 0) try self.w.writeAll(", ");
+            try self.writeRef(inst.toRef());
+        }
+        try self.w.writeAll("}");
+        if (module.body.len > 0) try self.w.writeAll(", ");
+    }
+
+    for (module.body, 0..) |inst, i| {
         if (i > 0) try self.w.writeAll(", ");
         try self.writeRef(inst.toRef());
     }

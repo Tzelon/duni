@@ -21,6 +21,16 @@ pub const Scratch = struct {
         s.* = undefined;
     }
 
+    pub fn appendBody(s: *Scratch, body: []const Dir.Inst.Index) Allocator.Error!u32 {
+        const len: u32 = @intCast(body.len);
+        try s.astgen.scratch.ensureUnusedCapacity(s.astgen.gpa, len);
+
+        for (body) |body_inst| {
+            s.astgen.scratch.appendAssumeCapacity(@intFromEnum(body_inst));
+        }
+        return len;
+    }
+
     pub fn addSlice(s: *Scratch, len: u32) Allocator.Error!Slice {
         const start: u32 = @intCast(s.astgen.scratch.items.len);
         try s.astgen.scratch.resize(s.astgen.gpa, start + len);

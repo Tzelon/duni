@@ -203,18 +203,14 @@ fn rootModuleDecl(
         else => _ = try expr(&block_scope, member),
     };
 
-    const body = block_scope.instructionsSlice();
-    try astgen.scratch.ensureUnusedCapacity(astgen.gpa, body.len);
-    for (body) |body_inst| {
-        astgen.scratch.appendAssumeCapacity(@intFromEnum(body_inst));
-    }
+    const body_len = try scratch.appendBody(block_scope.instructionsSlice());
 
     wip_decls.finish();
 
     try block_scope.setModule(decl_inst, .{
         .src_node = node,
         .decls_len = scan_result.decls_len,
-        .body_len = @intCast(body.len),
+        .body_len = body_len,
 
         .remaining = scratch.all().get(astgen),
     });
@@ -1648,7 +1644,7 @@ test "extern fn" {
     try expect(
         \\extern fn print(x number) number
     ,
-        \\%0 = module_decl()
+        \\%0 = module_decl(decls={%1})
         \\%1 = declaration()
         \\%2 = block_inline(%4, %5, %6) node_offset:1:1 to :1:33
         \\%3 = break_inline(%4, f64_type)
@@ -1665,7 +1661,7 @@ test "call" {
         \\extern fn print(x number) number
         \\print(42)
     ,
-        \\%0 = module_decl(%8, %9)
+        \\%0 = module_decl(decls={%1}, %8, %9)
         \\%1 = declaration()
         \\%2 = block_inline(%4, %5, %6) node_offset:1:1 to :1:33
         \\%3 = break_inline(%4, f64_type)

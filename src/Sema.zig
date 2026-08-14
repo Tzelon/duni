@@ -48,11 +48,11 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     defer sema.deinit();
 
     try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
-    const body = code.mainBody();
+    const module = code.getModuleDecl(.main_module_inst);
 
-    try analyzeBody(&sema, ip, body);
+    try analyzeBody(&sema, ip, module.body);
 
-    const last_indx = body[body.len - 1];
+    const last_indx = module.body[module.body.len - 1];
     const last_ref = sema.inst_map.get(last_indx).?;
 
     // The result type is inferred from the value until declarations carry
@@ -62,6 +62,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
         .int, .float => try sema.coerce(ip, .comptime_float_type, last_ref),
         .string => last_ref,
         .simple_type => unreachable, // no producer emits a type as a value
+        .func_type => unreachable,
     };
 
     try sema.instructions.append(sema.gpa, .{
@@ -98,6 +99,17 @@ fn analyzeBody(
             // The module instruction is never inside a body; a nested-module
             // mistake should trap here, not be skipped.
             .extended => unreachable,
+
+            // A declaration never appears inside a body — it lives in the module's
+            // decl list and is reached by name. (Zig: Sema.zig `.declaration => unreachable`.)
+            .declaration => unreachable,
+
+            // These occur only inside a declaration's type/value body, which Sema does
+            // not walk yet — S2 replaces these with real arms (reusing analyzeBody).
+            .param, .func, .block_inline, .break_inline => unreachable,
+
+            // Reachable through the pipeline (`print(42)`), but call analysis is S3.
+            .call => unreachable,
         };
 
         sema.inst_map.putAssumeCapacity(inst_idx, air_ref);
@@ -422,13 +434,15 @@ fn buildTestDir(
     } } });
     for (insts) |inst| try list.append(gpa, inst);
 
-    // extra: bin payloads, then ModuleDecl{src_node, body_len}, then the body.
-    const extra = try gpa.alloc(u32, bin_extra.len + 2 + insts.len);
+    // extra: bin payloads, then ModuleDecl{src_node, decls_len, body_len},
+    // then the body. These tests have no declarations, so decls_len = 0.
+    const extra = try gpa.alloc(u32, bin_extra.len + 3 + insts.len);
     errdefer gpa.free(extra);
     @memcpy(extra[0..bin_extra.len], bin_extra);
     extra[bin_extra.len] = 0; // ModuleDecl.src_node = .root
-    extra[bin_extra.len + 1] = @intCast(insts.len); // body_len
-    for (0..insts.len) |i| extra[bin_extra.len + 2 + i] = @intCast(i + 1);
+    extra[bin_extra.len + 1] = 0; // decls_len
+    extra[bin_extra.len + 2] = @intCast(insts.len); // body_len
+    for (0..insts.len) |i| extra[bin_extra.len + 3 + i] = @intCast(i + 1);
 
     return .{
         .instructions = list.toOwnedSlice(),
@@ -624,14 +638,15 @@ test "analyze block" {
     try list.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
 
     // extra[0..3]: block payload — body_len=2, %2, %3
-    // extra[3..6]: ModuleDecl{src_node, body_len=1} + main body %1
-    const extra = try gpa.alloc(u32, 6);
+    // extra[3..7]: ModuleDecl{src_node, decls_len=0, body_len=1} + main body %1
+    const extra = try gpa.alloc(u32, 7);
     extra[0] = 2; // block body_len
     extra[1] = 2; // %2
     extra[2] = 3; // %3
     extra[3] = 0; // ModuleDecl.src_node = .root
-    extra[4] = 1; // ModuleDecl.body_len
-    extra[5] = 1; // main body: %1
+    extra[4] = 0; // ModuleDecl.decls_len
+    extra[5] = 1; // ModuleDecl.body_len
+    extra[6] = 1; // main body: %1
 
     var dir: Dir = .{
         .instructions = list.toOwnedSlice(),

@@ -60,6 +60,27 @@ pub const Index = enum(u32) {
     /// Used by Air/Sema only.
     none = std.math.maxInt(u32),
     _,
+
+    /// An array of `Index` existing within the `extra` array.
+    /// This type exists to provide a struct with lifetime that is
+    /// not invalidated when items are added to the `InternPool`.
+    pub const Slice = struct {
+        start: u32,
+        len: u32,
+
+        pub const empty: Slice = .{ .start = 0, .len = 0 };
+
+        pub fn get(slice: Slice, ip: *const InternPool) []Index {
+            return @ptrCast(ip.extra.items[slice.start..][0..slice.len]);
+        }
+
+        /// If `slice` is empty (`slice.len == 0`), returns `.none`.
+        /// Otherwise, asserts that `index < slice.len`, and returns the value at `index`.
+        pub fn getOrNone(slice: Slice, ip: *const InternPool, index: usize) Index {
+            if (slice.len == 0) return .none;
+            return slice.get(ip)[index];
+        }
+    };
 };
 
 pub const Key = union(enum) {
@@ -67,6 +88,8 @@ pub const Key = union(enum) {
     int: Key.Int,
     float: Float,
     string: NullTerminatedString,
+
+    func_type: FuncType,
 
     pub const Int = struct {
         ty: Index,
@@ -103,6 +126,23 @@ pub const Key = union(enum) {
         };
     };
 
+    pub const FuncType = struct {
+        param_types: Index.Slice,
+        return_type: Index,
+
+        pub fn eql(a: FuncType, b: FuncType, ip: *const InternPool) bool {
+            return std.mem.eql(Index, a.param_types.get(ip), b.param_types.get(ip)) and
+                a.return_type == b.return_type;
+        }
+
+        pub fn hash(self: FuncType, hasher: *Hash, ip: *const InternPool) void {
+            for (self.param_types.get(ip)) |param_type| {
+                std.hash.autoHash(hasher, param_type);
+            }
+            std.hash.autoHash(hasher, self.return_type);
+        }
+    };
+
     /// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
     /// implement logic that only wants to deal with types because the logic can
     /// ignore all simple values. Note that technically, types are values.
@@ -115,7 +155,6 @@ pub const Key = union(enum) {
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
-        _ = ip;
         const asBytes = std.mem.asBytes;
         const KeyTag = @typeInfo(Key).@"union".tag_type.?;
         const seed = @intFromEnum(@as(KeyTag, key));
@@ -147,11 +186,16 @@ pub const Key = union(enum) {
             },
 
             .string => |str| Hash.hash(seed, asBytes(&str)),
+
+            .func_type => |func| {
+                var hasher = Hash.init(seed);
+                func.hash(&hasher, ip);
+                return hasher.final();
+            },
         };
     }
 
     pub fn eql(a: Key, b: Key, ip: *const InternPool) bool {
-        _ = ip;
         const KeyTag = @typeInfo(Key).@"union".tag_type.?;
         const a_tag: KeyTag = a;
         const b_tag: KeyTag = b;
@@ -208,6 +252,10 @@ pub const Key = union(enum) {
 
             .string => |a_info| {
                 return a_info == b.string;
+            },
+
+            .func_type => |a_info| {
+                return a_info.eql(b.func_type, ip);
             },
         }
     }
@@ -320,6 +368,8 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
         .string => |str| {
             ip.items.appendAssumeCapacity(.{ .tag = .string, .data = @intFromEnum(str) });
         },
+
+        .func_type => unreachable, // use getFuncType() instead
     }
 
     gop.key_ptr.* = new_index;
@@ -343,6 +393,55 @@ pub fn getString(ip: *InternPool, gpa: Allocator, slice: []const u8) Allocator.E
     ip.string_bytes.appendSliceAssumeCapacity(slice);
     ip.string_bytes.appendAssumeCapacity(0);
     ip.strings.appendAssumeCapacity(@intCast(ip.string_bytes.items.len));
+
+    gop.key_ptr.* = new_index;
+    return new_index;
+}
+
+pub fn getFuncType(
+    ip: *InternPool,
+    gpa: Allocator,
+    key: GetFuncTypeKey,
+) Allocator.Error!Index {
+    // Validate input parameters.
+    assert(key.return_type != .none);
+    for (key.param_types) |param_type| assert(param_type != .none);
+
+    try ip.items.ensureUnusedCapacity(gpa, 1);
+
+    // The strategy here is to add the function type unconditionally, then to
+    // ask if it already exists, and if so, revert the lengths of the mutated
+    // arrays. This is similar to what `getOrPutTrailingString` does.
+    const prev_extra_len = ip.extra.items.len;
+    const params_len: u32 = @intCast(key.param_types.len);
+
+    try ip.extra.ensureUnusedCapacity(gpa, @typeInfo(Tag.TypeFunction).@"struct".fields.len +
+        params_len);
+
+    const func_type_extra_index = addExtraAssumeCapacity(ip, Tag.TypeFunction{
+        .params_len = params_len,
+        .return_type = key.return_type,
+    });
+
+    ip.extra.appendSliceAssumeCapacity(@ptrCast(key.param_types));
+    errdefer ip.extra.items.len = prev_extra_len;
+
+    const adapter: Adapter = .{ .ip = ip };
+    const ctx: Context = .{ .ip = ip };
+    const func_ty_key: Key = .{ .func_type = extraFuncType(ip, func_type_extra_index) };
+
+    const gop = try ip.map.getOrPutContextAdapted(gpa, func_ty_key, adapter, ctx);
+
+    if (gop.found_existing) {
+        ip.extra.items.len = prev_extra_len;
+        return gop.key_ptr.*;
+    }
+
+    const new_index: Index = @enumFromInt(ip.items.len);
+    ip.items.appendAssumeCapacity(.{
+        .tag = .type_function,
+        .data = func_type_extra_index,
+    });
 
     gop.key_ptr.* = new_index;
     return new_index;
@@ -377,6 +476,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         } },
 
         .string => .{ .string = @enumFromInt(data) },
+
+        .type_function => .{ .func_type = extraFuncType(ip, data) },
     };
 }
 
@@ -479,6 +580,17 @@ fn extraData(ip: *const InternPool, comptime T: type, index: u32) T {
     return extraDataTrail(ip, T, index).data;
 }
 
+fn extraFuncType(ip: *const InternPool, extra_index: u32) Key.FuncType {
+    const type_function = extraDataTrail(ip, Tag.TypeFunction, extra_index);
+    return .{
+        .param_types = .{
+            .start = type_function.end,
+            .len = type_function.data.params_len,
+        },
+        .return_type = type_function.data.return_type,
+    };
+}
+
 /// Trailing: Limb for every limbs_len
 pub const Int = packed struct {
     ty: Index,
@@ -546,6 +658,12 @@ const Adapter = struct {
     }
 };
 
+/// This is equivalent to `Key.FuncType` but adjusted to have a slice for `param_types`.
+pub const GetFuncTypeKey = struct {
+    param_types: []const Index,
+    return_type: Index,
+};
+
 /// How many items in the InternPool are statically known.
 /// This is specified with an integer literal and a corresponding comptime
 /// assert below to break an unfortunate and arguably incorrect dependency loop
@@ -583,6 +701,15 @@ pub const Tag = enum(u8) {
     /// A string
     /// data is NullTerminatedString
     string,
+
+    /// A function body type.
+    /// `data` is extra index to `TypeFunction`.
+    type_function,
+
+    pub const TypeFunction = struct {
+        params_len: u32,
+        return_type: Index,
+    };
 };
 
 pub const static_keys: [static_len]Key = .{
@@ -644,6 +771,20 @@ test "InternPool getString dedups identical bytes" {
     try std.testing.expect(a != c);
     try std.testing.expectEqualStrings("foo", a.toSlice(&ip));
     try std.testing.expectEqualStrings("bar", c.toSlice(&ip));
+}
+
+test "InternPool getFuncType dedups" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const a = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    const b = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    // Differs from `a` only in a param type, so it must not dedup.
+    const c = try ip.getFuncType(gpa, .{ .param_types = &.{.string_type}, .return_type = .f64_type });
+    try std.testing.expect(a == b);
+    try std.testing.expect(a != c);
 }
 
 test "InternPool dedups string values" {

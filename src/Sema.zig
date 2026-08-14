@@ -116,9 +116,7 @@ fn analyzeBody(
             // decl list and is reached by name. (Zig: Sema.zig `.declaration => unreachable`.)
             .declaration => unreachable,
 
-            // These occur only inside a declaration's type/value body, which Sema does
-            // not walk yet — S2 replaces these with real arms (reusing analyzeBody).
-            .func => unreachable,
+            .func => try sema.dirFunc(ip, inst_idx),
 
             .param => try sema.dirParam(ip, inst_idx),
 
@@ -241,6 +239,41 @@ fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
     return sema.addStrLit(ip, try ip.getString(sema.gpa, bytes));
 }
 
+fn dirFunc(
+    sema: *Sema,
+    ip: *InternPool,
+    inst: Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.code.extraData(Dir.Inst.Func, inst_data.payload_index);
+
+    const extra_index = extra.end;
+
+    // Gather param types by walking `param_block` and reading each param's
+    // type out of `inst_map` (dirParam mapped param → type, and params are
+    // analyzed before this func in the same body). Zig instead accumulates
+    // into `block.params`; we re-derive order from the DIR (`param_block`).
+    const tags = sema.code.instructions.items(.tag);
+    const pb = sema.code.instructions.items(.data)[@intFromEnum(extra.data.param_block)].pl_node;
+    const pb_extra = sema.code.extraData(Dir.Inst.Block, pb.payload_index);
+    const param_body = sema.code.bodySlice(pb_extra.end, pb_extra.data.body_len);
+    var params: std.ArrayListUnmanaged(InternPool.Index) = .empty;
+    for (param_body) |p| {
+        if (tags[@intFromEnum(p)] != .param) continue;
+        try params.append(sema.arena, sema.inst_map.get(p).?.toInterned().?);
+    }
+
+    const ret_ty: InternPool.Index = switch (extra.data.ret_ty.body_len) {
+        0 => .void_type,
+        1 => sema.resolveInst(@enumFromInt(sema.code.extra[extra_index])).toInterned().?,
+        else => unreachable,
+    };
+
+    const fn_ty = try ip.getFuncType(sema.gpa, .{ .return_type = ret_ty, .param_types = params.items });
+
+    return .fromInterned(fn_ty);
+}
+
 fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
@@ -266,7 +299,7 @@ fn dirBlockInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileErr
     return sema.inst_map.get(body[body.len - 1]).?;
 }
 
-fn dirBreakInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) Air.Inst.Ref {
+fn dirBreakInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     _ = ip;
     // Linear single-break: the break's value is just its operand. No
     // error.ComptimeBreak unwinding (Zig's analyzeBodyInner).
@@ -796,4 +829,54 @@ test "analyze float division by zero fails analysis" {
 
         try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
     }
+}
+
+test "dirFunc builds a function type from its params and return type" {
+    // `extern fn f(x number) number`: dirFunc walks `param_block` for the param
+    // types (seeded in `inst_map` as dirParam would) and interns the func type.
+    const gpa = std.testing.allocator;
+
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    defer list.deinit(gpa);
+    // %0 = block_inline (the param_block), body = {%1}
+    try list.append(gpa, .{ .tag = .block_inline, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } });
+    // %1 = param (payload unused by dirFunc; its type comes from inst_map)
+    try list.append(gpa, .{ .tag = .param, .data = .{ .pl_tok = .{ .src_tok = @enumFromInt(0), .payload_index = 0 } } });
+    // %2 = func(param_block=%0, ret_ty=f64_type)
+    try list.append(gpa, .{ .tag = .func, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 2 } } });
+
+    // extra[0..2]: Block{body_len=1} + body %1
+    // extra[2..6]: Func{ret_ty, param_block=%0, body_len=0} + return-type ref
+    const extra = try gpa.alloc(u32, 6);
+    extra[0] = 1; // Block.body_len
+    extra[1] = 1; // block body: %1
+    extra[2] = @bitCast(Dir.Inst.Func.RetTy{ .body_len = 1 }); // 1 = a simple trailing Ref
+    extra[3] = 0; // Func.param_block = %0
+    extra[4] = 0; // Func.body_len = 0 (extern = type-only)
+    extra[5] = @intFromEnum(Dir.Inst.Ref.f64_type); // return-type ref
+
+    var dir: Dir = .{
+        .instructions = list.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = try gpa.dupe(u8, &.{}),
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var sema = Sema{ .gpa = gpa, .code = dir, .arena = arena.allocator() };
+    defer sema.deinit();
+
+    // Seed the param's resolved type in `inst_map`, as dirParam would.
+    try sema.inst_map.ensureSpaceForInstructions(gpa, &.{@enumFromInt(1)});
+    sema.inst_map.putAssumeCapacity(@enumFromInt(1), .f64_type);
+
+    const ref = try sema.dirFunc(&ip, @enumFromInt(2));
+
+    const expected = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    try std.testing.expectEqual(expected, ref.toInterned().?);
 }

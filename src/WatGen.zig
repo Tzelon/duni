@@ -115,6 +115,8 @@ fn resultType(gen: *const WatGen) []const u8 {
         // interned float; no int value can reach codegen.
         .int => unreachable,
         .simple_type => @panic("type as value not supported yet"),
+        .func_type => @panic("type as value not supported yet"),
+        .@"extern" => @panic("type as value not supported yet"),
     };
 }
 
@@ -147,6 +149,8 @@ fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
         // interned float; no int value can reach codegen.
         .int => unreachable,
         .simple_type => @panic("type as value not supported yet"),
+        .func_type => @panic("type as value not supported yet"),
+        .@"extern" => @panic("type as value not supported yet"),
         .string => |handle| {
             // (ptr, len) into linear memory; the data segment was emitted by
             // writeDataSection at the offset collectStrings assigned.

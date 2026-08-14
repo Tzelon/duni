@@ -12,6 +12,7 @@ const Dir = @import("Dir.zig");
 
 const string = @import("string.zig");
 const NullTerminatedString = string.NullTerminatedString;
+const OptionalNullTerminatedString = string.OptionalNullTerminatedString;
 
 // List of all constant items
 items: std.MultiArrayList(Item) = .empty,
@@ -89,6 +90,7 @@ pub const Key = union(enum) {
     float: Float,
     string: NullTerminatedString,
 
+    @"extern": Extern,
     func_type: FuncType,
 
     pub const Int = struct {
@@ -143,6 +145,17 @@ pub const Key = union(enum) {
         }
     };
 
+    pub const Extern = struct {
+        /// The name of the extern function; the wasm import's field name.
+        name: NullTerminatedString,
+        /// The extern function's type (its `func_type`).
+        ty: Index,
+        /// The wasm import's module name, if specified. `.none` defaults to
+        /// `"host"` (see notes/functions.md). For example `extern "wasi..." fn`
+        /// would carry the module string here.
+        lib_name: OptionalNullTerminatedString,
+    };
+
     /// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
     /// implement logic that only wants to deal with types because the logic can
     /// ignore all simple values. Note that technically, types are values.
@@ -186,6 +199,8 @@ pub const Key = union(enum) {
             },
 
             .string => |str| Hash.hash(seed, asBytes(&str)),
+
+            .@"extern" => |ext| Hash.hash(seed, asBytes(&ext)),
 
             .func_type => |func| {
                 var hasher = Hash.init(seed);
@@ -250,13 +265,11 @@ pub const Key = union(enum) {
                 }
             },
 
-            .string => |a_info| {
-                return a_info == b.string;
-            },
+            .string => |a_info| return a_info == b.string,
 
-            .func_type => |a_info| {
-                return a_info.eql(b.func_type, ip);
-            },
+            .@"extern" => |a_info| return std.meta.eql(a_info, b.@"extern"),
+
+            .func_type => |a_info| return a_info.eql(b.func_type, ip),
         }
     }
 };
@@ -369,6 +382,13 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
             ip.items.appendAssumeCapacity(.{ .tag = .string, .data = @intFromEnum(str) });
         },
 
+        .@"extern" => |ext| {
+            ip.items.appendAssumeCapacity(.{
+                .tag = .@"extern",
+                .data = try addExtra(ip, gpa, ext),
+            });
+        },
+
         .func_type => unreachable, // use getFuncType() instead
     }
 
@@ -477,6 +497,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
 
         .string => .{ .string = @enumFromInt(data) },
 
+        .@"extern" => .{ .@"extern" = extraData(ip, Key.Extern, data) },
+
         .type_function => .{ .func_type = extraFuncType(ip, data) },
     };
 }
@@ -541,6 +563,7 @@ fn addExtraAssumeCapacity(ip: *InternPool, item: anytype) u32 {
         ip.extra.appendAssumeCapacity(switch (field.type) {
             Index,
             NullTerminatedString,
+            OptionalNullTerminatedString,
             => @intFromEnum(@field(item, field.name)),
 
             u32,
@@ -561,6 +584,7 @@ fn extraDataTrail(ip: *const InternPool, comptime T: type, index: u32) struct { 
         @field(result, field.name) = switch (field.type) {
             Index,
             NullTerminatedString,
+            OptionalNullTerminatedString,
             => @enumFromInt(extra_item),
 
             u32,
@@ -706,6 +730,10 @@ pub const Tag = enum(u8) {
     /// `data` is extra index to `TypeFunction`.
     type_function,
 
+    /// An extern function (a host import).
+    /// `data` is extra index to `Key.Extern`.
+    @"extern",
+
     pub const TypeFunction = struct {
         params_len: u32,
         return_type: Index,
@@ -783,6 +811,24 @@ test "InternPool getFuncType dedups" {
     const b = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
     // Differs from `a` only in a param type, so it must not dedup.
     const c = try ip.getFuncType(gpa, .{ .param_types = &.{.string_type}, .return_type = .f64_type });
+    try std.testing.expect(a == b);
+    try std.testing.expect(a != c);
+}
+
+test "InternPool extern dedups" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const ty = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    const print = try ip.getString(gpa, "print");
+    const puts = try ip.getString(gpa, "puts");
+
+    const a = try ip.get(gpa, .{ .@"extern" = .{ .name = print, .ty = ty, .lib_name = .none } });
+    const b = try ip.get(gpa, .{ .@"extern" = .{ .name = print, .ty = ty, .lib_name = .none } });
+    // Differs from `a` only in the name, so it must not dedup.
+    const c = try ip.get(gpa, .{ .@"extern" = .{ .name = puts, .ty = ty, .lib_name = .none } });
     try std.testing.expect(a == b);
     try std.testing.expect(a != c);
 }

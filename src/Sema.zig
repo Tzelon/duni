@@ -63,6 +63,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
         .string => last_ref,
         .simple_type => unreachable, // no producer emits a type as a value
         .func_type => unreachable,
+        .@"extern" => unreachable,
     };
 
     try sema.instructions.append(sema.gpa, .{

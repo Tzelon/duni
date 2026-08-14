@@ -93,3 +93,49 @@ index**: intern the expected key, compare indexes. Key-level `expectEqual`
 is wrong twice over — big-int keys hold slices (pointer compare) and
 `-0.0 == 0.0` under `==` — index identity is exact for every value kind
 because dedup *is* equality.
+
+## Declaration resolution — the `decls` table (2026-08-14)
+
+Sema resolves declarations **eagerly, whole-program**: before analyzing the
+module body, it iterates `module.decls` and resolves each into a `decls` map
+(`Dir.NullTerminatedString` → `Air.Inst.Ref`). `.decl_val` is then a map
+lookup on `str_tok.start`. AstGen dedups identifiers, so a decl's name and a
+`decl_val`'s name are the *same* Dir string handle — the lookup is handle
+equality, no re-interning. The lookup's `.?` rests on AstGen guaranteeing
+declared identifiers (Zig's `lookupIdentifier` ends in `unreachable`).
+
+This is deliberately **not** Zig's lazy model. Zig: `scanNamespace`
+registers names into a persistent `Zcu.Namespace`, and each decl's value is
+resolved on first reference (`ensureNavResolved`), memoized via the two-state
+`Nav`. Duni collapses all of that: AstGen already produced `module.decls` (the
+registration), and Sema resolves every decl up front. The map lives on
+`Sema` (not a `Namespace`) because one module is analyzed in one pass; the
+trigger to move it to a `Namespace`/`Nav` is multi-module (see
+`notes/deferred.md`). Zig ref: `zirDeclVal` → `lookupIdentifier` →
+`lookupInNamespace`; `analyzeNavVal` for the resolution.
+
+## Resolving an extern's type — the inline body arms
+
+`analyzeDeclaration` runs the declaration's `type_body` with `analyzeBody`
+and reads the resulting func type off `inst_map.get(last)`, then interns
+`Key.Extern`. The type body is a nested inline tree, so four DIR tags get
+real Sema arms:
+
+- **`break_inline`** (`dirBreakInline`): value = its operand. Duni's inline
+  bodies are **linear, single-break, target = enclosing block**, so there's
+  no `error.ComptimeBreak` unwinding — the value is computed at the break and
+  stored in `inst_map`; the enclosing block reads its last instruction. Zig's
+  `analyzeInlineBody`/`resolveInlineBody` exist only to demux that exception
+  protocol; Duni needs neither.
+- **`block_inline`** (`dirBlockInline`): run body, value = last inst. Today
+  identical to `dirBlock` (fold-only, no runtime Air block), kept separate
+  because they split when `block` grows a runtime path.
+- **`param`** (`dirParam`): run the param's type sub-body → the param's
+  **type**, into `inst_map`. Extern params are type-only, so a param maps to
+  its type; when fn bodies arrive the param maps to its `Air.arg` value
+  instead (the one line that changes).
+- **`func`** (`dirFunc`): gather param types by **walking `param_block`** and
+  reading each `.param`'s type from `inst_map` (not a `block.params`
+  accumulator — the walk reuses the mandatory `inst_map` entries, avoids
+  duplicate state, and `param_block` is load-bearing again for fn bodies),
+  resolve `RetTy`, call `getFuncType`. Zig ref: `zirFunc`/`funcCommon`.

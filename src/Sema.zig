@@ -30,7 +30,7 @@ const String = @import("string.zig");
 gpa: Allocator,
 
 // AIR instructions
-instructions: std.MultiArrayList(Air.Inst) = .{},
+air_instructions: std.MultiArrayList(Air.Inst) = .{},
 air_extra: std.ArrayList(u32) = .empty,
 
 /// Maps ZIR to AIR.
@@ -56,7 +56,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     var sema = Sema{ .gpa = gpa, .code = code, .arena = analysis_arena.allocator() };
     defer sema.deinit();
 
-    try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
+    try sema.air_instructions.ensureTotalCapacity(gpa, code.instructions.len);
     const module = code.getModuleDecl(.main_module_inst);
 
     for (module.decls) |decl_inst| {
@@ -68,23 +68,22 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     const last_indx = module.body[module.body.len - 1];
     const last_ref = sema.inst_map.get(last_indx).?;
 
+    const result_ty = sema.typeOf(ip, last_ref);
+
     // The result type is inferred from the value until declarations carry
     // types: numeric results are `number`, strings stay strings. The Zig
     // analog is `analyzeRet` coercing to `fn_ret_ty`.
-    const result_ref = switch (ip.indexToKey(sema.resolveValue(last_ref).?.toIntern())) {
-        .int, .float => try sema.coerce(ip, .comptime_float_type, last_ref),
-        .string => last_ref,
-        .simple_type => unreachable, // no producer emits a type as a value
-        .func_type => unreachable,
-        .@"extern" => unreachable,
-    };
+    const result_ref = if (result_ty.isNumeric(ip))
+        try sema.coerce(ip, .fromInterned(.comptime_float_type), last_ref)
+    else
+        last_ref;
 
-    try sema.instructions.append(sema.gpa, .{
+    try sema.air_instructions.append(sema.gpa, .{
         .tag = .ret,
         .data = .{ .un_op = result_ref },
     });
 
-    return .{ .instructions = sema.instructions.toOwnedSlice() };
+    return .{ .instructions = sema.air_instructions.toOwnedSlice(), .extra = sema.air_extra };
 }
 
 fn analyzeBody(
@@ -252,7 +251,7 @@ fn dirCall(
     inst: Dir.Inst.Index,
     comptime kind: enum { direct, field },
 ) CompileError!Air.Inst.Ref {
-    const inst_data = sema.code.instructions.items(.data)[@enumFromInt(inst)].pl_node;
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const ExtraType = switch (kind) {
         .direct => Dir.Inst.Call,
         .field => unreachable,
@@ -265,72 +264,16 @@ fn dirCall(
         .method => unreachable,
     };
 
-    const callee_ty = sema.typeOf(func);
-    const total_args = extra.args_len + @intFromBool(callee == .method);
-    const func_ty = try sema.checkCallArgumentCount(block, func, callee_src, callee_ty, total_args, callee == .method);
+    const callee_ty = sema.typeOf(ip, func);
 
-    // The block index before the call, so we can potentially insert an error trace save here later.
-    const block_index: Air.Inst.Index = @enumFromInt(@intCast(sema.instructions.items.len));
-
-    // This will be set by `analyzeCall` to indicate whether any parameter was an error (making the
-    // error trace potentially dirty).
-    var input_is_error = false;
-
-    const args_info: CallArgsInfo = .{ .zir_call = .{
-        .bound_arg = switch (callee) {
-            .direct => .none,
-            .method => |method| method.arg0_inst,
-        },
-        .bound_arg_src = callee_src,
-        .call_inst = inst,
-        .call_node_offset = inst_data.src_node,
-        .num_args = args_len,
-        .args_body = @ptrCast(sema.code.extra[extra.end..]),
-        .any_arg_is_error = &input_is_error,
-    } };
-
-    // AstGen ensures that a call instruction is always preceded by a dbg_stmt instruction.
-    const call_dbg_node: Zir.Inst.Index = @fromBackingInt(@intCast(@backingInt(inst) - 1));
-    const call_inst = try sema.analyzeCall(block, func, func_ty, callee_src, call_src, modifier, ensure_result_used, args_info, call_dbg_node, .call);
-
-    if (block.ownerModule().error_tracing and
-        !block.isComptime() and !block.is_typeof and (input_is_error or pop_error_return_trace))
-    {
-        const return_ty = sema.typeOf(call_inst);
-        if (modifier != .always_tail and return_ty.isNoReturn(zcu))
-            return call_inst; // call to "fn (...) noreturn", don't pop
-
-        // TODO: we don't fix up the error trace for always_tail correctly, we should be doing it
-        // *before* the recursive call. This will be a bit tricky to do and probably requires
-        // moving this logic into analyzeCall. But that's probably a good idea anyway.
-        if (modifier == .always_tail)
-            return call_inst;
-
-        // If any input is an error-type, we might need to pop any trace it generated. Otherwise, we only
-        // need to clean-up our own trace if we were passed to a non-error-handling expression.
-        if (input_is_error or (pop_error_return_trace and return_ty.isError(zcu))) {
-            const stack_trace_ty = try sema.getStdLangType(call_src, .StackTrace);
-            const field_name = try zcu.intern_pool.getOrPutString(gpa, io, pt.tid, "index", .no_embedded_nulls);
-            const field_index = try sema.structFieldIndex(block, stack_trace_ty, field_name, call_src);
-
-            // Insert a save instruction before the arg resolution + call instructions we just generated
-            const save_inst = try block.insertInst(block_index, .{
-                .tag = .save_err_return_trace_index,
-                .data = .{ .ty_pl = .{
-                    .ty = Air.internedToRef(stack_trace_ty.toIntern()),
-                    .payload = @intCast(field_index),
-                } },
-            });
-
-            // Pop the error return trace, testing the result for non-error if necessary
-            const operand = if (pop_error_return_trace or modifier == .always_tail) .none else call_inst;
-            try sema.popErrorReturnTrace(block, call_src, operand, save_inst);
-        }
-
-        return call_inst;
-    } else {
-        return call_inst;
+    const func_ty = ip.indexToKey(callee_ty.toIntern()).func_type;
+    if (extra.data.args_len != func_ty.param_types.len) {
+        // TODO(tzelon): structured Sema error reporting
+        log.warn("expected {d} argument(s), found {d}", .{ func_ty.param_types.len, extra.data.args_len });
+        return error.AnalysisFail;
     }
+
+    @panic("TODO: coerce args + emit Air.call");
 }
 
 fn dirFunc(
@@ -357,13 +300,13 @@ fn dirFunc(
         try params.append(sema.arena, sema.inst_map.get(p).?.toInterned().?);
     }
 
-    const ret_ty: InternPool.Index = switch (extra.data.ret_ty.body_len) {
-        0 => .void_type,
-        1 => sema.resolveInst(@enumFromInt(sema.code.extra[extra_index])).toInterned().?,
+    const ret_ty: Type = switch (extra.data.ret_ty.body_len) {
+        0 => .void,
+        1 => sema.resolveInst(@enumFromInt(sema.code.extra[extra_index])).toType(),
         else => unreachable,
     };
 
-    const fn_ty = try ip.getFuncType(sema.gpa, .{ .return_type = ret_ty, .param_types = params.items });
+    const fn_ty = try ip.getFuncType(sema.gpa, .{ .return_type = ret_ty.toIntern(), .param_types = params.items });
 
     return .fromInterned(fn_ty);
 }
@@ -442,9 +385,9 @@ fn dirParam(
 /// Today the only destination is `number` (`comptime_float_type` stands in for it until
 /// runtime types exist); the low-level number types arc (i32/i64/u32/u64/f32)
 /// adds its destinations here.
-fn coerce(sema: *Sema, ip: *InternPool, dest_ty: InternPool.Index, inst: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref) CompileError!Air.Inst.Ref {
     const val = sema.resolveValue(inst).?; // Sema is fold-only: every result is comptime-known.
-    switch (dest_ty) {
+    switch (dest_ty.toIntern()) {
         .comptime_float_type => switch (ip.indexToKey(val.toIntern())) {
             .float => return inst,
             .int => return sema.coerceIntToFloat(ip, val),
@@ -534,8 +477,8 @@ fn resolveValue(sema: *Sema, inst: Air.Inst.Ref) ?Value {
 }
 
 /// Returns the type of the AIR instruction.
-fn typeOf(sema: *Sema, ip: InternPool, inst: Air.Inst.Ref) Type {
-    return sema.getTmpAir().typeOf(inst, &sema.ip);
+fn typeOf(sema: *Sema, ip: *InternPool, inst: Air.Inst.Ref) Type {
+    return sema.getTmpAir().typeOf(inst, ip);
 }
 
 pub fn getTmpAir(sema: Sema) Air {
@@ -546,7 +489,8 @@ pub fn getTmpAir(sema: Sema) Air {
 }
 
 pub fn deinit(sema: *Sema) void {
-    sema.instructions.deinit(sema.gpa);
+    sema.air_instructions.deinit(sema.gpa);
+    sema.air_extra.deinit(sema.gpa);
     sema.inst_map.deinit(sema.gpa);
     sema.decls.deinit(sema.gpa);
     sema.* = undefined;

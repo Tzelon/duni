@@ -166,15 +166,23 @@ pub const Inst = struct {
     /// The tag type is specified so that it is safe to bitcast between `[]u32`
     /// and `[]Ref`.
     pub const Ref = enum(u32) {
+        // Kept in lock-step with `InternPool.Index`'s static members, in the
+        // same order — `resolveInst` maps a Dir static Ref to the matching
+        // InternPool Index by equal numeric value.
+        u32_type,
+        i32_type,
+        u64_type,
+        i64_type,
+        f64_type,
         comptime_int_type,
         comptime_float_type,
-        f64_type,
         string_type,
         //TODO(tzelon): should duni have void_type?
         void_type,
         zero,
         one,
         negative_one,
+        type_type,
 
         /// This Ref does not correspond to any DIR instruction or constant
         /// value and may instead be used as a sentinel to indicate null.

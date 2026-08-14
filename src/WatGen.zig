@@ -182,7 +182,7 @@ fn expectWatIndex(ip: *InternPool, ip_index: InternPool.Index, expected: []const
 
     var insts: std.MultiArrayList(Air.Inst) = .{};
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .fromInterned(ip_index) } });
-    var air = Air{ .instructions = insts.toOwnedSlice() };
+    var air = Air{ .instructions = insts.toOwnedSlice(), .extra = .empty };
     defer air.deinit(gpa);
 
     var buf: [512]u8 = undefined;

@@ -176,3 +176,58 @@ index-equality invariant would break if `1` and `1.0` were same-type values
 at different indexes. `number` appears later, at the runtime boundary, as the
 type both comptime kinds coerce into. Its WASM lowering is undecided; the
 pool stays target-independent — only WatGen knows about wasm types.
+
+## Function types — the `func_type` key (2026-08-14)
+
+`Key.FuncType = { param_types: Index.Slice, return_type: Index }`. The param
+list is variable-length, so it's stored inline in `extra` and referenced by a
+`Index.Slice` (`{start, len}` — a stripped `Nav`-free version of Zig's
+`Index.Slice`, no `tid` since Duni is single-threaded). The Slice exists for
+**lifetime**: a decoded `Key.FuncType` returned by `indexToKey` must survive
+later `extra` growth, so it holds offsets, not a raw slice into `extra` that
+would dangle on realloc. `.get(ip)` re-derives the live slice on demand.
+
+Interning goes through a dedicated `getFuncType`, **not** the generic
+`get(Key)`. The generic path hashes/dedups the key *before* writing storage,
+but you can't build a `Slice`-based probe key until the params are already in
+`extra` (chicken-and-egg). So `getFuncType` uses Zig's **add-then-revert**:
+write the header + params unconditionally, build the Slice key over what you
+just wrote, `getOrPut`, and on a hit rewind `extra.items.len` to abandon the
+speculative write. `get(Key)` has `.func_type => unreachable`.
+
+Rule that falls out: a value whose fields are all fixed-width handles rides
+the generic `get(Key)` (string, int, float, **extern**); a value with a
+variable-length trailing array needs a dedicated `getX` + add-then-revert
+(func_type). See `funcTypeReturnType` for the minimal single-threaded decode
+(no `unwrap`/shard machinery, no `type_pointer` branch — Duni has neither).
+
+## Extern values — `Key.Extern`
+
+`Key.Extern = { name, ty, lib_name }` — the wasm import name, its `func_type`,
+and the import module (`OptionalNullTerminatedString`, `.none` → `"host"`).
+All three are fixed-width handles, so it's a leaf value on the generic
+`get(Key)` path; `Key.Extern` is its own `extra` layout (no separate `Tag`
+struct). This is Duni's whole "callable decl" representation — Zig's `Nav`
+(the decl-level slot with lazy/incremental/namespace/backend/generic
+machinery) is deliberately **not** ported. Reasoning + revival trigger:
+`notes/deferred.md` (Sema / InternPool). The extern's `name` duplicates the
+`Sema.decls` key on purpose — the value must stand alone for WatGen to emit
+`(import "host" "print" …)` without the decl map.
+
+## Type and Value — newtypes over `Index` (2026-08-14)
+
+Both types and values are one `InternPool.Index`. `Value.zig` wraps that with
+value-only methods; `Type.zig` is its type-only counterpart (Zig's exact
+split). **The InternPool itself stays raw `Index`** — `Key.*.ty`,
+`FuncType`'s fields, `getFuncType`, `isIntegerType`, `InternPool.typeOf` all
+speak `Index`. `Type`/`Value` wrap **above** the pool (Sema / Air / WatGen),
+converting at the boundary (`Type.fromInterned` out, `.toIntern()` in). This
+is forced: `Type` imports `InternPool`, so the pool can't reference `Type`
+without a cycle — same reason Zig keeps its InternPool in raw `Index`.
+
+`typeOf` therefore lives in two places: `InternPool.typeOf(index) -> Index`
+(pure key-switch: a value → its `.ty`; a type → `type_type`), and
+`Air.typeOf(ref) -> Type` which wraps it for the interned case and derives
+the type from the instruction tag for the runtime case. The runtime arm is
+the seam for the S3/S4 Air instruction set (`.arg`/`.call`) — it can't be
+designed until those instructions exist.

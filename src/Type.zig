@@ -27,12 +27,15 @@ pub fn toIntern(ty: Type) InternPool.Index {
 pub fn isNumeric(ty: Type, ip: *const InternPool) bool {
     return switch (ty.toIntern()) {
         .f64_type,
+        .u32_type,
+        .i32_type,
+        .u64_type,
+        .i64_type,
         .comptime_int_type,
         .comptime_float_type,
         => true,
 
         else => switch (ip.indexToKey(ty.toIntern())) {
-            .int_type => true,
             else => false,
         },
     };
@@ -42,3 +45,5 @@ pub fn isNumeric(ty: Type, ip: *const InternPool) bool {
 pub fn fnReturnType(ty: Type, ip: *const InternPool) Type {
     return Type.fromInterned(ip.funcTypeReturnType(ty.toIntern()));
 }
+
+pub const @"void": Type = .{ .ip_index = .void_type };

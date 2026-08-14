@@ -170,9 +170,14 @@ pub const Key = union(enum) {
     pub const SimpleType = enum(u32) {
         comptime_int = @intFromEnum(Index.comptime_int_type),
         comptime_float = @intFromEnum(Index.comptime_float_type),
+        u32 = @intFromEnum(Index.u32_type),
+        i32 = @intFromEnum(Index.i32_type),
+        u64 = @intFromEnum(Index.u64_type),
+        i64 = @intFromEnum(Index.i64_type),
         f64 = @intFromEnum(Index.f64_type),
         string = @intFromEnum(Index.string_type),
         void = @intFromEnum(Index.void_type),
+        type = @intFromEnum(Index.type_type),
     };
 
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
@@ -661,8 +666,13 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
         .comptime_int_type,
         .comptime_float_type,
         .f64_type,
+        .u32_type,
+        .i32_type,
+        .u64_type,
+        .i64_type,
         .string_type,
         .void_type,
+        .type_type,
         => .type_type,
 
         .zero, .one, .negative_one => .comptime_int_type,
@@ -673,6 +683,11 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             const item = ip.items.get(@intFromEnum(index));
             return switch (item.tag) {
                 .simple_type => unreachable, // handled via Index above
+
+                .type_function,
+                => .type_type,
+
+                .string => .string_type,
 
                 .int_u32 => .u32_type,
                 .int_i32 => .i32_type,
@@ -689,12 +704,11 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
                 .int_positive,
                 .int_negative,
                 => {
-                    unreachable;
-                    //TODO(tzelon): how to get limbs
-                    // const limbs_list = ip.getLimbs();
-                    // const int: Int = @bitCast(limbs_list.view().items(.@"0")[item.data..][0..Int.limbs_items_len].*);
-                    // return int.ty;
+                    const int: Int = @bitCast(ip.limbs.items[item.data..][0..Int.limbs_items_len].*);
+                    return int.ty;
                 },
+
+                .@"extern" => extraData(ip, Key.Extern, item.data).ty,
             };
         },
         .none => unreachable,
@@ -805,10 +819,16 @@ pub const Tag = enum(u8) {
     };
 };
 
+// Order must match `Index`'s static members exactly (dense, 0-based):
+// static_keys[i] is asserted at `init` to intern at Index `i`.
 pub const static_keys: [static_len]Key = .{
+    .{ .simple_type = .u32 },
+    .{ .simple_type = .i32 },
+    .{ .simple_type = .u64 },
+    .{ .simple_type = .i64 },
+    .{ .simple_type = .f64 },
     .{ .simple_type = .comptime_int },
     .{ .simple_type = .comptime_float },
-    .{ .simple_type = .f64 },
     .{ .simple_type = .string },
     .{ .simple_type = .void },
     .{ .int = .{
@@ -823,6 +843,7 @@ pub const static_keys: [static_len]Key = .{
         .ty = .comptime_int_type,
         .storage = .{ .i64 = -1 },
     } },
+    .{ .simple_type = .type },
 };
 
 test "InternPool same key returns same index" {

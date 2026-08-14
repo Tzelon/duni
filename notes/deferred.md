@@ -88,6 +88,30 @@ below).
   recovery (Zig's `FnProto.iterate`).
   **Trigger:** stage B (`fnDeclInner` equivalent).
 
+## Sema / InternPool
+
+- **Zig's `Nav` (named addressable value).** `InternPool.zig:544` in the
+  Zig tree. It's Zig's decl-level identity — the slot a source declaration
+  resolves to — and it carries machinery Duni doesn't have: two-state lazy
+  resolution (`analysis: ?{namespace, zir_index, wanted}` vs
+  `resolved: ?Resolved`, for incremental rebuilds), a `namespace` +
+  fully-qualified `fqn`, per-decl backend attributes (align, linksection,
+  addrspace, threadlocal, const), and generic instantiation
+  (`generic_owner`). Zig splits the decl (`Nav`) from the value it resolves
+  to (`Key.Extern`) because a Nav can be a var / fn / generic instance.
+  Duni collapses that: the P2 extern **value** (`Key.ExternFunc{ty, name,
+  lib_name}`) is self-contained (WatGen emits `(import "host" "print" …)`
+  from it alone), and the S1 `decls` map (`NullTerminatedString → Index`)
+  *is* the decl layer — eager, whole-program, single-module. `name` living
+  in both the map key and the ExternFunc value is intentional (Zig does the
+  same); the value must stand alone for codegen. A Nav here would be Zig's
+  premise — lazy, incremental, multi-namespace, backend-attributed — without
+  Duni's requirements.
+  **Trigger:** the first of incremental compilation, real
+  namespaces/modules, per-decl backend attributes, or generics — each
+  parked elsewhere in this ledger. Whichever lands first needs a decl-slot
+  richer than a name→Index map; that's when a Nav-like layer earns its place.
+
 ## Parser / formatter
 
 - **`call_comma` tag split.** With closers stored in the AST, trailing

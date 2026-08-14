@@ -16,6 +16,10 @@ const Type = @import("../Type.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
 
+/// The meaning of this data is determined by `Inst.Tag` value.
+/// The first few indexes are reserved. See `ExtraIndex` for the values.
+extra: std.ArrayList(u32),
+
 pub const Inst = struct {
     tag: Tag,
     data: Data,
@@ -126,21 +130,23 @@ pub fn typeOf(air: *const Air, inst: Air.Inst.Ref, ip: *const InternPool) Type {
 }
 
 pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool) Type {
-    const datas = air.instructions.items(.data);
+    _ = ip;
+    // const datas = air.instructions.items(.data);
     switch (air.instructions.items(.tag)[@intFromEnum(inst)]) {
-        .arg => return datas[@intFromEnum(inst)].arg.ty.toType(),
+        // .arg => return datas[@intFromEnum(inst)].arg.ty.toType(),
 
         .ret,
-        => return .noreturn,
-
-        .call => {
-            const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);
-            return .fromInterned(ip.funcTypeReturnType(callee_ty.toIntern()));
-        },
+        => unreachable,
+        //
+        // .call => {
+        //     const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);
+        //     return .fromInterned(ip.funcTypeReturnType(callee_ty.toIntern()));
+        // },
     }
 }
 
 pub fn deinit(air: *Air, gpa: std.mem.Allocator) void {
     air.instructions.deinit(gpa);
+    air.extra.deinit(gpa);
     air.* = undefined;
 }

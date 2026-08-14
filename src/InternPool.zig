@@ -45,9 +45,15 @@ pub const Item = struct {
 /// When adding a tag to this enum, consider adding a corresponding entry to
 /// `primitives` in AstGen.zig.
 pub const Index = enum(u32) {
+    u32_type,
+    i32_type,
+    u64_type,
+    i64_type,
+
+    f64_type,
+
     comptime_int_type,
     comptime_float_type,
-    f64_type,
     string_type,
     //TODO(tzelon): should duni have void_type?
     void_type,
@@ -57,6 +63,8 @@ pub const Index = enum(u32) {
     one,
     /// `-1` (comptime_int)
     negative_one,
+
+    type_type,
 
     /// Used by Air/Sema only.
     none = std.math.maxInt(u32),
@@ -641,6 +649,63 @@ pub const Float64 = struct {
         };
     }
 };
+
+pub fn typeOf(ip: *const InternPool, index: Index) Index {
+
+    // This optimization of static keys is required so that typeOf can be called
+    // on static keys that haven't been added yet during static key initialization.
+    // An alternative would be to topological sort the static keys, but this would
+    // mean that the range of type indices would not be dense.
+
+    return switch (index) {
+        .comptime_int_type,
+        .comptime_float_type,
+        .f64_type,
+        .string_type,
+        .void_type,
+        => .type_type,
+
+        .zero, .one, .negative_one => .comptime_int_type,
+
+        // This optimization on tags is needed so that indexToKey can call
+        // typeOf without being recursive.
+        _ => {
+            const item = ip.items.get(@intFromEnum(index));
+            return switch (item.tag) {
+                .simple_type => unreachable, // handled via Index above
+
+                .int_u32 => .u32_type,
+                .int_i32 => .i32_type,
+
+                .float_f64 => .f64_type,
+
+                .int_comptime_int_u32,
+                .int_comptime_int_i32,
+                => .comptime_int_type,
+
+                .float_comptime_float => .comptime_float_type,
+
+                // Note these are stored in limbs data, not extra data.
+                .int_positive,
+                .int_negative,
+                => {
+                    unreachable;
+                    //TODO(tzelon): how to get limbs
+                    // const limbs_list = ip.getLimbs();
+                    // const int: Int = @bitCast(limbs_list.view().items(.@"0")[item.data..][0..Int.limbs_items_len].*);
+                    // return int.ty;
+                },
+            };
+        },
+        .none => unreachable,
+    };
+}
+
+pub fn funcTypeReturnType(ip: *const InternPool, ty: Index) Index {
+    const item = ip.items.get(@intFromEnum(ty));
+    assert(item.tag == .type_function);
+    return extraData(ip, Tag.TypeFunction, item.data).return_type;
+}
 
 pub fn deinit(
     ip: *InternPool,

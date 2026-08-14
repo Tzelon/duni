@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 
 const InternPool = @import("../InternPool.zig");
 const Value = @import("../Value.zig");
+const Type = @import("../Type.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
 
@@ -91,8 +92,16 @@ pub const Inst = struct {
             };
         }
 
+        pub fn toType(ref: Ref) Type {
+            return .fromInterned(ref.toInterned().?);
+        }
+
         pub fn fromValue(v: Value) Ref {
             return .fromInterned(v.toIntern());
+        }
+
+        pub fn fromType(t: Type) Ref {
+            return .fromIntern(t.toIntern());
         }
     };
 
@@ -106,6 +115,29 @@ pub const Inst = struct {
 
 pub fn internedToRef(ip_index: InternPool.Index) Inst.Ref {
     return .fromInterned(ip_index);
+}
+
+pub fn typeOf(air: *const Air, inst: Air.Inst.Ref, ip: *const InternPool) Type {
+    if (inst.toInterned()) |ip_index| {
+        return .fromInterned(ip.typeOf(ip_index));
+    } else {
+        return air.typeOfIndex(inst.toIndex().?, ip);
+    }
+}
+
+pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool) Type {
+    const datas = air.instructions.items(.data);
+    switch (air.instructions.items(.tag)[@intFromEnum(inst)]) {
+        .arg => return datas[@intFromEnum(inst)].arg.ty.toType(),
+
+        .ret,
+        => return .noreturn,
+
+        .call => {
+            const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);
+            return .fromInterned(ip.funcTypeReturnType(callee_ty.toIntern()));
+        },
+    }
 }
 
 pub fn deinit(air: *Air, gpa: std.mem.Allocator) void {

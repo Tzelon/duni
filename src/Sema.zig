@@ -35,6 +35,13 @@ instructions: std.MultiArrayList(Air.Inst) = .{},
 // inst_map is how Sema remembers, for every DIR instruction it has already lowered, the AIR ref (or interned comptime value) to substitute when later DIR instructions reference it.
 inst_map: InstMap = .{},
 
+/// Whole-program decl table: decl name → its resolved comptime value.
+/// Keyed by the Dir-side interned name. Populated eagerly before the
+/// module body is analyzed (Zig resolves lazily via `ensureNavResolved`;
+/// we don't, so no Nav/dependency machinery).
+//TODO(tzelon): once we have modules this need to be changed via Nav and Namespace (Zcu)
+decls: std.AutoHashMapUnmanaged(Dir.NullTerminatedString, Air.Inst.Ref) = .{},
+
 /// Points to the temporary arena allocator of the Sema.
 /// This arena will be cleared when the sema is destroyed.
 arena: Allocator,
@@ -49,6 +56,10 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
     try sema.instructions.ensureTotalCapacity(gpa, code.instructions.len);
     const module = code.getModuleDecl(.main_module_inst);
+
+    for (module.decls) |decl_inst| {
+        try sema.analyzeDeclaration(ip, decl_inst);
+    }
 
     try analyzeBody(&sema, ip, module.body);
 
@@ -96,7 +107,7 @@ fn analyzeBody(
             .div => try sema.dirArithmetic(ip, .div, inst_idx),
             .str => try sema.dirStr(ip, inst_idx),
             .block => try sema.dirBlock(ip, inst_idx),
-            .decl_val => unreachable,
+            .decl_val => try sema.dirDeclVal(ip, inst_idx),
             // The module instruction is never inside a body; a nested-module
             // mistake should trap here, not be skipped.
             .extended => unreachable,
@@ -107,7 +118,13 @@ fn analyzeBody(
 
             // These occur only inside a declaration's type/value body, which Sema does
             // not walk yet — S2 replaces these with real arms (reusing analyzeBody).
-            .param, .func, .block_inline, .break_inline => unreachable,
+            .func => unreachable,
+
+            .param => try sema.dirParam(ip, inst_idx),
+
+            .block_inline => try sema.dirBlockInline(ip, inst_idx),
+
+            .break_inline => try sema.dirBreakInline(ip, inst_idx),
 
             // Reachable through the pipeline (`print(42)`), but call analysis is S3.
             .call => unreachable,
@@ -115,6 +132,35 @@ fn analyzeBody(
 
         sema.inst_map.putAssumeCapacity(inst_idx, air_ref);
     }
+}
+
+fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) CompileError!void {
+    const decl = sema.code.getDeclaration(decl_inst);
+    //TODO(tzelon) non extern function are later
+    if (decl.linkage != .@"extern") @panic("only extern fn decl are supported");
+
+    const type_body = decl.type_body.?;
+    try sema.analyzeBody(ip, type_body);
+
+    // TODO(tzelon): is this the best we can do? extracting the ref from the inst_map
+    const ty_ref = sema.inst_map.get(type_body[type_body.len - 1]).?;
+    const fn_ty = ty_ref.toInterned().?; // a function type is always comptime-known
+
+    const name = try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.name));
+    const lib_name: String.OptionalNullTerminatedString = if (decl.lib_name == .empty)
+        .none
+    else
+        (try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.lib_name))).toOptional();
+
+    const extern_val = try ip.get(sema.gpa, .{ .@"extern" = .{
+        .lib_name = lib_name,
+        .ty = fn_ty,
+        .name = name,
+    } });
+
+    const extern_ref = Air.internedToRef(extern_val);
+
+    try sema.decls.putNoClobber(sema.gpa, decl.name, extern_ref);
 }
 
 fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -202,6 +248,65 @@ fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air
 
     try sema.analyzeBody(ip, body);
 
+    return sema.inst_map.get(body[body.len - 1]).?;
+}
+
+fn dirBlockInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    // Run the body inline — no runtime Air block. The body ends with a
+    // `break_inline` whose value (Step 1) is already in `inst_map`, so the
+    // block evaluates to its last instruction. No `error.ComptimeBreak` to
+    // catch: Duni's inline bodies are linear and single-break, so unlike
+    // Zig (Sema.zig:1757, inlined to drive comptime break-propagation) this
+    // is a self-contained sub-analysis. Kept separate from `dirBlock`: the
+    // two split further when `block` grows a runtime Air path.
+    const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
+    const body = sema.code.bodySlice(extra.end, extra.data.body_len);
+    try sema.analyzeBody(ip, body);
+    return sema.inst_map.get(body[body.len - 1]).?;
+}
+
+fn dirBreakInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) Air.Inst.Ref {
+    _ = ip;
+    // Linear single-break: the break's value is just its operand. No
+    // error.ComptimeBreak unwinding (Zig's analyzeBodyInner).
+    const operand = sema.code.instructions.items(.data)[@intFromEnum(inst)].@"break".operand;
+    return sema.resolveInst(operand);
+}
+
+fn dirDeclVal(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    _ = ip;
+    const str_tok = sema.code.instructions.items(.data)[@intFromEnum(inst)].str_tok;
+    // AstGen detects use of undeclared identifiers so `?` is safe.
+    return sema.decls.get(str_tok.start).?;
+}
+
+fn dirParam(
+    sema: *Sema,
+    ip: *InternPool,
+    inst: Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_tok;
+    const extra = sema.code.extraData(Dir.Inst.Param, inst_data.payload_index);
+    // const param_name: Dir.NullTerminatedString = extra.data.name;
+    const body = sema.code.bodySlice(extra.end, extra.data.type.body_len);
+
+    // const param_ty: Type = if (extra.data.type.is_generic) .generic_poison else ty: {
+    //     // Make sure any nested param instructions don't clobber our work.
+    //     const prev_params = block.params;
+    //     block.params = .{};
+    //     defer {
+    //         block.params = prev_params;
+    //     }
+    //
+    //     const param_ty_inst = try sema.resolveInlineBody(block, body, inst);
+    //     break :ty try sema.analyzeAsType(block, src, .fn_param_types, param_ty_inst);
+    // };
+
+    // Run the type body inline; its result is this param's type. Returning it
+    // maps the param inst → its type in `inst_map`, which `func` reads.
+    // (Zig: `resolveInlineBody(body)` → `analyzeAsType`; we skip as-type.)
+    try sema.analyzeBody(ip, body);
     return sema.inst_map.get(body[body.len - 1]).?;
 }
 
@@ -304,6 +409,7 @@ fn resolveValue(sema: *Sema, inst: Air.Inst.Ref) ?Value {
 pub fn deinit(sema: *Sema) void {
     sema.instructions.deinit(sema.gpa);
     sema.inst_map.deinit(sema.gpa);
+    sema.decls.deinit(sema.gpa);
     sema.* = undefined;
 }
 

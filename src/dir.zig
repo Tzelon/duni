@@ -428,6 +428,7 @@ pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
             Inst.Ref,
             Inst.Index,
             Ast.Node.Index,
+            NullTerminatedString,
             => @enumFromInt(code.extra[i]),
 
             Ast.Node.Offset,
@@ -435,6 +436,8 @@ pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
             => @enumFromInt(@as(i32, @bitCast(code.extra[i]))),
 
             Inst.Declaration.Flags,
+            Inst.Param.Type,
+            Inst.Func.RetTy,
             => @bitCast(code.extra[i]),
 
             else => @compileError("bad field type"),

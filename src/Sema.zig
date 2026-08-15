@@ -128,6 +128,27 @@ fn analyzeBody(
     }
 }
 
+fn analyzeCall(
+    sema: *Sema,
+    ip: *InternPool,
+    callee: Air.Inst.Ref,
+    func_ty: Type,
+    args_info: CallArgsInfo,
+    operation: CallOperation,
+) CompileError!Air.Inst.Ref {
+    try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Call).@"struct".fields.len + args_info.len);
+    const call_ref = try sema.addInst(.{
+        .tag = .call,
+        .data = .{ .pl_op = .{
+            .operand = func,
+            .payload = sema.addExtraAssumeCapacity(Air.Call{
+                .args_len = @intCast(args_info.len),
+            }),
+        } },
+    });
+    sema.appendRefsAssumeCapacity(args_info);
+}
+
 fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) CompileError!void {
     const decl = sema.code.getDeclaration(decl_inst);
     //TODO(tzelon) non extern function are later
@@ -273,7 +294,9 @@ fn dirCall(
         return error.AnalysisFail;
     }
 
-    @panic("TODO: coerce args + emit Air.call");
+    const call_inst = try sema.analyzeCall();
+
+    return call_inst;
 }
 
 fn dirFunc(
@@ -452,6 +475,50 @@ fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Ai
 fn addStrLit(sema: *Sema, ip: *InternPool, string: String.NullTerminatedString) CompileError!Air.Inst.Ref {
     const val = try ip.get(sema.gpa, .{ .string = string });
     return .fromInterned(val);
+}
+
+pub fn addInst(sema: *Sema, inst: Air.Inst) error{OutOfMemory}!Air.Inst.Ref {
+    return (try sema.addInstAsIndex(inst)).toRef();
+}
+
+pub fn addInstAsIndex(sema: *Sema, inst: Air.Inst) error{OutOfMemory}!Air.Inst.Index {
+    const gpa = sema.gpa;
+
+    try sema.air_instructions.ensureUnusedCapacity(gpa, 1);
+
+    const result_index: Air.Inst.Index = @enumFromInt(sema.air_instructions.len);
+    sema.air_instructions.appendAssumeCapacity(inst);
+    return result_index;
+}
+
+pub fn addExtra(sema: *Sema, extra: anytype) Allocator.Error!u32 {
+    const field_count = std.meta.fieldNames(@TypeOf(extra)).len;
+    try sema.air_extra.ensureUnusedCapacity(sema.gpa, field_count);
+    return sema.addExtraAssumeCapacity(extra);
+}
+
+pub fn addExtraAssumeCapacity(sema: *Sema, extra: anytype) u32 {
+    const result: u32 = @intCast(sema.air_extra.items.len);
+    sema.air_extra.appendSliceAssumeCapacity(&payloadToExtraItems(extra));
+    return result;
+}
+
+fn payloadToExtraItems(data: anytype) [@typeInfo(@TypeOf(data)).@"struct".fields.len]u32 {
+    const info = @typeInfo(@TypeOf(data)).@"struct";
+    var result: [info.fields.len]u32 = undefined;
+    inline for (&result, info.fields) |*val, field| {
+        val.* = switch (field.type) {
+            u32 => @field(data, field.name),
+            i32 => @bitCast(@field(data, field.name)),
+            Air.Inst.Ref, InternPool.Index => @intFromEnum(@field(data, field.name)),
+            else => @compileError("bad field type: " ++ @typeName(field.type)),
+        };
+    }
+    return result;
+}
+
+fn appendRefsAssumeCapacity(sema: *Sema, refs: []const Air.Inst.Ref) void {
+    sema.air_extra.appendSliceAssumeCapacity(@ptrCast(refs));
 }
 
 fn resolveInst(sema: *Sema, dir_ref: Dir.Inst.Ref) Air.Inst.Ref {

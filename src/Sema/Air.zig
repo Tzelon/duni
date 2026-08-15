@@ -28,11 +28,23 @@ pub const Inst = struct {
         /// Return a value from a function.
         /// Uses the `un_op` field.
         ret,
+
+        /// Function call.
+        /// Result type is the return type of the function being called.
+        /// Uses the `pl_op` field with the `Call` payload. operand is the callee.
+        /// Triggers `resolveTypeLayout` on the return type of the callee.
+        ///
+        /// See `unwrapCall` for a way to load this tag's data.
+        call,
     };
 
     /// The position of an AIR instruction within the `Air` instructions array.
     pub const Index = enum(u32) {
         _,
+
+        pub fn toRef(index: Index) Inst.Ref {
+            return @intFromEnum(index);
+        }
     };
 
     /// Either a reference to a value stored in the InternPool, or a reference to an AIR instruction.
@@ -114,7 +126,19 @@ pub const Inst = struct {
     /// how to interpret the data within.
     pub const Data = union {
         un_op: Ref,
+
+        ty: Type,
+
+        pl_op: struct {
+            operand: Ref,
+            payload: u32,
+        },
     };
+};
+
+/// Trailing is a list of `Inst.Ref` for every `args_len`.
+pub const Call = struct {
+    args_len: u32,
 };
 
 pub fn internedToRef(ip_index: InternPool.Index) Inst.Ref {

@@ -70,20 +70,28 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
     const result_ty = sema.typeOf(ip, last_ref);
 
-    // The result type is inferred from the value until declarations carry
-    // types: numeric results are `number`, strings stay strings. The Zig
-    // analog is `analyzeRet` coercing to `fn_ret_ty`.
-    const result_ref = if (result_ty.isNumeric(ip))
-        try sema.coerce(ip, .fromInterned(.comptime_float_type), last_ref)
-    else
-        last_ref;
+    // No declared return type yet, so the result type is the last value's.
+    const result_ref = blk: {
+        // A runtime result (e.g. a call) already carries its runtime type;
+        // only comptime-known numeric results fold to the `number` boundary.
+        if (sema.resolveValue(last_ref) == null) break :blk last_ref;
+        if (result_ty.isNumeric(ip))
+            break :blk try sema.coerce(ip, .fromInterned(.comptime_float_type), last_ref);
+        break :blk last_ref;
+    };
 
     try sema.air_instructions.append(sema.gpa, .{
         .tag = .ret,
         .data = .{ .un_op = result_ref },
     });
 
-    return .{ .instructions = sema.air_instructions.toOwnedSlice(), .extra = sema.air_extra };
+    const air = Air{
+        .instructions = sema.air_instructions.slice(),
+        .extra = sema.air_extra,
+    };
+    sema.air_extra = .empty;
+    sema.air_instructions = .empty;
+    return air;
 }
 
 fn analyzeBody(
@@ -479,24 +487,26 @@ fn dirParam(
 /// runtime types exist); the low-level number types arc (i32/i64/u32/u64/f32)
 /// adds its destinations here.
 fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref) CompileError!Air.Inst.Ref {
-    const val = sema.resolveValue(inst).?; // Sema is fold-only: every result is comptime-known.
+    const val = sema.resolveValue(inst).?; // fold-only: args/results are comptime-known
     switch (dest_ty.toIntern()) {
-        .comptime_float_type => switch (ip.indexToKey(val.toIntern())) {
-            .float => return inst,
-            .int => return sema.coerceIntToFloat(ip, val),
+        .comptime_float_type, .f64_type => switch (ip.indexToKey(val.toIntern())) {
+            // Already a float: re-intern under dest_ty. Dedup makes this a
+            // passthrough when the type already matches.
+            .float => return .fromInterned(try ip.get(sema.gpa, .{ .float = .{
+                .ty = dest_ty.toIntern(),
+                .storage = .{ .f64 = val.toFloat(f64, ip) },
+            } })),
+            .int => return sema.coerceIntToFloat(ip, val, dest_ty),
             else => unreachable,
         },
         else => unreachable,
     }
 }
 
-/// comptime_int → comptime_float, exact or error (Zig's fits check in
-/// `coerceExtra`): round the int to f64, then round-trip back through a big
-/// int and compare against the operand. Accepts every integer f64 represents
-/// exactly — any magnitude with ≤ 53 significant bits, e.g. 2^64 — and
-/// rejects any that would round, e.g. 2^53 + 1. No silent precision loss,
-/// and no threshold.
-fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value) CompileError!Air.Inst.Ref {
+/// Intern `val` as a float of `dest_ty` (comptime_float or f64), exact or
+/// error: rejects any integer f64 can't represent exactly (e.g. 2^53 + 1)
+/// via a round-trip fits check — no silent precision loss.
+fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value, dest_ty: Type) CompileError!Air.Inst.Ref {
     const float = val.toFloat(f64, ip);
     var space: Value.BigIntSpace = undefined;
     const operand_big_int = val.toBigInt(&space, ip);
@@ -520,7 +530,7 @@ fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value) CompileError!Air.I
         return error.AnalysisFail;
     }
     const ip_index = try ip.get(sema.gpa, .{ .float = .{
-        .ty = .comptime_float_type,
+        .ty = dest_ty.toIntern(),
         .storage = .{ .f64 = float },
     } });
     return Air.Inst.Ref.fromInterned(ip_index);

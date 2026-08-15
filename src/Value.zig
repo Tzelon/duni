@@ -10,6 +10,8 @@ const assert = std.debug.assert;
 const BigIntConst = std.math.big.int.Const;
 const BigIntMutable = std.math.big.int.Mutable;
 
+const Type = @import("Type.zig");
+
 const InternPool = @import("InternPool.zig");
 pub const BigIntSpace = InternPool.Key.Int.Storage.BigIntSpace;
 
@@ -23,6 +25,16 @@ pub fn fromInterned(i: InternPool.Index) Value {
 pub fn toIntern(val: Value) InternPool.Index {
     assert(val.ip_index != .none);
     return val.ip_index;
+}
+
+pub fn typeOf(val: Value, ip: *const InternPool) Type {
+    return Type.fromInterned(ip.typeOf(val.toIntern()));
+}
+
+pub fn eql(a: Value, b: Value, ty: Type, ip: *const InternPool) bool {
+    assert(a.typeOf(ip).toIntern() == ty.toIntern());
+    assert(b.typeOf(ip).toIntern() == ty.toIntern());
+    return a.toIntern() == b.toIntern();
 }
 
 /// Asserts the value is an integer and it fits in a i64
@@ -92,3 +104,18 @@ pub fn toFloat(val: Value, comptime T: type, ip: *const InternPool) T {
         else => unreachable,
     };
 }
+
+//TODO(tzelon): we will need this
+// Converts an integer or a float to a float. May result in a loss of information.
+// Caller can find out by equality checking the result against the operand.
+// pub fn floatCast(val: Value, dest_ty: Type, ip: *const InternPool) !Value {
+//     //TODO(tzelon): where do we get gpa? in zig it is the Compilation gpa
+//     return Value.fromInterned(try ip.get(ip.gpa, .{ .float = .{
+//         .ty = dest_ty.toIntern(),
+//         .storage = switch (dest_ty.floatBits()) {
+//             32 => .{ .f32 = val.toFloat(f32, ip) },
+//             64 => .{ .f64 = val.toFloat(f64, ip) },
+//             else => unreachable,
+//         },
+//     } }));
+// }

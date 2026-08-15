@@ -133,6 +133,7 @@ pub const Key = union(enum) {
 
         pub const Storage = union(enum) {
             f64: f64,
+            f32: f32,
         };
     };
 
@@ -332,6 +333,39 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
         .int => |int| b: {
             assert(ip.isIntegerType(int.ty));
             switch (int.ty) {
+                .u32_type => switch (int.storage) {
+                    .big_int => |big_int| {
+                        ip.items.appendAssumeCapacity(.{
+                            .tag = .int_u32,
+                            .data = big_int.toInt(u32) catch unreachable,
+                        });
+                        break :b;
+                    },
+                    inline .u64, .i64 => |x| {
+                        ip.items.appendAssumeCapacity(.{
+                            .tag = .int_u32,
+                            .data = @as(u32, @intCast(x)),
+                        });
+                        break :b;
+                    },
+                },
+                .i32_type => switch (int.storage) {
+                    .big_int => |big_int| {
+                        const casted = big_int.toInt(i32) catch unreachable;
+                        ip.items.appendAssumeCapacity(.{
+                            .tag = .int_i32,
+                            .data = @as(u32, @bitCast(casted)),
+                        });
+                        break :b;
+                    },
+                    inline .u64, .i64 => |x| {
+                        ip.items.appendAssumeCapacity(.{
+                            .tag = .int_i32,
+                            .data = @as(u32, @bitCast(@as(i32, @intCast(x)))),
+                        });
+                        break :b;
+                    },
+                },
                 .comptime_int_type => switch (int.storage) {
                     .big_int => |big_int| {
                         if (big_int.toInt(u32)) |casted| {
@@ -386,6 +420,10 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
             switch (float.ty) {
                 .comptime_float_type => ip.items.appendAssumeCapacity(.{
                     .tag = .float_comptime_float,
+                    .data = try addExtra(ip, gpa, Float64.pack(float.storage.f64)),
+                }),
+                .f64_type => ip.items.appendAssumeCapacity(.{
+                    .tag = .float_f64,
                     .data = try addExtra(ip, gpa, Float64.pack(float.storage.f64)),
                 }),
                 else => unreachable,

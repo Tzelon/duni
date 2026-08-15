@@ -46,4 +46,16 @@ pub fn fnReturnType(ty: Type, ip: *const InternPool) Type {
     return Type.fromInterned(ip.funcTypeReturnType(ty.toIntern()));
 }
 
+/// Asserts the type is a fixed-size float or comptime_float.
+/// Returns 128 for comptime_float types.
+pub fn floatBits(ty: Type) u16 {
+    return switch (ty.toIntern()) {
+        .f32_type => 32,
+        .f64_type => 64,
+        .comptime_float_type => 64,
+
+        else => unreachable,
+    };
+}
+
 pub const @"void": Type = .{ .ip_index = .void_type };

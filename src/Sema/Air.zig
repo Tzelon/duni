@@ -42,8 +42,16 @@ pub const Inst = struct {
     pub const Index = enum(u32) {
         _,
 
+        pub fn unwrap(index: Index) union(enum) { ref: Inst.Ref, target: u31 } {
+            const low_index: u31 = @truncate(@intFromEnum(index));
+            return switch (@as(u1, @intCast(@intFromEnum(index) >> 31))) {
+                0 => .{ .ref = @enumFromInt(@as(u32, 1 << 31) | low_index) },
+                1 => .{ .target = low_index },
+            };
+        }
+
         pub fn toRef(index: Index) Inst.Ref {
-            return @intFromEnum(index);
+            return index.unwrap().ref;
         }
     };
 
@@ -117,7 +125,7 @@ pub const Inst = struct {
         }
 
         pub fn fromType(t: Type) Ref {
-            return .fromIntern(t.toIntern());
+            return .fromInterned(t.toIntern());
         }
     };
 
@@ -154,18 +162,17 @@ pub fn typeOf(air: *const Air, inst: Air.Inst.Ref, ip: *const InternPool) Type {
 }
 
 pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool) Type {
-    _ = ip;
-    // const datas = air.instructions.items(.data);
+    const datas = air.instructions.items(.data);
     switch (air.instructions.items(.tag)[@intFromEnum(inst)]) {
         // .arg => return datas[@intFromEnum(inst)].arg.ty.toType(),
 
         .ret,
         => unreachable,
-        //
-        // .call => {
-        //     const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);
-        //     return .fromInterned(ip.funcTypeReturnType(callee_ty.toIntern()));
-        // },
+
+        .call => {
+            const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);
+            return .fromInterned(ip.funcTypeReturnType(callee_ty.toIntern()));
+        },
     }
 }
 

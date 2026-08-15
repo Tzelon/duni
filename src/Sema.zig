@@ -128,25 +128,86 @@ fn analyzeBody(
     }
 }
 
+const CallArgsInfo = union(enum) {
+    /// This call corresponds to a DIR call instruction. The arguments have not yet been
+    /// resolved. They must be resolved by `analyzeCall` so that argument resolution and
+    /// generic instantiation may be interleaved. This is required for RLS to work on
+    /// generic parameters.
+    dir_call: struct {
+        /// This may be `none`, in which case it is ignored. Otherwise, it is the
+        /// already-resolved value of the first argument, from method call syntax.
+        bound_arg: Air.Inst.Ref,
+        /// The ZIR call instruction. The parameter type is placed at this index while
+        /// analyzing arguments.
+        call_inst: Dir.Inst.Index,
+        /// The number of arguments to this call, not including `bound_arg`.
+        num_args: u32,
+        /// The DIR corresponding to all function arguments (other than `bound_arg`, if it
+        /// is not `none`). Format is precisely the same as trailing data of ZIR `call`.
+        args_body: []const Dir.Inst.Index,
+    },
+
+    fn count(cai: CallArgsInfo) usize {
+        return switch (cai) {
+            .dir_call => |dir_call| dir_call.num_args + @intFromBool(dir_call.bound_arg != .none),
+        };
+    }
+
+    /// Analyzes the arg at `arg_index` and coerces it to `param_ty`.
+    fn analyzeArg(
+        cai: CallArgsInfo,
+        sema: *Sema,
+        ip: *InternPool,
+        arg_index: usize,
+        param_ty: Type,
+    ) CompileError!Air.Inst.Ref {
+        const dir_call = cai.dir_call;
+
+        const has_bound_arg = dir_call.bound_arg != .none;
+        const real_arg_idx = arg_index - @intFromBool(has_bound_arg);
+
+        const arg_body = if (real_arg_idx == 0) blk: {
+            const start = dir_call.num_args;
+            const end = @intFromEnum(dir_call.args_body[0]);
+            break :blk dir_call.args_body[start..end];
+        } else blk: {
+            const start = @intFromEnum(dir_call.args_body[real_arg_idx - 1]);
+            const end = @intFromEnum(dir_call.args_body[real_arg_idx]);
+            break :blk dir_call.args_body[start..end];
+        };
+
+        const uncoerced_arg = try sema.resolveInlineBody(ip, arg_body);
+        return sema.coerce(ip, param_ty, uncoerced_arg);
+    }
+};
+
 fn analyzeCall(
     sema: *Sema,
     ip: *InternPool,
     callee: Air.Inst.Ref,
-    func_ty: Type,
+    func_ty_info: InternPool.Key.FuncType,
     args_info: CallArgsInfo,
-    operation: CallOperation,
 ) CompileError!Air.Inst.Ref {
-    try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Call).@"struct".fields.len + args_info.len);
+    const args = try sema.arena.alloc(Air.Inst.Ref, args_info.count());
+
+    for (args, 0..) |*arg, arg_idx| {
+        const param_ty: Type = .fromInterned(func_ty_info.param_types.get(ip)[arg_idx]);
+        arg.* = try args_info.analyzeArg(sema, ip, arg_idx, param_ty);
+    }
+
+    try sema.air_extra.ensureUnusedCapacity(sema.gpa, @typeInfo(Air.Call).@"struct".fields.len + args.len);
     const call_ref = try sema.addInst(.{
         .tag = .call,
         .data = .{ .pl_op = .{
-            .operand = func,
+            .operand = callee,
             .payload = sema.addExtraAssumeCapacity(Air.Call{
-                .args_len = @intCast(args_info.len),
+                .args_len = @intCast(args.len),
             }),
         } },
     });
-    sema.appendRefsAssumeCapacity(args_info);
+    sema.appendRefsAssumeCapacity(args);
+
+    return call_ref;
 }
 
 fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) CompileError!void {
@@ -155,10 +216,7 @@ fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) C
     if (decl.linkage != .@"extern") @panic("only extern fn decl are supported");
 
     const type_body = decl.type_body.?;
-    try sema.analyzeBody(ip, type_body);
-
-    // TODO(tzelon): is this the best we can do? extracting the ref from the inst_map
-    const ty_ref = sema.inst_map.get(type_body[type_body.len - 1]).?;
+    const ty_ref = try sema.resolveInlineBody(ip, type_body);
     const fn_ty = ty_ref.toInterned().?; // a function type is always comptime-known
 
     const name = try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.name));
@@ -287,14 +345,27 @@ fn dirCall(
 
     const callee_ty = sema.typeOf(ip, func);
 
-    const func_ty = ip.indexToKey(callee_ty.toIntern()).func_type;
+    const func_ty = ip.indexToFuncType(callee_ty.toIntern()).?;
     if (extra.data.args_len != func_ty.param_types.len) {
         // TODO(tzelon): structured Sema error reporting
         log.warn("expected {d} argument(s), found {d}", .{ func_ty.param_types.len, extra.data.args_len });
         return error.AnalysisFail;
     }
 
-    const call_inst = try sema.analyzeCall();
+    const args_info: CallArgsInfo = .{
+        .dir_call = .{
+            // TODO(tzelon): when we want to have value.count() and value is the first param
+            .bound_arg = switch (callee) {
+                .direct => .none,
+                .method => unreachable,
+            },
+            .call_inst = inst,
+            .num_args = extra.data.args_len,
+            .args_body = @ptrCast(sema.code.extra[extra.end..]),
+        },
+    };
+
+    const call_inst = try sema.analyzeCall(ip, func, func_ty, args_info);
 
     return call_inst;
 }
@@ -345,8 +416,9 @@ fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air
 }
 
 fn dirBlockInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    // NOTE(tzelon):
     // Run the body inline — no runtime Air block. The body ends with a
-    // `break_inline` whose value (Step 1) is already in `inst_map`, so the
+    // `break_inline` whose value is already in `inst_map`, so the
     // block evaluates to its last instruction. No `error.ComptimeBreak` to
     // catch: Duni's inline bodies are linear and single-break, so unlike
     // Zig (Sema.zig:1757, inlined to drive comptime break-propagation) this
@@ -355,8 +427,7 @@ fn dirBlockInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileErr
     const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
     const body = sema.code.bodySlice(extra.end, extra.data.body_len);
-    try sema.analyzeBody(ip, body);
-    return sema.inst_map.get(body[body.len - 1]).?;
+    return try sema.resolveInlineBody(ip, body);
 }
 
 fn dirBreakInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -399,8 +470,7 @@ fn dirParam(
     // Run the type body inline; its result is this param's type. Returning it
     // maps the param inst → its type in `inst_map`, which `func` reads.
     // (Zig: `resolveInlineBody(body)` → `analyzeAsType`; we skip as-type.)
-    try sema.analyzeBody(ip, body);
-    return sema.inst_map.get(body[body.len - 1]).?;
+    return try sema.resolveInlineBody(ip, body);
 }
 
 /// Coerce a comptime-known value to `dest_ty`.
@@ -519,6 +589,25 @@ fn payloadToExtraItems(data: anytype) [@typeInfo(@TypeOf(data)).@"struct".fields
 
 fn appendRefsAssumeCapacity(sema: *Sema, refs: []const Air.Inst.Ref) void {
     sema.air_extra.appendSliceAssumeCapacity(@ptrCast(refs));
+}
+
+pub fn resolveInlineBody(
+    sema: *Sema,
+    ip: *InternPool,
+    body: []const Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    try sema.analyzeBody(ip, body);
+
+    // TODO(tzelon): We assume the following
+    // 1. The break is the last instruction
+    // 2. There's one break per body
+    // 3. The break targets the enclosing block
+    // 4. No unwinding needed
+    // Once we have break, continue, and return this must change
+    const break_inst = body[body.len - 1];
+    assert(sema.code.instructions.items(.tag)[@intFromEnum(break_inst)] == .break_inline);
+    const operand = sema.code.instructions.items(.data)[@intFromEnum(break_inst)].@"break".operand;
+    return sema.resolveInst(operand);
 }
 
 fn resolveInst(sema: *Sema, dir_ref: Dir.Inst.Ref) Air.Inst.Ref {

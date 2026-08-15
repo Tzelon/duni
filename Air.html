@@ -1,0 +1,1264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Air — How It Works</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    @layer reset, base, layout, components, utilities;
+
+    @layer reset {
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      html { scroll-behavior: smooth; }
+    }
+
+    @layer base {
+      :root {
+        --bg: #0d1117;
+        --bg-card: #161b22;
+        --bg-code: #0d1117;
+        --bg-highlight: #1c2128;
+        --border: #30363d;
+        --border-subtle: #21262d;
+
+        --text: #e6edf3;
+        --text-muted: #8b949e;
+        --text-dim: #6e7681;
+
+        --accent-blue: #58a6ff;
+        --accent-green: #3fb950;
+        --accent-orange: #f0883e;
+        --accent-purple: #bc8cff;
+        --accent-red: #f85149;
+        --accent-yellow: #e3b341;
+        --accent-teal: #39d353;
+        --accent-pink: #f778ba;
+
+        --radius: 8px;
+        --radius-sm: 4px;
+        --radius-lg: 12px;
+
+        --shadow: 0 4px 24px rgba(0,0,0,.4);
+        --shadow-sm: 0 2px 8px rgba(0,0,0,.3);
+
+        --font-sans: 'Inter', system-ui, sans-serif;
+        --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+        --sidebar-w: 260px;
+        --content-max: 860px;
+      }
+
+      body {
+        font-family: var(--font-sans);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 15px;
+        line-height: 1.7;
+        min-height: 100dvh;
+      }
+
+      h1, h2, h3, h4 {
+        line-height: 1.25;
+        font-weight: 600;
+        letter-spacing: -.02em;
+      }
+
+      a { color: var(--accent-blue); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      code {
+        font-family: var(--font-mono);
+        font-size: .875em;
+        background: var(--bg-code);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        padding: .1em .4em;
+        color: var(--accent-orange);
+      }
+
+      p { margin-block: .75em; }
+      p:first-child { margin-top: 0; }
+
+      ul, ol { padding-left: 1.4em; }
+      li { margin-block: .3em; }
+    }
+
+    @layer layout {
+      .shell {
+        display: grid;
+        grid-template-columns: var(--sidebar-w) 1fr;
+        grid-template-rows: auto 1fr;
+        min-height: 100dvh;
+      }
+
+      .topbar {
+        grid-column: 1 / -1;
+        background: var(--bg-card);
+        border-bottom: 1px solid var(--border);
+        padding: .75rem 1.5rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        background: color-mix(in srgb, var(--bg-card) 90%, transparent);
+      }
+
+      .sidebar {
+        background: var(--bg-card);
+        border-right: 1px solid var(--border);
+        padding: 1.5rem 1rem;
+        position: sticky;
+        top: 57px;
+        height: calc(100dvh - 57px);
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .main {
+        padding: 2.5rem 2rem;
+        max-width: calc(var(--content-max) + 4rem);
+        overflow-x: hidden;
+      }
+
+      .section {
+        margin-block: 2.5rem;
+        scroll-margin-top: 80px;
+      }
+
+      .section:first-child { margin-top: 0; }
+
+      @media (max-width: 768px) {
+        .shell { grid-template-columns: 1fr; }
+        .sidebar { display: none; }
+        .main { padding: 1.5rem 1rem; }
+      }
+    }
+
+    @layer components {
+      /* ── Topbar ── */
+      .topbar-logo {
+        font-family: var(--font-mono);
+        font-weight: 500;
+        font-size: .85rem;
+        color: var(--text-muted);
+        background: var(--bg-highlight);
+        padding: .25rem .6rem;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border);
+      }
+
+      .topbar h1 {
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--text);
+      }
+
+      .topbar-badge {
+        margin-left: auto;
+        font-size: .75rem;
+        color: var(--text-dim);
+        font-family: var(--font-mono);
+      }
+
+      /* ── Sidebar nav ── */
+      .nav-section {
+        margin-block: 1.25rem;
+      }
+
+      .nav-label {
+        font-size: .7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .1em;
+        color: var(--text-dim);
+        padding: 0 .5rem;
+        margin-bottom: .4rem;
+      }
+
+      .nav-link {
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+        padding: .35rem .5rem;
+        border-radius: var(--radius-sm);
+        color: var(--text-muted);
+        font-size: .85rem;
+        transition: background .15s, color .15s;
+
+        &:hover {
+          background: var(--bg-highlight);
+          color: var(--text);
+          text-decoration: none;
+        }
+
+        &.active {
+          background: color-mix(in srgb, var(--accent-blue) 15%, transparent);
+          color: var(--accent-blue);
+        }
+      }
+
+      .nav-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: .5;
+        flex-shrink: 0;
+      }
+
+      /* ── Section headings ── */
+      .section-title {
+        font-size: 1.5rem;
+        color: var(--text);
+        margin-bottom: 1rem;
+        display: flex;
+        align-items: center;
+        gap: .75rem;
+      }
+
+      .section-title .icon {
+        font-size: 1.25rem;
+      }
+
+      .subsection-title {
+        font-size: 1.1rem;
+        color: var(--text);
+        margin-top: 1.75rem;
+        margin-bottom: .75rem;
+        padding-bottom: .4rem;
+        border-bottom: 1px solid var(--border-subtle);
+      }
+
+      /* ── Cards ── */
+      .card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1.25rem 1.5rem;
+        margin-block: 1rem;
+      }
+
+      .card.accent-blue  { border-left: 3px solid var(--accent-blue);   }
+      .card.accent-green { border-left: 3px solid var(--accent-green);  }
+      .card.accent-orange{ border-left: 3px solid var(--accent-orange); }
+      .card.accent-purple{ border-left: 3px solid var(--accent-purple); }
+      .card.accent-yellow{ border-left: 3px solid var(--accent-yellow); }
+
+      .card-title {
+        font-size: .8rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        margin-bottom: .5rem;
+      }
+
+      .card.accent-blue   .card-title { color: var(--accent-blue);   }
+      .card.accent-green  .card-title { color: var(--accent-green);  }
+      .card.accent-orange .card-title { color: var(--accent-orange); }
+      .card.accent-purple .card-title { color: var(--accent-purple); }
+      .card.accent-yellow .card-title { color: var(--accent-yellow); }
+
+      /* ── Code blocks ── */
+      pre {
+        background: var(--bg-code);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1rem 1.25rem;
+        overflow-x: auto;
+        font-family: var(--font-mono);
+        font-size: .82rem;
+        line-height: 1.65;
+        margin-block: .75rem;
+
+        & code {
+          background: none;
+          border: none;
+          padding: 0;
+          color: var(--text);
+          font-size: inherit;
+        }
+      }
+
+      .kw  { color: #ff7b72; }
+      .ty  { color: #79c0ff; }
+      .fn  { color: #d2a8ff; }
+      .str { color: #a5d6ff; }
+      .num { color: #f0883e; }
+      .cm  { color: var(--text-dim); font-style: italic; }
+      .op  { color: #ff7b72; }
+      .fi  { color: var(--accent-green); }
+
+      /* ── Memory layout diagrams ── */
+      .mem-diagram {
+        margin-block: 1.25rem;
+        overflow-x: auto;
+      }
+
+      .mem-label {
+        font-family: var(--font-mono);
+        font-size: .75rem;
+        color: var(--text-muted);
+        margin-bottom: .35rem;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+      }
+
+      .mem-row {
+        display: flex;
+        align-items: stretch;
+        gap: 2px;
+        margin-block: 2px;
+      }
+
+      .mem-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: .4rem .6rem;
+        border-radius: var(--radius-sm);
+        font-family: var(--font-mono);
+        font-size: .75rem;
+        min-width: 60px;
+        text-align: center;
+        line-height: 1.3;
+        border: 1px solid transparent;
+      }
+
+      .mem-cell .cell-label {
+        font-size: .65rem;
+        opacity: .7;
+        margin-bottom: .2rem;
+      }
+
+      .mem-cell.blue   { background: color-mix(in srgb, var(--accent-blue)   20%, var(--bg-card)); border-color: var(--accent-blue);   color: var(--accent-blue);   }
+      .mem-cell.green  { background: color-mix(in srgb, var(--accent-green)  20%, var(--bg-card)); border-color: var(--accent-green);  color: var(--accent-green);  }
+      .mem-cell.orange { background: color-mix(in srgb, var(--accent-orange) 20%, var(--bg-card)); border-color: var(--accent-orange); color: var(--accent-orange); }
+      .mem-cell.purple { background: color-mix(in srgb, var(--accent-purple) 20%, var(--bg-card)); border-color: var(--accent-purple); color: var(--accent-purple); }
+      .mem-cell.yellow { background: color-mix(in srgb, var(--accent-yellow) 20%, var(--bg-card)); border-color: var(--accent-yellow); color: var(--accent-yellow); }
+      .mem-cell.teal   { background: color-mix(in srgb, var(--accent-teal)   20%, var(--bg-card)); border-color: var(--accent-teal);   color: var(--accent-teal);   }
+      .mem-cell.dim    { background: var(--bg-highlight); border-color: var(--border); color: var(--text-dim); }
+      .mem-cell.pink   { background: color-mix(in srgb, var(--accent-pink)   20%, var(--bg-card)); border-color: var(--accent-pink);   color: var(--accent-pink);   }
+      .mem-cell.red    { background: color-mix(in srgb, var(--accent-red)    20%, var(--bg-card)); border-color: var(--accent-red);    color: var(--accent-red);    }
+
+      .mem-arrow {
+        display: flex;
+        align-items: center;
+        padding: 0 .25rem;
+        color: var(--text-dim);
+        font-size: .9rem;
+      }
+
+      .mem-index {
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        color: var(--text-dim);
+        padding-right: .5rem;
+        min-width: 28px;
+        text-align: right;
+        align-self: center;
+      }
+
+      /* ── Bit layout ── */
+      .bits {
+        display: flex;
+        gap: 2px;
+        margin-block: .75rem;
+        font-family: var(--font-mono);
+        flex-wrap: wrap;
+      }
+
+      .bit-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: .35rem .5rem;
+        border-radius: var(--radius-sm);
+        font-size: .72rem;
+        border: 1px solid var(--border);
+        background: var(--bg-highlight);
+        min-width: 46px;
+        text-align: center;
+      }
+
+      .bit-cell .bit-top {
+        font-size: .6rem;
+        color: var(--text-dim);
+        margin-bottom: .15rem;
+      }
+
+      .bit-cell.tag  { background: color-mix(in srgb, var(--accent-red)  22%, var(--bg-card)); border-color: var(--accent-red);  color: var(--accent-red);  }
+      .bit-cell.val  { flex: 1; background: color-mix(in srgb, var(--accent-blue) 15%, var(--bg-card)); border-color: var(--accent-blue); color: var(--accent-blue); }
+
+      /* ── Pipeline diagram ── */
+      .pipeline {
+        display: flex;
+        align-items: center;
+        gap: 0;
+        flex-wrap: wrap;
+        margin-block: 1rem;
+        row-gap: .5rem;
+      }
+
+      .pipeline-step {
+        background: var(--bg-highlight);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: .4rem .8rem;
+        font-family: var(--font-mono);
+        font-size: .78rem;
+        color: var(--text);
+        white-space: nowrap;
+      }
+
+      .pipeline-arrow {
+        color: var(--text-dim);
+        padding: 0 .4rem;
+        font-size: .9rem;
+      }
+
+      /* ── Flow steps ── */
+      .flow {
+        counter-reset: flow-step;
+        display: flex;
+        flex-direction: column;
+        gap: .6rem;
+        margin-block: 1rem;
+      }
+
+      .flow-step {
+        display: grid;
+        grid-template-columns: 2rem 1fr;
+        gap: .75rem;
+        align-items: start;
+        padding: .8rem 1rem;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        counter-increment: flow-step;
+        position: relative;
+
+        &::before {
+          content: counter(flow-step);
+          width: 2rem;
+          height: 2rem;
+          border-radius: 50%;
+          background: var(--accent-blue);
+          color: var(--bg);
+          font-weight: 700;
+          font-size: .8rem;
+          display: grid;
+          place-items: center;
+          flex-shrink: 0;
+        }
+      }
+
+      .flow-step-content {
+        padding-top: .15rem;
+      }
+
+      .flow-step-title {
+        font-weight: 600;
+        font-size: .9rem;
+        margin-bottom: .25rem;
+      }
+
+      .flow-step-desc {
+        font-size: .85rem;
+        color: var(--text-muted);
+        margin: 0;
+      }
+
+      /* ── Tag table ── */
+      .tag-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: .84rem;
+        margin-block: 1rem;
+      }
+
+      .tag-table thead th {
+        background: var(--bg-highlight);
+        padding: .6rem 1rem;
+        text-align: left;
+        font-size: .75rem;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        color: var(--text-muted);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .tag-table tbody tr {
+        border-bottom: 1px solid var(--border-subtle);
+        transition: background .1s;
+      }
+
+      .tag-table tbody tr:hover {
+        background: var(--bg-highlight);
+      }
+
+      .tag-table td {
+        padding: .6rem 1rem;
+        vertical-align: top;
+      }
+
+      .tag-table td:first-child {
+        font-family: var(--font-mono);
+        font-size: .8rem;
+        color: var(--accent-purple);
+        white-space: nowrap;
+      }
+
+      .tag-table td:nth-child(2) {
+        color: var(--text-muted);
+        font-size: .8rem;
+      }
+
+      .tag-table td:nth-child(3) {
+        color: var(--text);
+        font-size: .82rem;
+      }
+
+      /* ── Key-Value pairs ── */
+      .kv-grid {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: .4rem 1rem;
+        margin-block: .75rem;
+        font-size: .85rem;
+      }
+
+      .kv-key {
+        font-family: var(--font-mono);
+        color: var(--accent-orange);
+        font-size: .82rem;
+        align-self: start;
+        padding-top: .05em;
+      }
+
+      .kv-val {
+        color: var(--text-muted);
+      }
+
+      /* ── Index map visual ── */
+      .index-map {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: .5rem;
+        margin-block: 1rem;
+      }
+
+      .index-entry {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: .5rem .75rem;
+        text-align: center;
+      }
+
+      .index-num {
+        font-family: var(--font-mono);
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: var(--accent-blue);
+        display: block;
+      }
+
+      .index-name {
+        font-family: var(--font-mono);
+        font-size: .7rem;
+        color: var(--text-muted);
+        display: block;
+        margin-top: .15rem;
+      }
+
+      .index-desc {
+        font-size: .7rem;
+        color: var(--text-dim);
+        display: block;
+        margin-top: .2rem;
+      }
+
+      /* ── Divider ── */
+      .divider {
+        border: none;
+        border-top: 1px solid var(--border-subtle);
+        margin-block: 2rem;
+      }
+
+      /* ── Big layout diagram ── */
+      .layout-diagram {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-block: 1.25rem;
+      }
+
+      @media (max-width: 640px) { .layout-diagram { grid-template-columns: 1fr; } }
+
+      .layout-array {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1rem;
+      }
+
+      .layout-array-title {
+        font-size: .72rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .1em;
+        color: var(--text-dim);
+        margin-bottom: .75rem;
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+      }
+
+      .layout-array-title .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+      }
+
+      /* ── Callout ── */
+      .callout {
+        display: flex;
+        gap: .75rem;
+        padding: .9rem 1.1rem;
+        border-radius: var(--radius);
+        margin-block: 1rem;
+        font-size: .88rem;
+      }
+
+      .callout.info    { background: color-mix(in srgb, var(--accent-blue)  10%, var(--bg-card)); border: 1px solid color-mix(in srgb, var(--accent-blue)  30%, transparent); }
+      .callout.warning { background: color-mix(in srgb, var(--accent-yellow)10%, var(--bg-card)); border: 1px solid color-mix(in srgb, var(--accent-yellow)30%, transparent); }
+      .callout.tip     { background: color-mix(in srgb, var(--accent-green) 10%, var(--bg-card)); border: 1px solid color-mix(in srgb, var(--accent-green) 30%, transparent); }
+
+      .callout-icon { font-size: 1.1rem; flex-shrink: 0; line-height: 1.5; }
+      .callout-body { color: var(--text-muted); }
+      .callout-body p { margin: 0; }
+      .callout-body strong { color: var(--text); }
+    }
+
+    @layer utilities {
+      .text-muted  { color: var(--text-muted); }
+      .text-dim    { color: var(--text-dim); }
+      .mono        { font-family: var(--font-mono); }
+      .mt-0        { margin-top: 0; }
+      .mb-0        { margin-bottom: 0; }
+      .gap-sm      { gap: .5rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ═══ TOP BAR ═══ -->
+  <header class="topbar">
+    <span class="topbar-logo">duni / src/Sema</span>
+    <h1>Air.zig</h1>
+    <span class="topbar-badge">Ref / Index Encoding Guide</span>
+  </header>
+
+  <!-- ═══ SIDEBAR ═══ -->
+  <nav class="sidebar" aria-label="Page navigation">
+    <div class="nav-section">
+      <div class="nav-label">Overview</div>
+      <a href="#what-is-it"  class="nav-link"><span class="nav-dot"></span>What is Air?</a>
+      <a href="#big-picture" class="nav-link"><span class="nav-dot"></span>Big picture</a>
+      <a href="#fields"      class="nav-link"><span class="nav-dot"></span>Fields</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">The two id types</div>
+      <a href="#two-types"   class="nav-link"><span class="nav-dot"></span>Index vs Ref</a>
+      <a href="#bits"        class="nav-link"><span class="nav-dot"></span>Bit layout</a>
+      <a href="#unwrap"      class="nav-link"><span class="nav-dot"></span>Index.unwrap → Ref</a>
+      <a href="#ref-decode"  class="nav-link"><span class="nav-dot"></span>Ref decoders</a>
+      <a href="#who-sets"    class="nav-link"><span class="nav-dot"></span>Who sets the tag bit</a>
+      <a href="#why-two"     class="nav-link"><span class="nav-dot"></span>Why two types</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Instructions</div>
+      <a href="#inst"        class="nav-link"><span class="nav-dot"></span>Inst &amp; Tag</a>
+      <a href="#data"        class="nav-link"><span class="nav-dot"></span>Data union</a>
+      <a href="#typeof"      class="nav-link"><span class="nav-dot"></span>typeOf</a>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Reference</div>
+      <a href="#worked-example" class="nav-link"><span class="nav-dot"></span>Worked example</a>
+    </div>
+  </nav>
+
+  <!-- ═══ MAIN CONTENT ═══ -->
+  <main class="main">
+
+    <!-- ─── WHAT IS IT ─── -->
+    <section class="section" id="what-is-it">
+      <h2 class="section-title"><span class="icon">🌬️</span>What is Air?</h2>
+
+      <p>
+        <code>Air</code> ("Analyzed IR") is the output of <code>Sema</code> and the input to
+        <code>WatGen</code>. It is a <strong>flat list of typed instructions</strong> — the program
+        after semantic analysis, with every type resolved and every comptime-known value already
+        interned. Unlike DIR (one instance per source file), <strong>each function gets its own
+        <code>Air</code></strong>.
+      </p>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body">
+          <p><strong>Key insight:</strong> an Air instruction's operand is never a value or a pointer —
+          it is a <code>Ref</code>, a single <code>u32</code> that means <em>either</em> "an interned
+          constant" <em>or</em> "the result of another instruction". The whole file is really about how
+          that one integer is packed and unpacked.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── BIG PICTURE ─── -->
+    <section class="section" id="big-picture">
+      <h2 class="section-title"><span class="icon">🗺️</span>Big Picture</h2>
+
+      <div class="pipeline">
+        <span class="pipeline-step">Text</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">Scanner</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">Parse → Ast</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">AstGen → Dir</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">Sema</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" style="border-color:var(--accent-blue);color:var(--accent-blue)"><strong>Air</strong></span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step">WatGen</span>
+      </div>
+
+      <p>
+        Sema <em>builds</em> Air by appending instructions; WatGen <em>reads</em> Air to emit WAT.
+        The <code>InternPool</code> lives beside both — Air never stores a constant inline, it stores
+        an <code>InternPool.Index</code> disguised as a <code>Ref</code>.
+      </p>
+    </section>
+
+    <!-- ─── FIELDS ─── -->
+    <section class="section" id="fields">
+      <h2 class="section-title"><span class="icon">🗄️</span>Fields</h2>
+
+      <p>The struct is tiny — two arrays:</p>
+
+      <table class="tag-table">
+        <thead>
+          <tr><th>Field</th><th>Type</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>instructions</td>
+            <td>MultiArrayList(Inst).Slice</td>
+            <td>The instruction stream. Struct-of-arrays: a <code>tag: Tag</code> array and a
+            <code>data: Data</code> array. A slot's position <em>is</em> its <code>Inst.Index</code>.</td>
+          </tr>
+          <tr>
+            <td>extra</td>
+            <td>ArrayList(u32)</td>
+            <td>Flat u32 overflow, for instructions whose payload doesn't fit in 8 bytes (e.g.
+            <code>call</code>'s trailing argument <code>Ref</code>s). Indexed by a <code>payload</code> offset.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        <code>deinit</code> frees both arrays. There is no separate value store — values are the
+        InternPool's job, and Air only holds references to them.
+      </p>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── TWO TYPES ─── -->
+    <section class="section" id="two-types">
+      <h2 class="section-title"><span class="icon">🎭</span>The two id types: Index vs Ref</h2>
+
+      <p>
+        Both are <code>enum(u32)</code>. Both use <strong>bit 31 as a tag bit</strong>. The trick is
+        they tag it <em>differently</em>, so the same instruction number lives under a different tag
+        bit in each space. "Unwrap" / "convert to ref" is nothing more than reading or flipping that
+        top bit — no allocation, no lookup.
+      </p>
+
+      <div class="layout-diagram">
+        <div class="card accent-blue" style="margin:0">
+          <div class="card-title">Ref — "WHAT is this operand?"</div>
+          <p style="font-size:.85rem">A value slot. Polymorphic: an <code>InternPool.Index</code>
+          (a constant/type) <strong>or</strong> an Air instruction's result.</p>
+          <div class="kv-grid" style="margin-bottom:0">
+            <span class="kv-key">bit31 = 0</span><span class="kv-val">InternPool value</span>
+            <span class="kv-key">bit31 = 1</span><span class="kv-val">Air instruction</span>
+            <span class="kv-key">0xFFFFFFFF</span><span class="kv-val"><code>none</code> — bit31=1 but means IP's <code>none</code></span>
+          </div>
+        </div>
+        <div class="card accent-purple" style="margin:0">
+          <div class="card-title">Index — "WHICH instruction slot?"</div>
+          <p style="font-size:.85rem">An identity: the key into <code>instructions</code>. Can only
+          ever be an instruction.</p>
+          <div class="kv-grid" style="margin-bottom:0">
+            <span class="kv-key">bit31 = 0</span><span class="kv-val">normal Air instruction</span>
+            <span class="kv-key">bit31 = 1</span><span class="kv-val">"target" pseudo-instruction</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout warning">
+        <span class="callout-icon">⚠️</span>
+        <div class="callout-body">
+          <p><strong>The inversion is the whole point.</strong> For a real instruction #5, a
+          <code>Ref</code> has bit31 = <strong>1</strong> but an <code>Index</code> has bit31 =
+          <strong>0</strong>. Because the same number sits under opposite tag bits, a conversion
+          function <em>has</em> to exist to move between the two encodings.</p>
+        </div>
+      </div>
+
+      <div class="callout info">
+        <span class="callout-icon">📌</span>
+        <div class="callout-body">
+          <p>The <code>target</code> arm exists in <code>unwrap</code> for backend-invented pseudo
+          instructions, but Duni has <strong>no producer for it yet</strong> — today every real
+          <code>Index</code> has bit31 = 0.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── BITS ─── -->
+    <section class="section" id="bits">
+      <h2 class="section-title"><span class="icon">🧮</span>Bit layout</h2>
+
+      <p>Both types are 32 bits: one tag bit up top, 31 bits of payload below.</p>
+
+      <div class="bits">
+        <div class="bit-cell tag"><span class="bit-top">bit 31</span>T</div>
+        <div class="bit-cell val"><span class="bit-top">bits 30 … 0</span>value (31 bits)</div>
+      </div>
+
+      <pre><code><span class="cm">// Ref (Air.zig:63)                    Index (Air.zig:42)</span>
+<span class="cm">//  T=0 → InternPool.Index               T=0 → normal Air instruction</span>
+<span class="cm">//  T=1 → Air instruction                T=1 → target pseudo-instruction</span>
+<span class="cm">//  0xFFFFFFFF = none (special)</span></code></pre>
+
+      <div class="mem-diagram">
+        <div class="mem-label">the same instruction #5, in each space</div>
+        <div class="mem-row">
+          <span class="mem-index">Index</span>
+          <div class="mem-cell purple" style="min-width:150px"><span class="cell-label">T=0 · N=5</span>0x0000_0005</div>
+          <span class="mem-arrow">↔ toRef / toIndex ↔</span>
+          <span class="mem-index">Ref</span>
+          <div class="mem-cell blue" style="min-width:150px"><span class="cell-label">T=1 · N=5</span>0x8000_0005</div>
+        </div>
+        <div class="mem-row">
+          <span class="mem-index">Ref</span>
+          <div class="mem-cell green" style="min-width:150px"><span class="cell-label">T=0 · N=2</span>0x0000_0002</div>
+          <span class="mem-arrow">= InternPool.Index(2) = f64_type</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── UNWRAP ─── -->
+    <section class="section" id="unwrap">
+      <h2 class="section-title"><span class="icon">🔓</span>Index.unwrap → convert to Ref</h2>
+
+      <p>
+        <code>unwrap</code> sorts a raw <code>Index</code> into "convertible-to-Ref" vs "target
+        pseudo-instr". It strips the tag bit to get the number, then reads the tag bit to decide:
+      </p>
+
+      <pre><code><span class="kw">pub fn</span> <span class="fn">unwrap</span>(index: Index) <span class="kw">union</span>(enum) { ref: Inst.Ref, target: <span class="ty">u31</span> } {
+    <span class="kw">const</span> low_index: <span class="ty">u31</span> = @truncate(@intFromEnum(index));        <span class="cm">// strip tag bit</span>
+    <span class="kw">return</span> <span class="kw">switch</span> (@as(<span class="ty">u1</span>, @intCast(@intFromEnum(index) >> <span class="num">31</span>))) { <span class="cm">// read tag bit</span>
+        <span class="num">0</span> => .{ .ref    = @enumFromInt(@as(<span class="ty">u32</span>, <span class="num">1</span> << <span class="num">31</span>) | low_index) }, <span class="cm">// normal → set T=1</span>
+        <span class="num">1</span> => .{ .target = low_index },                          <span class="cm">// target → keep number</span>
+    };
+}
+
+<span class="kw">pub fn</span> <span class="fn">toRef</span>(index: Index) Inst.Ref {
+    <span class="kw">return</span> index.unwrap().ref;   <span class="cm">// only valid for a normal (T=0) Index</span>
+}</code></pre>
+
+      <div class="mem-diagram">
+        <div class="mem-label">unwrap outcomes</div>
+        <div class="mem-row">
+          <div class="mem-cell purple" style="min-width:140px"><span class="cell-label">Index T=0</span>0x0000_0005</div>
+          <span class="mem-arrow">──▶</span>
+          <div class="mem-cell blue" style="min-width:150px"><span class="cell-label">.ref (set bit31)</span>0x8000_0005</div>
+        </div>
+        <div class="mem-row">
+          <div class="mem-cell red" style="min-width:140px"><span class="cell-label">Index T=1</span>0x8000_0003</div>
+          <span class="mem-arrow">──▶</span>
+          <div class="mem-cell dim" style="min-width:150px"><span class="cell-label">.target (raw u31)</span>3</div>
+        </div>
+      </div>
+
+      <p>
+        So a normal <code>Index</code> becomes a <code>Ref</code> by turning the tag bit <em>on</em>.
+        A target <code>Index</code> has no <code>Ref</code> — <code>unwrap</code> hands you the raw
+        <code>u31</code> instead. <code>toRef</code> is just the happy path of that.
+      </p>
+    </section>
+
+    <!-- ─── REF DECODE ─── -->
+    <section class="section" id="ref-decode">
+      <h2 class="section-title"><span class="icon">🔍</span>Ref decoders — going the other way</h2>
+
+      <p>
+        A <code>Ref</code> can be an instruction <em>or</em> an interned value, so it has two
+        "which kind is it?" queries. Both return <code>?</code> — <code>null</code> means "not that
+        kind". That null-check is a feature: it forces the constant case to be handled.
+      </p>
+
+      <pre><code><span class="kw">pub fn</span> <span class="fn">toIndexAllowNone</span>(ref: Ref) ?Index {
+    <span class="kw">return switch</span> (ref) {
+        .none => <span class="kw">null</span>,
+        <span class="kw">else</span> => <span class="kw">if</span> (@intFromEnum(ref) >> <span class="num">31</span> != <span class="num">0</span>)   <span class="cm">// T=1 → it's an instruction</span>
+            @enumFromInt(@as(<span class="ty">u31</span>, @truncate(@intFromEnum(ref))))
+        <span class="kw">else</span> <span class="kw">null</span>,                                    <span class="cm">// T=0 → it's a value, not an instr</span>
+    };
+}
+
+<span class="kw">pub fn</span> <span class="fn">toInternedAllowNone</span>(ref: Ref) ?InternPool.Index {
+    <span class="kw">return switch</span> (ref) {
+        .none => .none,                              <span class="cm">// special-cased FIRST</span>
+        <span class="kw">else</span> => <span class="kw">if</span> (@intFromEnum(ref) >> <span class="num">31</span> == <span class="num">0</span>)   <span class="cm">// T=0 → it's an IP value</span>
+            @enumFromInt(@as(<span class="ty">u31</span>, @truncate(@intFromEnum(ref))))
+        <span class="kw">else</span> <span class="kw">null</span>,                                    <span class="cm">// T=1 → it's an instruction</span>
+    };
+}</code></pre>
+
+      <table class="tag-table">
+        <thead><tr><th>Ref value</th><th>toIndex</th><th>toInterned</th></tr></thead>
+        <tbody>
+          <tr><td>0x8000_0005 (T=1)</td><td>Index(5)</td><td>null</td></tr>
+          <tr><td>0x0000_0002 (T=0)</td><td>null</td><td>f64_type (2)</td></tr>
+          <tr><td>0xFFFF_FFFF (none)</td><td>null</td><td>.none <span class="text-dim">(special-cased)</span></td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        The non-<code>AllowNone</code> variants (<code>toIndex</code>, <code>toInterned</code>) just
+        <code>assert(ref != .none)</code> first, then delegate. And <code>fromInterned</code> goes the
+        reverse — it copies an IP index verbatim and <em>asserts</em> its top bit is already 0:
+      </p>
+
+      <pre><code><span class="kw">pub fn</span> <span class="fn">fromInterned</span>(ip_index: InternPool.Index) Ref {
+    <span class="kw">return switch</span> (ip_index) {
+        .none => .none,
+        <span class="kw">else</span> => {
+            assert(@intFromEnum(ip_index) >> <span class="num">31</span> == <span class="num">0</span>);   <span class="cm">// guarantees T=0, doesn't set it</span>
+            <span class="kw">return</span> @enumFromInt(@as(<span class="ty">u31</span>, @intCast(@intFromEnum(ip_index))));
+        },
+    };
+}</code></pre>
+
+      <div class="callout tip">
+        <span class="callout-icon">✅</span>
+        <div class="callout-body">
+          <p><strong>Why the static Refs are bit-identical to IP indices.</strong>
+          <code>comptime_int_type</code>, <code>f64_type</code>, <code>zero</code> … are declared as
+          <code>= @intFromEnum(InternPool.Index.xxx)</code>. Because a T=0 Ref <em>is</em> its
+          InternPool index, <code>fromInterned</code>/<code>toInterned</code> are pure tag-bit checks,
+          not table lookups. The order mirrors <code>InternPool.Index</code> exactly — change one,
+          change both.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── WHO SETS ─── -->
+    <section class="section" id="who-sets">
+      <h2 class="section-title"><span class="icon">✍️</span>Who sets the tag bit?</h2>
+
+      <p>
+        Nobody sets it by hand for the common cases — it falls out of which constructor you go through.
+      </p>
+
+      <table class="tag-table">
+        <thead><tr><th>Producer</th><th>Where</th><th>Tag bit</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>normal instr Index</td>
+            <td>Sema — <code>instructions.len</code></td>
+            <td>0 <span class="text-dim">— implicit; a small count naturally has bit31=0</span></td>
+          </tr>
+          <tr>
+            <td>Index → Ref</td>
+            <td><code>unwrap</code> / <code>toRef</code></td>
+            <td>1 <span class="text-dim">— EXPLICIT: <code>1&lt;&lt;31 | n</code>. This is the setter.</span></td>
+          </tr>
+          <tr>
+            <td>IP value → Ref</td>
+            <td><code>fromInterned</code></td>
+            <td>0 <span class="text-dim">— guaranteed by InternPool, asserted (not set)</span></td>
+          </tr>
+          <tr>
+            <td>none</td>
+            <td>comptime constant</td>
+            <td>1 <span class="text-dim">— 0xFFFFFFFF; special-cased before the tag bit is ever read</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        So for runtime operands, <code>Index.unwrap</code>/<code>toRef</code> is the code that stamps
+        the <code>1</code>. The <code>0</code> for interned values is never stamped — it's an invariant
+        of InternPool (it never hands out an index ≥ 2³¹) that the conversion merely asserts.
+      </p>
+    </section>
+
+    <!-- ─── WHY TWO ─── -->
+    <section class="section" id="why-two">
+      <h2 class="section-title"><span class="icon">🤔</span>Why two types — why convert at all?</h2>
+
+      <p>
+        You never "move" an instruction; it stays in the array. You switch between two ways of
+        <em>talking</em> about it, because Sema builds a graph where the two roles are genuinely
+        different — and one of them (<code>Ref</code>) also has to cover constants.
+      </p>
+
+      <div class="layout-diagram">
+        <div class="card accent-purple" style="margin:0">
+          <div class="card-title">Index → Ref &nbsp;(at the use site)</div>
+          <p style="font-size:.85rem">"I made an instruction, now feed its result to another." Cheap,
+          total, always valid. Every <code>%N</code> in an operand position is a Ref that started as an
+          Index.</p>
+          <pre style="margin-top:.5rem;margin-bottom:0"><code><span class="cm">%5 = load(ptr)</span>       <span class="cm">// Index(5)</span>
+<span class="cm">%6 = load(ptr2)</span>      <span class="cm">// Index(6)</span>
+<span class="cm">%7 = add(%5.toRef(),</span>
+<span class="cm">        %6.toRef())</span>  <span class="cm">// add's operands are Refs</span></code></pre>
+        </div>
+        <div class="card accent-blue" style="margin:0">
+          <div class="card-title">Ref → Index &nbsp;(at the consume site)</div>
+          <p style="font-size:.85rem">"I got an operand; tell me about the instruction behind it." Partial
+          (<code>?Index</code>) — the operand might be a constant, and the null forces you to handle
+          that.</p>
+          <pre style="margin-top:.5rem;margin-bottom:0"><code><span class="kw">if</span> (ref.toInterned()) |ip| ...  <span class="cm">// a constant</span>
+<span class="kw">else</span> {
+    <span class="kw">const</span> idx = ref.toIndex().?;  <span class="cm">// an instr</span>
+    <span class="cm">// index instructions[idx]</span>
+}</code></pre>
+        </div>
+      </div>
+
+      <p>The payoffs of keeping them distinct, all visible in this file:</p>
+      <ul>
+        <li><strong>Type-level guarantees.</strong> An operation that only makes sense on a real
+        instruction takes an <code>Index</code> in its signature — "this can't be a constant" is a
+        compile error, not a runtime crash.</li>
+        <li><strong>Array indexing without masking.</strong> A normal <code>Index</code> has bit31=0,
+        so its bits <em>are</em> the slot number — index <code>instructions</code> directly. The same
+        instruction as a <code>Ref</code> has bit31=1 and would need masking on every access.</li>
+        <li><strong>Legible intent.</strong> A field typed <code>Index</code> says "an instruction I
+        will inspect/patch"; one typed <code>Ref</code> says "a value that could be anything".</li>
+      </ul>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── INST ─── -->
+    <section class="section" id="inst">
+      <h2 class="section-title"><span class="icon">🧩</span>Inst &amp; Tag</h2>
+
+      <p>
+        An <code>Inst</code> is a <code>tag: Tag</code> + <code>data: Data</code>. <code>Tag</code> is a
+        one-byte discriminant that says which <code>Data</code> field is active and how to read it.
+        Only two tags exist today:
+      </p>
+
+      <table class="tag-table">
+        <thead><tr><th>Tag</th><th>Data field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>ret</td>
+            <td>un_op</td>
+            <td>Return a value from a function. <code>un_op</code> is the returned <code>Ref</code>.</td>
+          </tr>
+          <tr>
+            <td>call</td>
+            <td>pl_op</td>
+            <td>Function call. <code>operand</code> is the callee <code>Ref</code>; <code>payload</code>
+            indexes a <code>Call</code> record in <code>extra</code>, followed by one trailing
+            <code>Ref</code> per argument (<code>args_len</code>). Result type is the callee's return type.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout info">
+        <span class="callout-icon">💡</span>
+        <div class="callout-body">
+          <p><code>Call</code> is <code>struct { args_len: u32 }</code> with a trailing list of
+          <code>Inst.Ref</code>. This is the same "fixed header + trailing slice in <code>extra</code>"
+          pattern the AST and DIR use for variable-length data.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── DATA ─── -->
+    <section class="section" id="data">
+      <h2 class="section-title"><span class="icon">📦</span>Data union</h2>
+
+      <p>
+        Every instruction has an <strong>8-byte</strong> payload in this union. <code>Tag</code> picks
+        the active field:
+      </p>
+
+      <table class="tag-table">
+        <thead><tr><th>Field</th><th>Shape</th><th>Used by</th></tr></thead>
+        <tbody>
+          <tr><td>un_op</td><td><code>Ref</code></td><td><code>ret</code> — a single operand</td></tr>
+          <tr><td>ty</td><td><code>Type</code></td><td>an instruction that produces a type directly</td></tr>
+          <tr>
+            <td>pl_op</td>
+            <td><code>struct { operand: Ref, payload: u32 }</code></td>
+            <td><code>call</code> — one operand plus a <code>u32</code> offset into <code>extra</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="mem-diagram">
+        <div class="mem-label">a call instruction and its extra record</div>
+        <div class="mem-row">
+          <span class="mem-index">%7</span>
+          <div class="mem-cell blue"><span class="cell-label">tag</span>call</div>
+          <div class="mem-cell blue"><span class="cell-label">pl_op.operand</span>callee Ref</div>
+          <div class="mem-cell blue"><span class="cell-label">pl_op.payload</span>idx = 3</div>
+        </div>
+        <div style="height:.5rem"></div>
+        <div class="mem-label">extra — indexed by payload</div>
+        <div class="mem-row">
+          <span class="mem-index">3</span><div class="mem-cell orange"><span class="cell-label">Call.args_len</span>2</div>
+          <span class="mem-index">4</span><div class="mem-cell teal"><span class="cell-label">arg[0]</span>Ref</div>
+          <span class="mem-index">5</span><div class="mem-cell teal"><span class="cell-label">arg[1]</span>Ref</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── TYPEOF ─── -->
+    <section class="section" id="typeof">
+      <h2 class="section-title"><span class="icon">🏷️</span>typeOf — reading a Ref's type</h2>
+
+      <p>
+        <code>typeOf</code> is the canonical place the Ref decode branch shows up. Given any operand
+        <code>Ref</code>, first ask "is it a constant?" — if so its type comes from the InternPool;
+        otherwise it's an instruction and its type comes from the instruction.
+      </p>
+
+      <pre><code><span class="kw">pub fn</span> <span class="fn">typeOf</span>(air: *<span class="kw">const</span> Air, inst: Inst.Ref, ip: *<span class="kw">const</span> InternPool) Type {
+    <span class="kw">if</span> (inst.toInterned()) |ip_index| {          <span class="cm">// T=0 → a constant/type</span>
+        <span class="kw">return</span> .fromInterned(ip.typeOf(ip_index));
+    } <span class="kw">else</span> {                                     <span class="cm">// T=1 → an instruction</span>
+        <span class="kw">return</span> air.typeOfIndex(inst.toIndex().?, ip);
+    }
+}</code></pre>
+
+      <p>
+        <code>typeOfIndex</code> then switches on the instruction's tag. <code>call</code> resolves the
+        callee's type and returns its function return type; <code>ret</code> is <code>unreachable</code>
+        (it produces no value).
+      </p>
+    </section>
+
+    <hr class="divider">
+
+    <!-- ─── WORKED EXAMPLE ─── -->
+    <section class="section" id="worked-example">
+      <h2 class="section-title"><span class="icon">🎬</span>Worked example — round-tripping instruction #5</h2>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Sema emits an instruction</div>
+            <p class="flow-step-desc">It appends to <code>instructions</code>; the new slot number is
+            <code>len - 1 = 5</code>. As an <code>Index</code> that's <code>0x0000_0005</code>
+            (bit31 = 0, for free).</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">Wire it into another instruction</div>
+            <p class="flow-step-desc"><code>Index(5).toRef()</code> → <code>unwrap</code> sees T=0 →
+            <code>1&lt;&lt;31 | 5</code> = <code>0x8000_0005</code>. Now it's a Ref tagged
+            "instruction", ready to sit in an operand slot.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-step-content">
+            <div class="flow-step-title">A consumer reads that operand</div>
+            <p class="flow-step-desc"><code>ref.toInterned()</code> → bit31 is 1 → <code>null</code>
+            ("not a constant"). So it asks <code>ref.toIndex()</code> → bit31 is 1 → take low 31 bits →
+            <code>Index(5)</code>. Round-trips.</p>
+          </div>
+        </div>
+        <div class="flow-step" style="border-color:var(--accent-green)">
+          <div class="flow-step-content">
+            <div class="flow-step-title" style="color:var(--accent-green)">Contrast: a constant operand</div>
+            <p class="flow-step-desc">If the operand were <code>f64_type</code>
+            (<code>0x0000_0002</code>, bit31 = 0), <code>toInterned()</code> returns
+            <code>InternPool.Index(2)</code> immediately and <code>toIndex()</code> returns
+            <code>null</code> — no instruction behind it.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="mem-diagram" style="margin-top:1.5rem">
+        <div class="mem-label">the round trip</div>
+        <div class="mem-row">
+          <div class="mem-cell purple" style="min-width:150px"><span class="cell-label">Index space</span>%5 = 0x0000_0005</div>
+          <span class="mem-arrow">── toRef (set bit31) ──▶</span>
+          <div class="mem-cell blue" style="min-width:150px"><span class="cell-label">Ref space</span>0x8000_0005</div>
+        </div>
+        <div class="mem-row">
+          <div class="mem-cell purple" style="min-width:150px"><span class="cell-label">Index space</span>%5 = 0x0000_0005</div>
+          <span class="mem-arrow">◀── toIndex (mask low 31) ──</span>
+          <div class="mem-cell blue" style="min-width:150px"><span class="cell-label">Ref space</span>0x8000_0005</div>
+        </div>
+      </div>
+
+      <div class="callout tip">
+        <span class="callout-icon">🧠</span>
+        <div class="callout-body">
+          <p><strong>Mental model:</strong> <code>Ref</code> = tagged union of
+          {InternPool value | instruction}; <code>Index</code> = tagged union of
+          {normal instruction | target instruction}. "Unwrap" reads the tag bit; "convert to ref" moves
+          the instruction number into Ref's encoding by turning the tag bit on. Pure bit twiddling.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // Highlight the active nav link based on scroll position
+  const sections = document.querySelectorAll('.section[id]');
+  const links = document.querySelectorAll('.nav-link');
+
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const active = document.querySelector(`.nav-link[href="#${e.target.id}"]`);
+        if (active) active.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+
+  sections.forEach(s => obs.observe(s));
+</script>
+</body>
+</html>

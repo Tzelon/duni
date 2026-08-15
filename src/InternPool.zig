@@ -721,6 +721,14 @@ pub fn funcTypeReturnType(ip: *const InternPool, ty: Index) Index {
     return extraData(ip, Tag.TypeFunction, item.data).return_type;
 }
 
+pub fn indexToFuncType(ip: *const InternPool, val: Index) ?Key.FuncType {
+    const item = ip.items.get(@intFromEnum(val));
+    switch (item.tag) {
+        .type_function => return extraFuncType(ip, item.data),
+        else => return null,
+    }
+}
+
 pub fn deinit(
     ip: *InternPool,
     gpa: Allocator,

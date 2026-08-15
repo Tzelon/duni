@@ -123,10 +123,11 @@ real Sema arms:
 
 - **`break_inline`** (`dirBreakInline`): value = its operand. Duni's inline
   bodies are **linear, single-break, target = enclosing block**, so there's
-  no `error.ComptimeBreak` unwinding — the value is computed at the break and
-  stored in `inst_map`; the enclosing block reads its last instruction. Zig's
-  `analyzeInlineBody`/`resolveInlineBody` exist only to demux that exception
-  protocol; Duni needs neither.
+  no `error.ComptimeBreak` unwinding — a body's result is read straight off
+  the terminating break's `operand` (see `resolveInlineBody` below), never
+  merged. Zig's `analyzeInlineBody`/`resolveInlineBody` exist mostly to demux
+  that exception protocol; Duni's `resolveInlineBody` is the trivial linear
+  case.
 - **`block_inline`** (`dirBlockInline`): run body, value = last inst. Today
   identical to `dirBlock` (fold-only, no runtime Air block), kept separate
   because they split when `block` grows a runtime path.
@@ -139,3 +140,35 @@ real Sema arms:
   accumulator — the walk reuses the mandatory `inst_map` entries, avoids
   duplicate state, and `param_block` is load-bearing again for fn bodies),
   resolve `RetTy`, call `getFuncType`. Zig ref: `zirFunc`/`funcCommon`.
+
+## `resolveInlineBody` and the control-flow seam
+
+`resolveInlineBody(body)` runs the body, then returns its result by decoding
+the **terminating `break_inline`'s `operand`** — not `inst_map.get(body[last])`.
+The value flows through the break's operand (the real dataflow), matching
+Zig's model where `break_inline` is a *terminator*, not a value-producing
+instruction. The break is last by construction — every AstGen inline body ends
+in `addBreak(.break_inline, …)` — asserted on the tag. Shared by every
+inline-body site: `dirParam`, `analyzeDeclaration`, `dirBlockInline`,
+`analyzeArg`. (Consequence: `dirBreakInline`'s `inst_map` write is now dead —
+nothing reads a break by index — so `.break_inline` need not stay a
+value-producing dispatch arm once this lands.)
+
+Correct only because today's bodies are **linear and single-break**. Each
+control-flow feature breaks a different assumption, and the fix is Zig
+machinery added *around* the same operand read, not a rewrite:
+
+- **conditional `break` / early `return`** — the break is no longer last (it
+  sits inside an `if`). Needs `error.ComptimeBreak` + `comptime_break_inst`
+  unwinding (`analyzeBodyInner`) so a nested break reaches its target.
+- **multiple exits** — a block caught by several breaks → the result is a
+  **merge** (`Block.Merges`): the taken value at comptime, a runtime
+  `block`/`br` otherwise. Replaces "result = last inst's operand".
+- **labeled `break :outer`** — target ≠ enclosing block; the break's stored
+  `block_inst` target is compared and propagated outward.
+- **loops** (`continue`) — runtime control-flow Air: `br`/`cond_br`/`loop`.
+
+`resolveInlineBody` **survives** all of this as the linear-inline fast path —
+param/arg/decl-type bodies are genuinely loop-free expressions, exactly like
+Zig's kept `resolveInlineBody`. The merge/unwind path is added *alongside* for
+runtime block/loop bodies. Lands with the loops arc; not pre-built.

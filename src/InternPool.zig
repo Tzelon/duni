@@ -320,6 +320,9 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
     const new_index: Index = @enumFromInt(ip.items.len);
     try ip.items.ensureUnusedCapacity(gpa, 1);
     const gop = try ip.map.getOrPutContextAdapted(gpa, key, adapter, ctx);
+
+    // remove the key if something fails
+    errdefer ip.map.removeByPtr(gop.key_ptr);
     if (gop.found_existing) return gop.key_ptr.*;
 
     switch (key) {
@@ -533,8 +536,14 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             .ty = .comptime_int_type,
             .storage = .{ .i64 = @as(i32, @bitCast(data)) },
         } },
-        .int_u32 => unreachable,
-        .int_i32 => unreachable,
+        .int_i32 => .{ .int = .{
+            .ty = .i32_type,
+            .storage = .{ .i64 = @as(i32, @bitCast(data)) },
+        } },
+        .int_u32 => .{ .int = .{
+            .ty = .u32_type,
+            .storage = .{ .u64 = data },
+        } },
         .int_positive => ip.indexToKeyBigInt(data, true),
         .int_negative => ip.indexToKeyBigInt(data, false),
         .float_f64 => .{ .float = .{
@@ -576,6 +585,10 @@ pub fn isIntegerType(ip: *const InternPool, ty: Index) bool {
     _ = ip;
     return switch (ty) {
         .comptime_int_type,
+        .u64_type,
+        .u32_type,
+        .i64_type,
+        .i32_type,
         => true,
         else => false,
     };
@@ -789,9 +802,7 @@ const Context = struct {
         return ctx.ip.indexToKey(index).hash64(ctx.ip);
     }
     pub fn eql(ctx: @This(), a: Index, b: Index) bool {
-        std.debug.print("a .{}", .{ctx.ip.indexToKey(a)});
-        std.debug.print("b .{}", .{ctx.ip.indexToKey(a)});
-        return std.meta.eql(ctx.ip.indexToKey(a), ctx.ip.indexToKey(b));
+        return ctx.ip.indexToKey(a).eql(ctx.ip.indexToKey(b), ctx.ip);
     }
 };
 
@@ -1015,4 +1026,56 @@ test "InternPool dedups big integers" {
     const a = try ip.get(gpa, key);
     const b = try ip.get(gpa, key);
     try std.testing.expect(a == b);
+}
+
+test "InternPool get leaves no phantom map entry when an allocation fails" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    // A comptime_float is interned by writing a `Float64` into `extra`.
+    const key: Key = .{ .float = .{
+        .ty = .comptime_float_type,
+        .storage = .{ .f64 = 3.5 },
+    } };
+
+    var failing_state: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ip.get(failing_state.allocator(), key));
+
+    // Every entry in the map must name a real item, and there must be exactly one entry per item.
+    var it = ip.map.keyIterator();
+    while (it.next()) |interned| {
+        try std.testing.expect(@intFromEnum(interned.*) < ip.items.len);
+    }
+    try std.testing.expectEqual(ip.items.len, @as(usize, ip.map.count()));
+
+    // The pool is still usable.
+    const index = try ip.get(gpa, key);
+    try std.testing.expectEqual(@as(f64, 3.5), ip.indexToKey(index).float.storage.f64);
+}
+
+test "InternPool Context.eql compares big integers by value, not by limb identity" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    // A Duni integer literal too large for u64 is stored as limbs, so its `Key`
+    // holds a slice into `ip.limbs`. Two occurrences of the same literal hold
+    // equal digits at different offsets, so comparing the slices themselves
+    // instead of the digits they point at reports equal values as different.
+    // The two items are placed with `addInt` because `get` dedups through
+    // `Adapter`, which never lets a second copy reach `Context`.
+    var limbs = [_]Limb{ 0, 1 << 36 }; // 2^100
+    try ip.items.ensureUnusedCapacity(gpa, 2);
+    try addInt(&ip, gpa, .comptime_int_type, .int_positive, &limbs);
+    const first: Index = @enumFromInt(ip.items.len - 1);
+    try addInt(&ip, gpa, .comptime_int_type, .int_positive, &limbs);
+    const second: Index = @enumFromInt(ip.items.len - 1);
+
+    const ctx: Context = .{ .ip = &ip };
+    try std.testing.expect(ctx.eql(first, second));
 }

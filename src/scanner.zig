@@ -244,7 +244,18 @@ pub const Scanner = struct {
                 }
             },
 
-            .invalid => unreachable,
+            .invalid => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0 => if (self.index == self.buffer.len) {
+                        result.tag = .invalid;
+                    } else {
+                        continue :state .invalid;
+                    },
+                    '\n' => result.tag = .invalid,
+                    else => continue :state .invalid,
+                }
+            },
         }
 
         result.loc.end = self.index;
@@ -259,6 +270,7 @@ pub const Scanner = struct {
             .r_brace,
             .number_literal,
             .string_literal,
+            .invalid,
             => true,
             else => false,
         };
@@ -365,7 +377,7 @@ test "tokenizer" {
     try expectToken("\"hello world\"", &.{.string_literal});
     try expectToken("\"a\"\nx", &.{ .string_literal, .newline, .identifier });
     try expectToken("\"abc", &.{.invalid});
-    try expectToken("\"a\nb", &.{ .invalid, .identifier });
+    try expectToken("\"a\nb", &.{ .invalid, .newline, .identifier });
     try expectToken("\"a\\\"b\"", &.{.string_literal});
     try expectToken("}\nx", &.{ .r_brace, .newline, .identifier });
     try expectToken("extern fn add(x number, y number) number", &.{ .keyword_extern, .keyword_fn, .identifier, .l_paren, .identifier, .identifier, .comma, .identifier, .identifier, .r_paren, .identifier });

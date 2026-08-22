@@ -165,22 +165,6 @@ pub const Key = union(enum) {
         lib_name: OptionalNullTerminatedString,
     };
 
-    /// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
-    /// implement logic that only wants to deal with types because the logic can
-    /// ignore all simple values. Note that technically, types are values.
-    pub const SimpleType = enum(u32) {
-        comptime_int = @intFromEnum(Index.comptime_int_type),
-        comptime_float = @intFromEnum(Index.comptime_float_type),
-        u32 = @intFromEnum(Index.u32_type),
-        i32 = @intFromEnum(Index.i32_type),
-        u64 = @intFromEnum(Index.u64_type),
-        i64 = @intFromEnum(Index.i64_type),
-        f64 = @intFromEnum(Index.f64_type),
-        string = @intFromEnum(Index.string_type),
-        void = @intFromEnum(Index.void_type),
-        type = @intFromEnum(Index.type_type),
-    };
-
     pub fn hash64(key: Key, ip: *const InternPool) u64 {
         const asBytes = std.mem.asBytes;
         const KeyTag = @typeInfo(Key).@"union".tag_type.?;
@@ -294,6 +278,22 @@ pub const Key = union(enum) {
             .func_type => |a_info| return a_info.eql(b.func_type, ip),
         }
     }
+};
+
+/// Having `SimpleType` and `SimpleValue` in separate enums makes it easier to
+/// implement logic that only wants to deal with types because the logic can
+/// ignore all simple values. Note that technically, types are values.
+pub const SimpleType = enum(u32) {
+    comptime_int = @intFromEnum(Index.comptime_int_type),
+    comptime_float = @intFromEnum(Index.comptime_float_type),
+    u32 = @intFromEnum(Index.u32_type),
+    i32 = @intFromEnum(Index.i32_type),
+    u64 = @intFromEnum(Index.u64_type),
+    i64 = @intFromEnum(Index.i64_type),
+    f64 = @intFromEnum(Index.f64_type),
+    string = @intFromEnum(Index.string_type),
+    void = @intFromEnum(Index.void_type),
+    type = @intFromEnum(Index.type_type),
 };
 
 pub const SimpleValue = enum(u32) {

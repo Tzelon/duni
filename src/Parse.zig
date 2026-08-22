@@ -235,10 +235,7 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .eof => comptime ParseRule.init(null, null, .prec_none),
         .newline => comptime ParseRule.init(null, null, .prec_none),
         .comma => comptime ParseRule.init(null, null, .prec_none),
-        else => {
-            log.err("no rule for token {}", .{tag});
-            unreachable;
-        },
+        .invalid => comptime ParseRule.init(null, null, .prec_none),
     };
 
     return rule;

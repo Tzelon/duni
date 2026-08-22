@@ -216,6 +216,7 @@ fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
             try gen.writeIndent();
             try gen.out.print("i32.const {d}\n", .{handle.length(gen.ip)});
         },
+        .simple_value => @panic("value is not reachable yet"),
     }
 }
 

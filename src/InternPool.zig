@@ -49,22 +49,21 @@ pub const Index = enum(u32) {
     i32_type,
     u64_type,
     i64_type,
-
     f64_type,
-
     comptime_int_type,
     comptime_float_type,
     string_type,
-    //TODO(tzelon): should duni have void_type?
     void_type,
+    type_type,
+
     /// `0` (comptime_int)
     zero,
     /// `1` (comptime_int)
     one,
     /// `-1` (comptime_int)
     negative_one,
-
-    type_type,
+    /// `()`
+    void_value,
 
     /// Used by Air/Sema only.
     none = std.math.maxInt(u32),
@@ -98,6 +97,7 @@ pub const Key = union(enum) {
     float: Float,
     string: NullTerminatedString,
 
+    simple_value: SimpleValue,
     @"extern": Extern,
     func_type: FuncType,
 
@@ -187,7 +187,10 @@ pub const Key = union(enum) {
         const seed = @intFromEnum(@as(KeyTag, key));
 
         return switch (key) {
-            .simple_type => |x| Hash.hash(seed, asBytes(&x)),
+            inline .simple_type,
+            .simple_value,
+            => |x| Hash.hash(seed, asBytes(&x)),
+
             .int => |int| {
                 var hasher = Hash.init(seed);
                 // Canonicalize all integers by converting them to BigIntConst.
@@ -232,6 +235,11 @@ pub const Key = union(enum) {
         switch (a) {
             .simple_type => |a_info| {
                 const b_info = b.simple_type;
+                return a_info == b_info;
+            },
+
+            .simple_value => |a_info| {
+                const b_info = b.simple_value;
                 return a_info == b_info;
             },
 
@@ -288,6 +296,10 @@ pub const Key = union(enum) {
     }
 };
 
+pub const SimpleValue = enum(u32) {
+    void = @intFromEnum(Index.void_value),
+};
+
 pub fn init(ip: *InternPool, gpa: Allocator) !void {
     errdefer ip.deinit(gpa);
 
@@ -308,6 +320,7 @@ pub fn init(ip: *InternPool, gpa: Allocator) !void {
 
     if (std.debug.runtime_safety) {
         // Sanity check.
+        assert(ip.indexToKey(.void_value).simple_value == .void);
         // assert(ip.indexToKey(.bool_true).simple_value == .true);
         // assert(ip.indexToKey(.bool_false).simple_value == .false);
     }
@@ -330,6 +343,13 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
             assert(@intFromEnum(simple_type) == ip.items.len);
             ip.items.appendAssumeCapacity(.{
                 .tag = .simple_type,
+                .data = 0, // avoid writing `undefined` bits to a file
+            });
+        },
+        .simple_value => |simple_value| {
+            assert(@intFromEnum(simple_value) == ip.items.len);
+            ip.items.appendAssumeCapacity(.{
+                .tag = .simple_value,
                 .data = 0, // avoid writing `undefined` bits to a file
             });
         },
@@ -528,6 +548,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
 
     return switch (tag) {
         .simple_type => .{ .simple_type = @enumFromInt(@intFromEnum(index)) },
+        .simple_value => .{ .simple_value = @enumFromInt(@intFromEnum(index)) },
         .int_comptime_int_u32 => .{ .int = .{
             .ty = .comptime_int_type,
             .storage = .{ .u64 = data },
@@ -727,6 +748,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
         => .type_type,
 
         .zero, .one, .negative_one => .comptime_int_type,
+        .void_value => .void_type,
 
         // This optimization on tags is needed so that indexToKey can call
         // typeOf without being recursive.
@@ -760,6 +782,10 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
                 },
 
                 .@"extern" => extraData(ip, Key.Extern, item.data).ty,
+
+                // values, not types
+                .simple_value,
+                => unreachable,
             };
         },
         .none => unreachable,
@@ -862,10 +888,11 @@ pub const Tag = enum(u8) {
     /// data is NullTerminatedString
     string,
 
+    /// A value that can be represented with only an enum tag.
+    simple_value,
     /// A function body type.
     /// `data` is extra index to `TypeFunction`.
     type_function,
-
     /// An extern function (a host import).
     /// `data` is extra index to `Key.Extern`.
     @"extern",
@@ -888,6 +915,8 @@ pub const static_keys: [static_len]Key = .{
     .{ .simple_type = .comptime_float },
     .{ .simple_type = .string },
     .{ .simple_type = .void },
+    .{ .simple_type = .type },
+
     .{ .int = .{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = 0 },
@@ -900,7 +929,7 @@ pub const static_keys: [static_len]Key = .{
         .ty = .comptime_int_type,
         .storage = .{ .i64 = -1 },
     } },
-    .{ .simple_type = .type },
+    .{ .simple_value = .void },
 };
 
 test "InternPool same key returns same index" {
@@ -1078,4 +1107,15 @@ test "InternPool Context.eql compares big integers by value, not by limb identit
 
     const ctx: Context = .{ .ip = &ip };
     try std.testing.expect(ctx.eql(first, second));
+}
+
+test "InternPool void value is a value of type void" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    try std.testing.expectEqual(SimpleValue.void, ip.indexToKey(.void_value).simple_value);
+    try std.testing.expectEqual(Index.void_type, ip.typeOf(.void_value));
 }

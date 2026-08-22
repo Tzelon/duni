@@ -177,12 +177,13 @@ pub const Inst = struct {
         comptime_int_type,
         comptime_float_type,
         string_type,
-        //TODO(tzelon): should duni have void_type?
         void_type,
+        type_type,
+
         zero,
         one,
         negative_one,
-        type_type,
+        void_value,
 
         /// This Ref does not correspond to any DIR instruction or constant
         /// value and may instead be used as a sentinel to indicate null.

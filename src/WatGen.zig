@@ -146,7 +146,12 @@ fn writeEscapedBytes(gen: *WatGen, bytes: []const u8) !void {
 
 fn writeFunc(gen: *WatGen) !void {
     try gen.writeIndent();
-    try gen.out.print("(func $main (result {s})\n", .{gen.resultType()});
+    try gen.out.writeAll("(func $main");
+    // A void result has no wasm value type, so the clause is omitted entirely
+    // rather than mapped — same gate as `writeImports`.
+    const ret_ty = gen.resultType();
+    if (ret_ty != .void_type) try gen.out.print(" (result {s})", .{wasmType(ret_ty)});
+    try gen.out.writeAll("\n");
     gen.indent += 1;
     try gen.writeBody();
     gen.indent -= 1;
@@ -154,13 +159,15 @@ fn writeFunc(gen: *WatGen) !void {
     try gen.out.writeAll(")\n");
 }
 
-/// The wasm type of `main`'s result, from the type of the value the final
-/// `ret` returns — via `air.typeOf`, so a runtime call result (an AIR
-/// instruction ref, not an interned value) resolves too.
-fn resultType(gen: *const WatGen) []const u8 {
-    const datas = gen.air.instructions.items(.data);
-    const ret_ref = datas[gen.air.instructions.len - 1].un_op;
-    return wasmType(gen.air.typeOf(ret_ref, gen.ip).toIntern());
+/// The type of `main`'s result, from the value the final `ret` returns — via
+/// `air.typeOf`, so a runtime call result (an AIR instruction ref, not an
+/// interned value) resolves too. `Sema.analyze` always appends the `ret` last,
+/// so the terminator is found by position; the assert keeps that checked.
+fn resultType(gen: *const WatGen) InternPool.Index {
+    const last = gen.air.instructions.len - 1;
+    std.debug.assert(gen.air.instructions.items(.tag)[last] == .ret);
+    const ret_ref = gen.air.instructions.items(.data)[last].un_op;
+    return gen.air.typeOf(ret_ref, gen.ip).toIntern();
 }
 
 fn writeBody(gen: *WatGen) !void {
@@ -216,7 +223,10 @@ fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
             try gen.writeIndent();
             try gen.out.print("i32.const {d}\n", .{handle.length(gen.ip)});
         },
-        .simple_value => @panic("value is not reachable yet"),
+        .simple_value => |value| switch (value) {
+            // `void` has no runtime representation — nothing to push.
+            .void => {},
+        },
     }
 }
 
@@ -349,4 +359,24 @@ test "emit call to extern" {
         \\)
         \\
     , w.buffer[0..w.end]);
+}
+
+test "emit void result" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    // `void` has no wasm value type, so `main` gets no `(result …)` clause and
+    // nothing is pushed before the `return`.
+    try expectWatIndex(&ip, .void_value,
+        \\(module
+        \\  (func $main
+        \\    return
+        \\  )
+        \\  (export "main" (func $main))
+        \\)
+        \\
+    );
 }

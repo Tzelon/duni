@@ -154,7 +154,7 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .decl_val => try self.writeStrTok(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),
         .block, .block_inline => try self.writeBlock(data),
-        .break_inline => try self.writeBreak(data),
+        .@"break", .break_inline => try self.writeBreak(data),
         .declaration => try self.writeDeclaration(data),
         .func => try self.writeFunc(data),
         .param => try self.writeParam(data),

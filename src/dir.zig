@@ -17,8 +17,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
-const InternPool = @import("InternPool.zig");
-
 const Ast = @import("Ast.zig");
 
 instructions: std.MultiArrayList(Inst).Slice,
@@ -72,12 +70,15 @@ pub const Inst = struct {
         /// A block of code, which return a value.
         /// Uses the `pl_node` union field. Payload is `Block`.
         block,
+        /// Return a value from a block.
+        /// Uses the `break` union field.
+        /// Uses the source information from previous instruction.
+        @"break",
         /// A list of instructions which are analyzed in the parent context, without
         /// generating a runtime block. Must terminate with an "inline" variant of
         /// a noreturn instruction.
         /// Uses the `pl_node` union field. Payload is `Block`.
         block_inline,
-
         /// Return a value from a block. This instruction is used as the terminator
         /// of a `block_inline`. It allows using the return value from `Sema.analyzeBody`.
         /// This instruction may also be used when it is known that there is only one

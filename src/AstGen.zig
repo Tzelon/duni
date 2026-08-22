@@ -415,9 +415,8 @@ fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     const astgen = gd.astgen;
     const statements = astgen.tree.blockExpressions(node);
 
-    // Since this block is unlabeled, its control flow is effectively linear and we
-    // can *almost* get away with inlining the block here. However, we actually need
-    // to preserve the .block for Sema, to properly pop the error return trace.
+    // Duni block is an expression, with the last expression as the implicit break operand.
+    // An empty block breaks with void_value
 
     const block_tag: Dir.Inst.Tag = .block;
     const block_inst = try gd.makeBlockInst(block_tag, node);
@@ -426,9 +425,12 @@ fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     var block_scope = gd.makeSubBlock();
     defer block_scope.unstack();
 
+    // default return void from block
+    var result: Dir.Inst.Ref = .void_value;
     for (statements) |statement| {
-        _ = try expr(&block_scope, statement);
+        result = try expr(&block_scope, statement);
     }
+    _ = try block_scope.addBreak(.@"break", block_inst, result);
 
     try block_scope.setBlockBody(block_inst);
 
@@ -1620,11 +1622,21 @@ test "rebind rhs sees the previous binding" {
     );
 }
 
+test "block default break" {
+    try expect("{}",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:3
+        \\%2 = break(%1, void_value)
+        \\
+    );
+}
+
 test "block" {
     try expect("{ 1 }",
         \\%0 = module_decl(%1)
-        \\%1 = block(%2) node_offset:1:1 to :1:6
+        \\%1 = block(%2, %3) node_offset:1:1 to :1:6
         \\%2 = int(1)
+        \\%3 = break(%1, %2)
         \\
     );
 
@@ -1634,8 +1646,9 @@ test "block" {
         \\}
     ,
         \\%0 = module_decl(%1)
-        \\%1 = block(%2) node_offset:1:1 to :1:2
+        \\%1 = block(%2, %3) node_offset:1:1 to :1:2
         \\%2 = int(1)
+        \\%3 = break(%1, %2)
         \\
     );
 }

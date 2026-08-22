@@ -65,8 +65,11 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
     try analyzeBody(&sema, ip, module.body);
 
-    const last_indx = module.body[module.body.len - 1];
-    const last_ref = sema.inst_map.get(last_indx).?;
+    // in case of empty module do not crash
+    const last_ref: Air.Inst.Ref = if (module.body.len == 0)
+        .fromInterned(.void_value)
+    else
+        sema.inst_map.get(module.body[module.body.len - 1]).?;
 
     const result_ty = sema.typeOf(ip, last_ref);
 
@@ -116,6 +119,7 @@ fn analyzeBody(
             .div => try sema.dirArithmetic(ip, .div, inst_idx),
             .str => try sema.dirStr(ip, inst_idx),
             .block => try sema.dirBlock(ip, inst_idx),
+            .@"break" => try sema.dirBreak(ip, inst_idx),
             .decl_val => try sema.dirDeclVal(ip, inst_idx),
             // The module instruction is never inside a body; a nested-module
             // mistake should trap here, not be skipped.
@@ -413,6 +417,8 @@ fn dirFunc(
     return .fromInterned(fn_ty);
 }
 
+//TODO(tzelon): block needs Block struct to function, which we can break out of.
+// Currently we just copy the instructions into the inst_map
 fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
@@ -420,7 +426,34 @@ fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air
 
     try sema.analyzeBody(ip, body);
 
-    return sema.inst_map.get(body[body.len - 1]).?;
+    //TODO(tzelon): get the break operand and return it from the block which is the owner of the return value
+    const break_data = sema.code.instructions.items(.data)[@intFromEnum(body[body.len - 1])].@"break";
+    const break_extra = sema.code.extraData(Dir.Inst.Break, break_data.payload_index).data;
+    assert(break_extra.block_inst == inst);
+
+    return sema.resolveInst(break_data.operand);
+}
+
+fn dirBreak(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    // const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].@"break";
+    // const extra = sema.code.extraData(Dir.Inst.Break, inst_data.payload_index).data;
+    // const operand = sema.resolveInst(inst_data.operand);
+    // //TODO(tzelon): unused for now, this is the actual block the break is breaking
+    // _ = extra.block_inst;
+    //
+    // return sema.addInst(.{
+    //     .tag = .br,
+    //     .data = .{ .br = .{
+    //         .block_inst = extra.block_inst,
+    //         .operand = operand,
+    //     } },
+    // });
+
+    _ = ip;
+    // Linear single-break: the break's value is just its operand. No
+    // error.ComptimeBreak unwinding (Zig's analyzeBodyInner).
+    const operand = sema.code.instructions.items(.data)[@intFromEnum(inst)].@"break".operand;
+    return sema.resolveInst(operand);
 }
 
 fn dirBlockInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -981,28 +1014,39 @@ test "analyze 1 / 0 fails analysis" {
 test "analyze block" {
     const gpa = std.testing.allocator;
 
-    // { 1\n 2 } — block evaluates to its last expression, not the first
+    const Ast = @import("Ast.zig");
+
+    // { 1\n 2 } — block evaluates to its last expression, not the first.
+    // The body ends with a `break` carrying the result, as AstGen emits it.
     var list: std.MultiArrayList(Dir.Inst) = .{};
     defer list.deinit(gpa);
     try list.append(gpa, .{ .tag = .extended, .data = .{ .extended = .{
         .opcode = .module_decl,
         .small = @bitCast(Dir.Inst.ModuleDecl.Small{}),
-        .operand = 3,
+        .operand = 4,
     } } });
     try list.append(gpa, .{ .tag = .block, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } });
     try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
     try list.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(3)).toRef(),
+        .payload_index = 8,
+    } } });
 
-    // extra[0..3]: block payload — body_len=2, %2, %3
-    // extra[3..7]: ModuleDecl{src_node, decls_len=0, body_len=1} + main body %1
-    const extra = try gpa.alloc(u32, 7);
-    extra[0] = 2; // block body_len
+    // extra[0..4]: block payload — body_len=3, %2, %3, %4
+    // extra[4..8]: ModuleDecl{src_node, decls_len=0, body_len=1} + main body %1
+    // extra[8..10]: Break payload — operand_src_node, block_inst
+    const extra = try gpa.alloc(u32, 10);
+    extra[0] = 3; // block body_len
     extra[1] = 2; // %2
     extra[2] = 3; // %3
-    extra[3] = 0; // ModuleDecl.src_node = .root
-    extra[4] = 0; // ModuleDecl.decls_len
-    extra[5] = 1; // ModuleDecl.body_len
-    extra[6] = 1; // main body: %1
+    extra[3] = 4; // %4
+    extra[4] = 0; // ModuleDecl.src_node = .root
+    extra[5] = 0; // ModuleDecl.decls_len
+    extra[6] = 1; // ModuleDecl.body_len
+    extra[7] = 1; // main body: %1
+    extra[8] = @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none)); // Break.operand_src_node
+    extra[9] = 1; // Break.block_inst = %1
 
     var dir: Dir = .{
         .instructions = list.toOwnedSlice(),

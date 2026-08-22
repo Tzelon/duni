@@ -52,8 +52,6 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, std.Io.Limit.unlimited, std.mem.Alignment.of(u8), 0);
     defer allocator.free(source);
 
-    std.debug.print("source \n {s} :source \n", .{source});
-
     var ip: InternPool = .{};
     try ip.init(allocator);
     defer ip.deinit(allocator);

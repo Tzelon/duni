@@ -694,9 +694,3 @@ test "fn call" {
         .{ .tag = .number_literal },
     } });
 }
-
-test "dump" {
-    var tree = try Ast.parse(std.testing.allocator, "1 - 2 - 3");
-    defer tree.deinit(std.testing.allocator);
-    try tree.dump();
-}

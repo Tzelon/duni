@@ -107,6 +107,13 @@ pub const Inst = struct {
         /// AST node is the function call.
         call,
 
+        /// Sends control flow back to the function's callers, carrying the
+        /// return value. Terminates a function value body (the implicit
+        /// return of the body's last expression; an explicit `return`
+        /// statement lands here too when it arrives).
+        /// Uses the `un_node` union field.
+        ret_node,
+
         /// Returns a function type, or a function instance, depending on whether
         /// the body_len is 0. Calling convention is auto.
         /// Uses the `pl_node` union field. `payload_index` points to a `Func`.

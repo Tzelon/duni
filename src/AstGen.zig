@@ -7,6 +7,7 @@ const Node = Ast.Node;
 const full = Ast.full;
 
 const Dir = @import("Dir.zig");
+const Diagnostics = @import("Diagnostics.zig");
 
 const Scope = @import("AstGen/Scope.zig");
 
@@ -26,6 +27,7 @@ const InnerError = error{ OutOfMemory, AnalysisFail };
 
 gpa: Allocator,
 tree: *const Ast,
+diags: *Diagnostics,
 instructions: std.MultiArrayList(Dir.Inst) = .{},
 extra: ArrayList(u32) = .empty,
 
@@ -50,12 +52,13 @@ string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.d
 /// AstGen error reporting phase 1 lands.
 any_failed_decls: bool = false,
 
-pub fn generate(gpa: Allocator, tree: Ast) !Dir {
+pub fn generate(gpa: Allocator, tree: Ast, diags: *Diagnostics) !Dir {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
     var astgen = AstGen{
         .tree = &tree,
+        .diags = diags,
         .arena = arena.allocator(),
         .gpa = gpa,
         .scope_arena = std.heap.ArenaAllocator.init(gpa),
@@ -253,9 +256,11 @@ fn fnDecl(
     const is_extern = if (fn_proto.extern_token) |_| true else false;
 
     if (body_node == .none and !is_extern) {
-        // TODO(tzelon): AstGen error reporting phase 1.
-        // return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
-        std.log.warn("non-extern function has no body", .{});
+        try astgen.diags.addError(
+            .{ .byte = astgen.tree.tokenStart(fn_proto.ast.fn_token) },
+            "non-extern function has no body",
+            .{},
+        );
         return error.AnalysisFail;
     }
 
@@ -332,8 +337,11 @@ fn fnDeclInner(
         while (scope != params_scope_start) {
             const previous_param = scope.cast(Scope.LocalVal).?;
             if (previous_param.name == param_name) {
-                // TODO(tzelon): AstGen error reporting phase 1.
-                std.log.warn("duplicate function parameter name '{s}'", .{try astgen.identifierTokenString(name_token)});
+                try astgen.diags.addError(
+                    .{ .byte = tree.tokenStart(name_token) },
+                    "duplicate function parameter name '{s}'",
+                    .{try astgen.identifierTokenString(name_token)},
+                );
                 return error.AnalysisFail;
             }
             scope = previous_param.parent;
@@ -388,9 +396,7 @@ fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index,
     const result: Dir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
         .int => |num| switch (num) {
             0 => if (sign == .positive) try gd.addInt(num) else {
-                // TODO(tzelon): report through AstGen error reporting once it
-                // exists; log.warn because the test runner fails on log.err.
-                std.log.warn("0 cannot be negative", .{});
+                try astgen.diags.addError(.{ .byte = tree.tokenStart(num_token) }, "0 cannot be negative", .{});
                 return error.AnalysisFail;
             },
 
@@ -423,7 +429,7 @@ fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index,
             return try gd.addFloat(smaller_float);
         },
         .failure => {
-            std.log.warn("failed to parse literal number", .{});
+            try astgen.diags.addError(.{ .byte = tree.tokenStart(num_token) }, "invalid number literal", .{});
             return error.AnalysisFail;
         },
     };
@@ -477,8 +483,7 @@ fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
 
     // The lhs is a pattern; today only a plain identifier is supported.
     if (tree.nodeTag(lhs_node) != .identifier) {
-        // TODO(tzelon): AstGen error reporting phase 1.
-        std.log.warn("unsupported pattern", .{});
+        try astgen.diags.addError(.{ .byte = tree.tokenStart(tree.firstToken(lhs_node)) }, "unsupported pattern", .{});
         return error.AnalysisFail;
     }
 
@@ -671,8 +676,11 @@ fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) 
 
     // No namespaces yet: the scope chain is the complete set of names,
     // so a miss means the identifier is undeclared.
-    // TODO(tzelon): AstGen error reporting phase 1.
-    std.log.warn("use of undeclared identifier '{s}'", .{try astgen.identifierTokenString(ident_token)});
+    try astgen.diags.addError(
+        .{ .byte = astgen.tree.tokenStart(ident_token) },
+        "use of undeclared identifier '{s}'",
+        .{try astgen.identifierTokenString(ident_token)},
+    );
     return error.AnalysisFail;
 }
 
@@ -765,7 +773,6 @@ fn parseStrLit(
     bytes: []const u8,
     offset: u32,
 ) InnerError!void {
-    _ = token;
     const raw_string = bytes[offset..];
     const result = r: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(astgen.gpa, buf);
@@ -776,7 +783,10 @@ fn parseStrLit(
     };
     switch (result) {
         .success => return,
-        .failure => |err| return std.log.warn("{f}", .{err.fmt(raw_string)}), //astgen.failWithStrLitError(err, token, bytes, offset),
+        .failure => |err| {
+            try astgen.diags.addError(.{ .byte = astgen.tree.tokenStart(token) }, "{f}", .{err.fmt(raw_string)});
+            return error.AnalysisFail;
+        },
     }
 }
 
@@ -1573,7 +1583,9 @@ fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
-    var dir = try AstGen.generate(gpa, tree);
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    var dir = try AstGen.generate(gpa, tree, &diags);
     defer dir.deinit(gpa);
 
     var buf: [1024]u8 = undefined;
@@ -1680,7 +1692,10 @@ test "negative zero int is rejected" {
 
     var tree = try Ast.parse(gpa, "-0");
     defer tree.deinit(gpa);
-    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree, &diags));
+    try std.testing.expect(diags.hasErrors());
 }
 
 test "bind expression" {
@@ -1781,7 +1796,10 @@ test "duplicate param name is an error" {
     );
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
-    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree, &diags));
+    try std.testing.expect(diags.hasErrors());
 }
 
 test "extern fn" {

@@ -126,7 +126,12 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
     const estimated_node_count = (tokens_slice.len + 2) / 2;
     try parser.nodes.ensureTotalCapacity(gpa, estimated_node_count);
 
-    try parser.parseRoot();
+    // A fatal parse error is still a *parse result*: the error is already
+    // recorded, and the caller reads `errors` — never a Zig error.
+    parser.parseRoot() catch |err| switch (err) {
+        error.ParseError => assert(parser.errors.items.len > 0),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 
     try parser.extra_data.shrinkToLen(gpa);
     try parser.errors.shrinkToLen(gpa);
@@ -249,6 +254,7 @@ pub const Error = struct {
 
     pub const Tag = enum {
         expected_return_type,
+        expression_nested_too_deeply,
         expected_comma_after_arg,
         expected_token,
         expected_expression,

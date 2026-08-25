@@ -16,7 +16,9 @@ const log = std.log.scoped(.sema);
 
 const arith = @import("Sema/arith.zig");
 
+const Ast = @import("Ast.zig");
 const Dir = @import("Dir.zig");
+const Diagnostics = @import("Diagnostics.zig");
 
 const Value = @import("Value.zig");
 const Type = @import("Type.zig");
@@ -49,6 +51,16 @@ decls: std.AutoHashMapUnmanaged(Dir.NullTerminatedString, Air.Inst.Ref) = .{},
 arena: Allocator,
 
 code: Dir,
+
+/// Compile errors accumulate here; the caller renders them. Sema records
+/// node locations (it holds no tree — Dir's compile-error exception lets
+/// the renderer reach back into the AST).
+diags: *Diagnostics,
+
+/// The AST node every instruction's `src_node` offset is relative to:
+/// the root for the module body, the declaration's node inside a function
+/// body (mirrors AstGen's `decl_node_index`).
+base_node: Ast.Node.Index = @enumFromInt(0),
 
 /// The declared return type of the function whose body is being analyzed.
 /// `ret_node` coerces its operand to it. The module body has no declared
@@ -93,14 +105,22 @@ pub const Result = struct {
     }
 };
 
-pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Result {
+pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) !Result {
     var analysis_arena: std.heap.ArenaAllocator = .init(gpa);
     defer analysis_arena.deinit();
-    var sema = Sema{ .gpa = gpa, .code = code, .arena = analysis_arena.allocator() };
+    var sema = Sema{ .gpa = gpa, .code = code, .arena = analysis_arena.allocator(), .diags = diags };
     defer sema.deinit();
 
     try sema.air_instructions.ensureTotalCapacity(gpa, code.instructions.len);
     const module = code.getModuleDecl(.main_module_inst);
+
+    // `main` returns the module body's last value, so a body is required —
+    // a file of only declarations has nothing to return. (Revisit when the
+    // decided `fn main` end state lands; see notes/deferred.md.)
+    if (module.body.len == 0) {
+        try diags.addError(.{ .byte = 0 }, "module has no value-producing statements", .{});
+        return error.AnalysisFail;
+    }
 
     for (module.decls) |decl_inst| {
         try sema.analyzeDeclaration(ip, decl_inst);
@@ -124,11 +144,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Result {
 
     try analyzeBody(&sema, ip, module.body);
 
-    // in case of empty module do not crash
-    const last_ref: Air.Inst.Ref = if (module.body.len == 0)
-        .fromInterned(.void_value)
-    else
-        sema.inst_map.get(module.body[module.body.len - 1]).?;
+    const last_ref: Air.Inst.Ref = sema.inst_map.get(module.body[module.body.len - 1]).?;
 
     const result_ty = sema.typeOf(ip, last_ref);
 
@@ -138,7 +154,7 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Result {
         // only comptime-known numeric results fold to the `number` boundary.
         if (sema.resolveValue(last_ref) == null) break :blk last_ref;
         if (result_ty.isNumeric(ip))
-            break :blk try sema.coerce(ip, .fromInterned(.comptime_float_type), last_ref);
+            break :blk try sema.coerce(ip, .fromInterned(.comptime_float_type), last_ref, .{ .byte = 0 });
         break :blk last_ref;
     };
 
@@ -163,11 +179,19 @@ fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index
     const func = ip.indexToKey(func_val).func;
     const fn_ty = ip.indexToFuncType(func.ty).?;
 
+    const func_inst_idx: Dir.Inst.Index = @enumFromInt(func.dir_inst);
+    const func_pl = module_sema.code.instructions.items(.data)[@intFromEnum(func_inst_idx)].pl_node;
+    const func_extra = module_sema.code.extraData(Dir.Inst.Func, func_pl.payload_index);
+    const owner_decl = module_sema.code.getDeclaration(func_extra.data.param_block);
+
     var sema = Sema{
         .gpa = module_sema.gpa,
         .code = module_sema.code,
         .arena = module_sema.arena,
         .decls = module_sema.decls,
+        .diags = module_sema.diags,
+        // Instruction offsets inside the body are relative to the declaration.
+        .base_node = owner_decl.src_node,
         .fn_ret_ty = .fromInterned(fn_ty.return_type),
     };
     defer {
@@ -176,20 +200,16 @@ fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index
         sema.deinit();
     }
 
-    const func_inst: Dir.Inst.Index = @enumFromInt(func.dir_inst);
-    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(func_inst)].pl_node;
-    const extra = sema.code.extraData(Dir.Inst.Func, inst_data.payload_index);
     // The return type occupies `ret_ty.body_len` trailing slots before the body.
-    const body = sema.code.bodySlice(extra.end + extra.data.ret_ty.body_len, extra.data.body_len);
+    const body = sema.code.bodySlice(func_extra.end + func_extra.data.ret_ty.body_len, func_extra.data.body_len);
 
     // Pre-map each `param` instruction in the declaration's value body to an
     // Air `arg`, in parameter order (Zig: `analyzeFnBody` does the same
     // before running the body). The body then resolves param refs to args.
     const tags = sema.code.instructions.items(.tag);
-    const decl = sema.code.getDeclaration(extra.data.param_block);
     const param_types = fn_ty.param_types.get(ip);
     var arg_index: u32 = 0;
-    for (decl.value_body.?) |param_inst| {
+    for (owner_decl.value_body.?) |param_inst| {
         if (tags[@intFromEnum(param_inst)] != .param) continue;
         try sema.inst_map.ensureSpaceForInstructions(sema.gpa, &.{param_inst});
         const arg_ref = try sema.addInst(.{ .tag = .arg, .data = .{ .arg = .{
@@ -309,7 +329,17 @@ const CallArgsInfo = union(enum) {
         };
 
         const uncoerced_arg = try sema.resolveInlineBody(ip, arg_body);
-        return sema.coerce(ip, param_ty, uncoerced_arg);
+
+        // The terminating break's operand source node is the argument's own
+        // node — where a coercion error points.
+        const break_data = sema.code.instructions.items(.data)[@intFromEnum(arg_body[arg_body.len - 1])].@"break";
+        const break_extra = sema.code.extraData(Dir.Inst.Break, break_data.payload_index).data;
+        const arg_loc: Diagnostics.Loc = if (break_extra.operand_src_node.unwrap()) |offset|
+            .{ .node_start = sema.absNode(offset) }
+        else
+            .{ .byte = 0 };
+
+        return sema.coerce(ip, param_ty, uncoerced_arg, arg_loc);
     }
 };
 
@@ -377,8 +407,11 @@ fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) C
 
     const gop = try sema.decls.getOrPut(sema.gpa, decl.name);
     if (gop.found_existing) {
-        // TODO(tzelon): structured Sema error reporting
-        log.warn("duplicate declaration name '{s}'", .{sema.code.nullTerminatedString(decl.name)});
+        try sema.diags.addError(
+            .{ .node_start = decl.src_node },
+            "duplicate declaration name '{s}'",
+            .{sema.code.nullTerminatedString(decl.name)},
+        );
         return error.AnalysisFail;
     }
     gop.value_ptr.* = decl_ref;
@@ -422,16 +455,33 @@ fn dirArithmetic(
     const lhs = sema.resolveInst(extra.lhs);
     const rhs = sema.resolveInst(extra.rhs);
 
-    return sema.analyzeArithmetic(ip, dir_tag, lhs, rhs);
+    return sema.analyzeArithmetic(ip, dir_tag, lhs, rhs, sema.absNode(inst_data.src_node));
 }
 
-fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: Air.Inst.Ref, rhs: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+/// The absolute AST node for an instruction's relative `src_node` offset.
+fn absNode(sema: *const Sema, offset: Ast.Node.Offset) Ast.Node.Index {
+    return offset.toAbsolute(sema.base_node);
+}
+
+fn analyzeArithmetic(
+    sema: *Sema,
+    ip: *InternPool,
+    dir_tag: Dir.Inst.Tag,
+    lhs: Air.Inst.Ref,
+    rhs: Air.Inst.Ref,
+    src_node: Ast.Node.Index,
+) CompileError!Air.Inst.Ref {
     // Arithmetic is defined on numbers only — a string operand must fail here,
     // before either the fold path (Value.toBigInt) or the runtime coercion
     // would trip on it. (Zig: "invalid operands to binary expression".)
-    if (!sema.typeOf(ip, lhs).isNumeric(ip) or !sema.typeOf(ip, rhs).isNumeric(ip)) {
-        // TODO(tzelon): structured Sema error reporting
-        log.warn("invalid operands to binary expression", .{});
+    const lhs_ty = sema.typeOf(ip, lhs);
+    const rhs_ty = sema.typeOf(ip, rhs);
+    if (!lhs_ty.isNumeric(ip) or !rhs_ty.isNumeric(ip)) {
+        try sema.diags.addError(
+            .{ .node_main = src_node },
+            "invalid operands to binary expression: '{s}' and '{s}'",
+            .{ lhs_ty.name(), rhs_ty.name() },
+        );
         return error.AnalysisFail;
     }
 
@@ -443,7 +493,10 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
     // zero divisor is rejected even when the dividend is a runtime value.
     if (dir_tag == .div) {
         if (maybe_rhs_val) |rhs_val| {
-            if (rhs_val.isZero(ip)) return error.AnalysisFail;
+            if (rhs_val.isZero(ip)) {
+                try sema.diags.addError(.{ .node_main = src_node }, "division by zero", .{});
+                return error.AnalysisFail;
+            }
         }
     }
 
@@ -468,8 +521,9 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
     // runtime on `number` (f64). Coerce both sides to the runtime type —
     // a comptime int/float interns as an f64 constant, a runtime number
     // passes through.
-    const lhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), lhs);
-    const rhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), rhs);
+    const loc: Diagnostics.Loc = .{ .node_main = src_node };
+    const lhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), lhs, loc);
+    const rhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), rhs, loc);
 
     const air_tag: Air.Inst.Tag = switch (dir_tag) {
         .add => .add,
@@ -519,11 +573,17 @@ fn dirCall(
     };
 
     const callee_ty = sema.typeOf(ip, func);
+    const call_loc: Diagnostics.Loc = .{ .node_start = sema.absNode(inst_data.src_node) };
 
-    const func_ty = ip.indexToFuncType(callee_ty.toIntern()).?;
+    const func_ty = ip.indexToFuncType(callee_ty.toIntern()) orelse {
+        try sema.diags.addError(call_loc, "type '{s}' is not a function", .{callee_ty.name()});
+        return error.AnalysisFail;
+    };
     if (extra.data.args_len != func_ty.param_types.len) {
-        // TODO(tzelon): structured Sema error reporting
-        log.warn("expected {d} argument(s), found {d}", .{ func_ty.param_types.len, extra.data.args_len });
+        try sema.diags.addError(call_loc, "expected {d} argument(s), found {d}", .{
+            func_ty.param_types.len,
+            extra.data.args_len,
+        });
         return error.AnalysisFail;
     }
 
@@ -599,17 +659,17 @@ fn dirFunc(
 fn dirRet(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = sema.resolveInst(inst_data.operand);
+    const loc: Diagnostics.Loc = .{ .node_main = sema.absNode(inst_data.src_node) };
 
     const result = result: {
         if (sema.fn_ret_ty.toIntern() == .void_type) {
             if (sema.typeOf(ip, operand).toIntern() != .void_type) {
-                // TODO(tzelon): structured Sema error reporting
-                log.warn("function declared void returns a value", .{});
+                try sema.diags.addError(loc, "function declared 'void' returns a value", .{});
                 return error.AnalysisFail;
             }
             break :result operand;
         }
-        break :result try sema.coerce(ip, sema.fn_ret_ty, operand);
+        break :result try sema.coerce(ip, sema.fn_ret_ty, operand, loc);
     };
 
     _ = try sema.addInst(.{ .tag = .ret, .data = .{ .un_op = result } });
@@ -723,17 +783,13 @@ fn dirParam(
 /// Today the only destination is `number` (`comptime_float_type` stands in for it until
 /// runtime types exist); the low-level number types arc (i32/i64/u32/u64/f32)
 /// adds its destinations here.
-fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref, loc: Diagnostics.Loc) CompileError!Air.Inst.Ref {
     const val = sema.resolveValue(inst) orelse {
         const inst_ty = sema.typeOf(ip, inst);
         switch (dest_ty.toIntern()) {
             .comptime_float_type, .f64_type => switch (inst_ty.toIntern()) {
                 .comptime_float_type, .f64_type => return inst,
-                else => {
-                    // TODO(tzelon): structured Sema error reporting
-                    log.warn("expected a number", .{});
-                    return error.AnalysisFail;
-                },
+                else => return sema.failTypeMismatch(dest_ty, inst_ty, loc),
             },
             else => unreachable,
         }
@@ -746,17 +802,22 @@ fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref) Compi
                 .ty = dest_ty.toIntern(),
                 .storage = .{ .f64 = val.toFloat(f64, ip) },
             } })),
-            .int => return sema.coerceIntToFloat(ip, val, dest_ty),
-            else => unreachable,
+            .int => return sema.coerceIntToFloat(ip, val, dest_ty, loc),
+            else => return sema.failTypeMismatch(dest_ty, .fromInterned(ip.typeOf(val.toIntern())), loc),
         },
         else => unreachable,
     }
 }
 
+fn failTypeMismatch(sema: *Sema, expected: Type, found: Type, loc: Diagnostics.Loc) CompileError {
+    try sema.diags.addError(loc, "expected type '{s}', found '{s}'", .{ expected.name(), found.name() });
+    return error.AnalysisFail;
+}
+
 /// Intern `val` as a float of `dest_ty` (comptime_float or f64), exact or
 /// error: rejects any integer f64 can't represent exactly (e.g. 2^53 + 1)
 /// via a round-trip fits check — no silent precision loss.
-fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value, dest_ty: Type) CompileError!Air.Inst.Ref {
+fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value, dest_ty: Type, loc: Diagnostics.Loc) CompileError!Air.Inst.Ref {
     const float = val.toFloat(f64, ip);
     var space: Value.BigIntSpace = undefined;
     const operand_big_int = val.toBigInt(&space, ip);
@@ -774,9 +835,7 @@ fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value, dest_ty: Type) Com
         break :fits result_big_int.toConst().eql(operand_big_int);
     };
     if (!fits) {
-        // TODO(tzelon): report through structured Sema error reporting once
-        // it exists; log.warn because the test runner fails on log.err.
-        log.warn("number cannot represent integer value", .{});
+        try sema.diags.addError(loc, "number cannot represent integer value", .{});
         return error.AnalysisFail;
     }
     const ip_index = try ip.get(sema.gpa, .{ .float = .{
@@ -799,7 +858,7 @@ fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Ai
 
     // negate is `0 - operand`
     const lhs = Air.internedToRef(.zero);
-    return sema.analyzeArithmetic(ip, .sub, lhs, rhs);
+    return sema.analyzeArithmetic(ip, .sub, lhs, rhs, sema.absNode(inst_data.src_node));
 }
 
 fn addStrLit(sema: *Sema, ip: *InternPool, string: String.NullTerminatedString) CompileError!Air.Inst.Ref {
@@ -1077,7 +1136,9 @@ fn expectAnalyzed(
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var result = try Sema.analyze(gpa, dir, &ip);
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    var result = try Sema.analyze(gpa, dir, &ip, &test_diags);
     defer result.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), result.main.instructions.len);
@@ -1124,7 +1185,9 @@ test "coerce int result to number is exact or error" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
 
     // Same rule through big-int storage: 2^64 + 1 needs 65 significant bits.
     const limbs = [_]std.math.big.Limb{ 1, 1 };
@@ -1137,7 +1200,9 @@ test "coerce int result to number is exact or error" {
     try big_ip.init(gpa);
     defer big_ip.deinit(gpa);
 
-    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, big_dir, &big_ip));
+    var big_diags = Diagnostics{ .gpa = gpa };
+    defer big_diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, big_dir, &big_ip, &big_diags));
 }
 
 test "analyze float literal" {
@@ -1158,7 +1223,9 @@ test "analyze string literal" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var result = try Sema.analyze(gpa, dir, &ip);
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    var result = try Sema.analyze(gpa, dir, &ip, &test_diags);
     defer result.deinit(gpa);
 
     const actual = result.main.instructions.items(.data)[0].un_op.toInterned().?;
@@ -1226,13 +1293,13 @@ test "analyze 1 / 0 fails analysis" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
 }
 
 test "analyze block" {
     const gpa = std.testing.allocator;
-
-    const Ast = @import("Ast.zig");
 
     // { 1\n 2 } — block evaluates to its last expression, not the first.
     // The body ends with a `break` carrying the result, as AstGen emits it.
@@ -1277,7 +1344,9 @@ test "analyze block" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var result = try Sema.analyze(gpa, dir, &ip);
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    var result = try Sema.analyze(gpa, dir, &ip, &test_diags);
     defer result.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), result.main.instructions.len);
@@ -1305,7 +1374,9 @@ test "analyze float division by zero fails analysis" {
         try ip.init(gpa);
         defer ip.deinit(gpa);
 
-        try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+        var test_diags = Diagnostics{ .gpa = gpa };
+        defer test_diags.deinit();
+        try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
     }
 }
 
@@ -1321,8 +1392,10 @@ test "coerce passes a runtime number through unchanged" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
     // `code` is never read: coerce works purely on AIR refs.
-    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator() };
+    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
     defer sema.deinit();
 
     // %0 = call print() where `extern fn print() number`
@@ -1338,7 +1411,7 @@ test "coerce passes a runtime number through unchanged" {
         .payload = 0,
     } } });
 
-    const coerced = try sema.coerce(&ip, .fromInterned(.f64_type), call_ref);
+    const coerced = try sema.coerce(&ip, .fromInterned(.f64_type), call_ref, .{ .byte = 0 });
     try std.testing.expectEqual(call_ref, coerced);
 }
 
@@ -1353,8 +1426,10 @@ test "analyze arithmetic with a runtime operand emits an Air bin op" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
     // `code` is never read: analyzeArithmetic works purely on AIR refs.
-    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator() };
+    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
     defer sema.deinit();
 
     // %0 = call print() where `extern fn print() number`
@@ -1371,7 +1446,7 @@ test "analyze arithmetic with a runtime operand emits an Air bin op" {
     } } });
 
     const one = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } });
-    const result = try sema.analyzeArithmetic(&ip, .add, call_ref, Air.internedToRef(one));
+    const result = try sema.analyzeArithmetic(&ip, .add, call_ref, Air.internedToRef(one), @enumFromInt(0));
 
     const result_idx = result.toIndex().?;
     try std.testing.expectEqual(Air.Inst.Tag.add, sema.air_instructions.items(.tag)[@intFromEnum(result_idx)]);
@@ -1397,7 +1472,9 @@ test "analyze arithmetic rejects non-numeric operands" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
 }
 
 test "analyze a defined fn produces its own Air of arg and ret" {
@@ -1405,8 +1482,6 @@ test "analyze a defined fn produces its own Air of arg and ret" {
     // and the body analysis emits one Air per function: the param pre-mapped
     // to an `arg`, and the body's `ret_node` coercing/returning it.
     const gpa = std.testing.allocator;
-
-    const Ast = @import("Ast.zig");
 
     var list: std.MultiArrayList(Dir.Inst) = .{};
     defer list.deinit(gpa);
@@ -1419,17 +1494,17 @@ test "analyze a defined fn produces its own Air of arg and ret" {
     // %1 = declaration(value_body={%3, %5, %6})
     try list.append(gpa, .{ .tag = .declaration, .data = .{ .declaration = .{
         .src_node = @enumFromInt(0),
-        .payload_index = 4,
+        .payload_index = 5,
     } } });
     // %2 = break_inline(%3, f64_type) — the param's type body terminator
     try list.append(gpa, .{ .tag = .break_inline, .data = .{ .@"break" = .{
         .operand = .f64_type,
-        .payload_index = 13,
+        .payload_index = 14,
     } } });
     // %3 = param(x, {%2})
     try list.append(gpa, .{ .tag = .param, .data = .{ .pl_tok = .{
         .src_tok = @enumFromInt(0),
-        .payload_index = 10,
+        .payload_index = 11,
     } } });
     // %4 = ret_node(%3)
     try list.append(gpa, .{ .tag = .ret_node, .data = .{ .un_node = .{
@@ -1439,23 +1514,26 @@ test "analyze a defined fn produces its own Air of arg and ret" {
     // %5 = func(param_block=%1, ret_ty=f64_type, body={%4})
     try list.append(gpa, .{ .tag = .func, .data = .{ .pl_node = .{
         .src_node = @enumFromInt(0),
-        .payload_index = 15,
+        .payload_index = 16,
     } } });
     // %6 = break_inline(%1, %5)
     try list.append(gpa, .{ .tag = .break_inline, .data = .{ .@"break" = .{
         .operand = @as(Dir.Inst.Index, @enumFromInt(5)).toRef(),
-        .payload_index = 20,
+        .payload_index = 21,
     } } });
+    // %7 = int(1) — the module body statement (a module needs one)
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
 
     const no_src: u32 = @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none));
-    const extra = try gpa.alloc(u32, 22);
-    // extra[0..4]: ModuleDecl{src_node=root, decls_len=1, body_len=0} + decls {%1}
+    const extra = try gpa.alloc(u32, 23);
+    // extra[0..5]: ModuleDecl{src_node=root, decls_len=1, body_len=1} + decls {%1} + body {%7}
     extra[0] = 0;
     extra[1] = 1;
-    extra[2] = 0;
+    extra[2] = 1;
     extra[3] = 1;
-    // extra[4..10]: Declaration{flags} + name + value_body_len + value body {%3, %5, %6}
-    extra[4] = @bitCast(Dir.Inst.Declaration.Flags{
+    extra[4] = 7;
+    // extra[5..11]: Declaration{flags} + name + value_body_len + value body {%3, %5, %6}
+    extra[5] = @bitCast(Dir.Inst.Declaration.Flags{
         .kind = .@"const",
         .linkage = .normal,
         .has_name = true,
@@ -1463,27 +1541,27 @@ test "analyze a defined fn produces its own Air of arg and ret" {
         .has_type_body = false,
         .has_value_body = true,
     });
-    extra[5] = 1; // name: string_bytes offset of "f"
-    extra[6] = 3; // value_body_len
-    extra[7] = 3; // %3
-    extra[8] = 5; // %5
-    extra[9] = 6; // %6
-    // extra[10..13]: Param{name=x, type{body_len=1}} + type body {%2}
-    extra[10] = 3; // name: string_bytes offset of "x"
-    extra[11] = @bitCast(Dir.Inst.Param.Type{ .body_len = 1 });
-    extra[12] = 2; // type body: %2
-    // extra[13..15]: Break payload for %2
-    extra[13] = no_src;
-    extra[14] = 3; // block_inst = %3
-    // extra[15..20]: Func{ret_ty{body_len=1}, param_block=%1, body_len=1} + ret ref + body {%4}
-    extra[15] = @bitCast(Dir.Inst.Func.RetTy{ .body_len = 1 });
-    extra[16] = 1; // param_block = %1
-    extra[17] = 1; // body_len
-    extra[18] = @intFromEnum(Dir.Inst.Ref.f64_type);
-    extra[19] = 4; // func body: %4
-    // extra[20..22]: Break payload for %6
-    extra[20] = no_src;
-    extra[21] = 1; // block_inst = %1
+    extra[6] = 1; // name: string_bytes offset of "f"
+    extra[7] = 3; // value_body_len
+    extra[8] = 3; // %3
+    extra[9] = 5; // %5
+    extra[10] = 6; // %6
+    // extra[11..14]: Param{name=x, type{body_len=1}} + type body {%2}
+    extra[11] = 3; // name: string_bytes offset of "x"
+    extra[12] = @bitCast(Dir.Inst.Param.Type{ .body_len = 1 });
+    extra[13] = 2; // type body: %2
+    // extra[14..16]: Break payload for %2
+    extra[14] = no_src;
+    extra[15] = 3; // block_inst = %3
+    // extra[16..21]: Func{ret_ty{body_len=1}, param_block=%1, body_len=1} + ret ref + body {%4}
+    extra[16] = @bitCast(Dir.Inst.Func.RetTy{ .body_len = 1 });
+    extra[17] = 1; // param_block = %1
+    extra[18] = 1; // body_len
+    extra[19] = @intFromEnum(Dir.Inst.Ref.f64_type);
+    extra[20] = 4; // func body: %4
+    // extra[21..23]: Break payload for %6
+    extra[21] = no_src;
+    extra[22] = 1; // block_inst = %1
 
     var dir: Dir = .{
         .instructions = list.toOwnedSlice(),
@@ -1496,7 +1574,9 @@ test "analyze a defined fn produces its own Air of arg and ret" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var result = try Sema.analyze(gpa, dir, &ip);
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    var result = try Sema.analyze(gpa, dir, &ip, &test_diags);
     defer result.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), result.funcs.len);
@@ -1552,7 +1632,9 @@ test "dirFunc builds a function type from its params and return type" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var sema = Sema{ .gpa = gpa, .code = dir, .arena = arena.allocator() };
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    var sema = Sema{ .gpa = gpa, .code = dir, .arena = arena.allocator(), .diags = &diags };
     defer sema.deinit();
 
     // Seed the param's resolved type in `inst_map`, as dirParam would.

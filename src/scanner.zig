@@ -325,6 +325,20 @@ pub const Token = struct {
         invalid,
         eof,
 
+        /// A human-readable name for the tag, for error messages: the fixed
+        /// lexeme when the tag has one, a description otherwise.
+        pub fn symbol(tag: Tag) []const u8 {
+            return tag.lexeme() orelse switch (tag) {
+                .invalid => "invalid token",
+                .identifier => "an identifier",
+                .number_literal => "a number literal",
+                .string_literal => "a string literal",
+                .newline => "a newline",
+                .eof => "EOF",
+                else => unreachable,
+            };
+        }
+
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
                 .invalid,

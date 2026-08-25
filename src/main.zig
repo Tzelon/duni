@@ -4,6 +4,7 @@ const Ast = @import("Ast.zig");
 const Sema = @import("Sema.zig");
 const InternPool = @import("InternPool.zig");
 const WatGen = @import("WatGen.zig");
+const Diagnostics = @import("Diagnostics.zig");
 const Io = std.Io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
@@ -17,7 +18,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 1) {
         try repl(io, gpa);
     } else if (args.len == 2) {
-        runFile(io, gpa, args[1]) catch process.exit(64);
+        runFile(io, gpa, args[1]) catch |err| switch (err) {
+            error.CompileFailed => process.exit(1),
+            else => process.exit(64),
+        };
     } else {
         std.debug.print("Usage: duni [path]\n", .{});
         process.exit(64);
@@ -56,17 +60,26 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     try ip.init(allocator);
     defer ip.deinit(allocator);
 
+    var diags = Diagnostics{ .gpa = allocator };
+    defer diags.deinit();
+
     var tree = try Ast.parse(allocator, source);
     defer tree.deinit(allocator);
     if (tree.errors.len != 0) {
-        for (tree.errors) |err| std.debug.print("Error: {any}\n", .{err.tag});
-        return error.ParseFailed;
+        try diags.addParseErrors(&tree);
+        return renderCompileErrors(io, &diags, &tree, path);
     }
 
-    var dir = try AstGen.generate(allocator, tree);
+    var dir = AstGen.generate(allocator, tree, &diags) catch |err| switch (err) {
+        error.AnalysisFail => return renderCompileErrors(io, &diags, &tree, path),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer dir.deinit(allocator);
 
-    var result = try Sema.analyze(allocator, dir, &ip);
+    var result = Sema.analyze(allocator, dir, &ip, &diags) catch |err| switch (err) {
+        error.AnalysisFail => return renderCompileErrors(io, &diags, &tree, path),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer result.deinit(allocator);
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -74,4 +87,17 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     const stdout = &stdout_writer.interface;
     try WatGen.emit(allocator, &result, &ip, stdout);
     try stdout.flush();
+}
+
+/// Print every accumulated diagnostic to stderr and fail the compilation.
+fn renderCompileErrors(io: std.Io, diags: *const Diagnostics, tree: *const Ast, path: []const u8) error{ CompileFailed, WriteFailed } {
+    // Normalize the display path: a leading `./` says nothing.
+    const display_path = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+    diags.render(tree, display_path, stderr) catch return error.WriteFailed;
+    stderr.flush() catch return error.WriteFailed;
+    return error.CompileFailed;
 }

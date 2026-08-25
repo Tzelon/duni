@@ -24,6 +24,24 @@ pub fn toIntern(ty: Type) InternPool.Index {
     return ty.ip_index;
 }
 
+/// The user-visible name of the type, for diagnostics. `f64` renders as
+/// `number` — that is the name the language exposes.
+pub fn name(ty: Type) []const u8 {
+    return switch (ty.toIntern()) {
+        .comptime_int_type => "comptime_int",
+        .comptime_float_type => "comptime_float",
+        .f64_type => "number",
+        .u32_type => "u32",
+        .i32_type => "i32",
+        .u64_type => "u64",
+        .i64_type => "i64",
+        .string_type => "string",
+        .void_type => "void",
+        .type_type => "type",
+        else => "(unnamed type)",
+    };
+}
+
 pub fn isNumeric(ty: Type, ip: *const InternPool) bool {
     return switch (ty.toIntern()) {
         .f64_type,

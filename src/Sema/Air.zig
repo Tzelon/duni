@@ -29,6 +29,19 @@ pub const Inst = struct {
         /// Uses the `un_op` field.
         ret,
 
+        /// Float addition. Both operands are `number` (f64) — Sema coerces
+        /// before emitting, so no integer arithmetic reaches codegen.
+        /// Uses the `bin_op` field.
+        add,
+        /// Float subtraction. Uses the `bin_op` field.
+        sub,
+        /// Float multiplication. Uses the `bin_op` field.
+        mul,
+        /// Float division (IEEE). A comptime-known zero divisor is rejected
+        /// by Sema; a runtime zero divisor produces inf/nan per IEEE.
+        /// Uses the `bin_op` field.
+        div,
+
         /// Function call.
         /// Result type is the return type of the function being called.
         /// Uses the `pl_op` field with the `Call` payload. operand is the callee.
@@ -135,6 +148,11 @@ pub const Inst = struct {
     pub const Data = union {
         un_op: Ref,
 
+        bin_op: struct {
+            lhs: Ref,
+            rhs: Ref,
+        },
+
         ty: Type,
 
         pl_op: struct {
@@ -168,6 +186,10 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
 
         .ret,
         => unreachable,
+
+        // Both operands were coerced to one numeric type by Sema, so the
+        // lhs type is the result type.
+        .add, .sub, .mul, .div => return air.typeOf(datas[@intFromEnum(inst)].bin_op.lhs, ip),
 
         .call => {
             const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);

@@ -290,10 +290,26 @@ fn dirArithmetic(
 }
 
 fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: Air.Inst.Ref, rhs: Air.Inst.Ref) CompileError!Air.Inst.Ref {
+    // Arithmetic is defined on numbers only — a string operand must fail here,
+    // before either the fold path (Value.toBigInt) or the runtime coercion
+    // would trip on it. (Zig: "invalid operands to binary expression".)
+    if (!sema.typeOf(ip, lhs).isNumeric(ip) or !sema.typeOf(ip, rhs).isNumeric(ip)) {
+        // TODO(tzelon): structured Sema error reporting
+        log.warn("invalid operands to binary expression", .{});
+        return error.AnalysisFail;
+    }
 
-    //TODO: we assume everything is comptime know and we can fold. this will not be true in the future
     const maybe_lhs_val = sema.resolveValue(lhs);
     const maybe_rhs_val = sema.resolveValue(rhs);
+
+    // Division by zero is a comptime error for ints and floats alike —
+    // IEEE inf/nan are never produced by comptime folding. A comptime-known
+    // zero divisor is rejected even when the dividend is a runtime value.
+    if (dir_tag == .div) {
+        if (maybe_rhs_val) |rhs_val| {
+            if (rhs_val.isZero(ip)) return error.AnalysisFail;
+        }
+    }
 
     if (maybe_lhs_val) |lhs_val| {
         if (maybe_rhs_val) |rhs_val| {
@@ -305,20 +321,31 @@ fn analyzeArithmetic(sema: *Sema, ip: *InternPool, dir_tag: Dir.Inst.Tag, lhs: A
                 .add => try arith.add(sema, ip, lhs_val, rhs_val, is_int),
                 .sub => try arith.sub(sema, ip, lhs_val, rhs_val, is_int),
                 .mul => try arith.mul(sema, ip, lhs_val, rhs_val, is_int),
-                .div => blk: {
-                    // Division by zero is a comptime error for ints and floats alike —
-                    // IEEE inf/nan are never produced by comptime folding.
-                    if (rhs_val.isZero(ip)) return error.AnalysisFail;
-                    break :blk try arith.div(sema, ip, lhs_val, rhs_val);
-                },
+                .div => try arith.div(sema, ip, lhs_val, rhs_val),
                 else => unreachable,
             };
             return Air.internedToRef(result_val.toIntern());
         }
     }
 
-    //TODO: We only support comptime known values
-    unreachable;
+    // At least one operand is a runtime value: the operation happens at
+    // runtime on `number` (f64). Coerce both sides to the runtime type —
+    // a comptime int/float interns as an f64 constant, a runtime number
+    // passes through.
+    const lhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), lhs);
+    const rhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), rhs);
+
+    const air_tag: Air.Inst.Tag = switch (dir_tag) {
+        .add => .add,
+        .sub => .sub,
+        .mul => .mul,
+        .div => .div,
+        else => unreachable,
+    };
+    return sema.addInst(.{ .tag = air_tag, .data = .{ .bin_op = .{
+        .lhs = lhs_coerced,
+        .rhs = rhs_coerced,
+    } } });
 }
 
 fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -514,13 +541,30 @@ fn dirParam(
     return try sema.resolveInlineBody(ip, body);
 }
 
-/// Coerce a comptime-known value to `dest_ty`.
-/// Error when the destination cannot represent it exactly.
+/// Coerce a value to `dest_ty`.
+/// A comptime-known value re-interns under the destination type; error when
+/// the destination cannot represent it exactly. A runtime value cannot fold —
+/// it passes through when its type already matches the destination, and is a
+/// type mismatch otherwise (`number` is the only runtime type today, so no
+/// runtime conversion instruction exists yet).
 /// Today the only destination is `number` (`comptime_float_type` stands in for it until
 /// runtime types exist); the low-level number types arc (i32/i64/u32/u64/f32)
 /// adds its destinations here.
 fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref) CompileError!Air.Inst.Ref {
-    const val = sema.resolveValue(inst).?; // fold-only: args/results are comptime-known
+    const val = sema.resolveValue(inst) orelse {
+        const inst_ty = sema.typeOf(ip, inst);
+        switch (dest_ty.toIntern()) {
+            .comptime_float_type, .f64_type => switch (inst_ty.toIntern()) {
+                .comptime_float_type, .f64_type => return inst,
+                else => {
+                    // TODO(tzelon): structured Sema error reporting
+                    log.warn("expected a number", .{});
+                    return error.AnalysisFail;
+                },
+            },
+            else => unreachable,
+        }
+    };
     switch (dest_ty.toIntern()) {
         .comptime_float_type, .f64_type => switch (ip.indexToKey(val.toIntern())) {
             // Already a float: re-intern under dest_ty. Dedup makes this a
@@ -1089,6 +1133,97 @@ test "analyze float division by zero fails analysis" {
 
         try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
     }
+}
+
+test "coerce passes a runtime number through unchanged" {
+    // A call result is a runtime value — there is nothing to fold. Coercing
+    // it to the `number` boundary must return the same ref, not resolve a
+    // value.
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    // `code` is never read: coerce works purely on AIR refs.
+    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator() };
+    defer sema.deinit();
+
+    // %0 = call print() where `extern fn print() number`
+    const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
+    const print_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "print"),
+        .ty = fn_ty,
+        .lib_name = .none,
+    } });
+    try sema.air_extra.append(gpa, 0); // Air.Call.args_len
+    const call_ref = try sema.addInst(.{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = Air.internedToRef(print_ext),
+        .payload = 0,
+    } } });
+
+    const coerced = try sema.coerce(&ip, .fromInterned(.f64_type), call_ref);
+    try std.testing.expectEqual(call_ref, coerced);
+}
+
+test "analyze arithmetic with a runtime operand emits an Air bin op" {
+    // A runtime lhs (a call result) cannot fold: the operation becomes an Air
+    // `add` whose comptime rhs is coerced to a runtime `number` (f64).
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    // `code` is never read: analyzeArithmetic works purely on AIR refs.
+    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator() };
+    defer sema.deinit();
+
+    // %0 = call print() where `extern fn print() number`
+    const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
+    const print_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "print"),
+        .ty = fn_ty,
+        .lib_name = .none,
+    } });
+    try sema.air_extra.append(gpa, 0); // Air.Call.args_len
+    const call_ref = try sema.addInst(.{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = Air.internedToRef(print_ext),
+        .payload = 0,
+    } } });
+
+    const one = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } });
+    const result = try sema.analyzeArithmetic(&ip, .add, call_ref, Air.internedToRef(one));
+
+    const result_idx = result.toIndex().?;
+    try std.testing.expectEqual(Air.Inst.Tag.add, sema.air_instructions.items(.tag)[@intFromEnum(result_idx)]);
+    const bin_op = sema.air_instructions.items(.data)[@intFromEnum(result_idx)].bin_op;
+    try std.testing.expectEqual(call_ref, bin_op.lhs);
+    const expected_rhs = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1.0 } } });
+    try std.testing.expectEqual(Air.internedToRef(expected_rhs), bin_op.rhs);
+}
+
+test "analyze arithmetic rejects non-numeric operands" {
+    // `1 + "hey"` — a string operand must fail analysis, not fall into int
+    // math and crash on `Value.toBigInt`.
+    const gpa = std.testing.allocator;
+
+    var dir = try buildTestDir(gpa, &.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .str, .data = .{ .str = .{ .start = @enumFromInt(0), .len = 3 } } },
+        .{ .tag = .add, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, "hey");
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
 }
 
 test "dirFunc builds a function type from its params and return type" {

@@ -7,8 +7,11 @@ print(43)
 // (module
 //   (import "host" "print" (func $print (param f64) (result f64)))
 //   (func $main (result f64)
+//     (local f64)
 //     f64.const 43
 //     call $print
+//     local.set 0
+//     local.get 0
 //     return
 //   )
 //   (export "main" (func $main))

@@ -1,7 +1,7 @@
-pub fn main() !void {}
+pub fn main() !void {
+    add(1, 2__4);
+}
 
 fn add(a: u32, b: u32) !u32 {
-    var x: u32 = 1;
-    x = a + b;
-    var x: u32 = 4;
+    return a + b;
 }

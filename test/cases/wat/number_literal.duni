@@ -1,0 +1,11 @@
+42
+
+// wat
+//
+// (module
+//   (func $main (result f64)
+//     f64.const 42
+//     return
+//   )
+//   (export "main" (func $main))
+// )

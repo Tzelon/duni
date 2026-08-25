@@ -1,0 +1,8 @@
+extern fn print(x number) number
+
+print(1 + 2 * 3)
+print(10 - 4 / 2)
+
+// run
+// expect_stdout=7
+// expect_stdout=8

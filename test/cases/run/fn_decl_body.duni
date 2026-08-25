@@ -1,0 +1,10 @@
+extern fn print(x number) number
+
+fn add(x number) number {
+x + 1
+}
+
+print(add(2))
+
+// run
+// expect_stdout=3

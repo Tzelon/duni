@@ -1,0 +1,15 @@
+extern fn print(x number) number
+
+print(43)
+
+// wat
+//
+// (module
+//   (import "host" "print" (func $print (param f64) (result f64)))
+//   (func $main (result f64)
+//     f64.const 43
+//     call $print
+//     return
+//   )
+//   (export "main" (func $main))
+// )

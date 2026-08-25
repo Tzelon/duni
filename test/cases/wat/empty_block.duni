@@ -1,0 +1,10 @@
+{}
+
+// wat
+//
+// (module
+//   (func $main
+//     return
+//   )
+//   (export "main" (func $main))
+// )

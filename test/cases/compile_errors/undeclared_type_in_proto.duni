@@ -1,0 +1,7 @@
+extern fn print(x badtype) number
+
+print(1)
+
+// error
+//
+// :1:19: error: use of undeclared identifier 'badtype'

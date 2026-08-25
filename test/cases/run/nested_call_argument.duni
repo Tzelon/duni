@@ -1,0 +1,7 @@
+extern fn print(x number) number
+
+print(print(1))
+
+// run
+// expect_stdout=1
+// expect_stdout=1

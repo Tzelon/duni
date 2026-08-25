@@ -1,0 +1,7 @@
+extern fn print(x number) number
+
+print("hi")
+
+// error
+//
+// :3:7: error: expected type 'number', found 'string'

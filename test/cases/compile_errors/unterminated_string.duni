@@ -1,0 +1,5 @@
+"abc
+
+// error
+//
+// :1:1: error: expected expression, found 'invalid token'

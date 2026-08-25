@@ -1,0 +1,5 @@
+extern fn print(x number)
+
+// error
+//
+// :1:25: error: expected return type

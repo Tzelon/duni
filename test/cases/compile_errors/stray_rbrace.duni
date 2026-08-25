@@ -1,0 +1,7 @@
+1 + 1
+}
+2 + 2
+
+// error
+//
+// :2:1: error: expected expression, found '}'

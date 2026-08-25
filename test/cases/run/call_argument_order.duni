@@ -1,0 +1,8 @@
+extern fn print(x number) number
+extern fn sub(a number, b number) number
+
+print(sub(10, print(3)))
+
+// run
+// expect_stdout=3
+// expect_stdout=7

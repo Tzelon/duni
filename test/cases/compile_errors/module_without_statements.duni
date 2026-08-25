@@ -1,0 +1,5 @@
+extern fn print(x number) number
+
+// error
+//
+// :1:1: error: module has no value-producing statements

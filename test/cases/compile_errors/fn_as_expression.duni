@@ -1,0 +1,5 @@
+1 + fn f(x number) number {}
+
+// error
+//
+// :1:5: error: expected expression, found 'fn'

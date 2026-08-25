@@ -1,0 +1,7 @@
+x = 1
+
+x(2)
+
+// error
+//
+// :3:1: error: type 'comptime_int' is not a function

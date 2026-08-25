@@ -1,0 +1,6 @@
+extern fn print(x number) number
+
+print(6)
+
+// run
+// expect_stdout=6

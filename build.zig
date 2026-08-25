@@ -6,7 +6,7 @@ const std = @import("std");
 // for defining build steps and express dependencies between them, allowing the
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -135,12 +135,33 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    // The in-file `test` blocks. dependOn can be called multiple times and
+    // since the two run steps do not depend on one another, this will make
+    // the two of them run in parallel.
+    const test_unit_step = b.step("test-unit", "Run the in-file unit tests");
+    test_unit_step.dependOn(&run_mod_tests.step);
+    test_unit_step.dependOn(&run_exe_tests.step);
+
+    // The data-driven compiler case suite (test/cases/). Each case is a
+    // .duni file whose trailing comment block declares the expected result;
+    // the harness builds one Run-step chain per case. See test_plan.md.
+    const test_cases_step = b.step("test-cases", "Run the compiler case tests (test/cases/)");
+    const test_filter = b.option([]const u8, "test-filter", "Only run case tests whose name contains this substring");
+    const wat2wasm_path = b.option([]const u8, "wat2wasm", "Path to wat2wasm (wabt), used by `// run` cases") orelse
+        (b.findProgram(&.{"wat2wasm"}, &.{}) catch null);
+    const node_path = b.option([]const u8, "node", "Path to node, used by `// run` cases") orelse
+        (b.findProgram(&.{"node"}, &.{}) catch null);
+    try @import("test/cases.zig").addCases(b, test_cases_step, .{
+        .duni_exe = exe,
+        .test_filter = test_filter,
+        .wat2wasm = wat2wasm_path,
+        .node = node_path,
+    });
+
+    // The full suite: unit tests + case suite.
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(test_unit_step);
+    test_step.dependOn(test_cases_step);
 
     const internpool_tests = b.addTest(.{
         .root_module = b.createModule(.{

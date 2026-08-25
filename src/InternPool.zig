@@ -99,6 +99,7 @@ pub const Key = union(enum) {
 
     simple_value: SimpleValue,
     @"extern": Extern,
+    func: Func,
     func_type: FuncType,
 
     pub const Int = struct {
@@ -154,6 +155,17 @@ pub const Key = union(enum) {
         }
     };
 
+    pub const Func = struct {
+        /// The function's type (its `func_type`).
+        ty: Index,
+        /// The `func` Dir instruction that owns this function's body — the
+        /// function's identity (Zig: `zir_body_inst`). Distinct functions
+        /// with the same type stay distinct through it. Callers/codegen get
+        /// the *name* from the declaration layer (`Sema.Result`), never from
+        /// the pool.
+        dir_inst: u32,
+    };
+
     pub const Extern = struct {
         /// The name of the extern function; the wasm import's field name.
         name: NullTerminatedString,
@@ -202,6 +214,8 @@ pub const Key = union(enum) {
             .string => |str| Hash.hash(seed, asBytes(&str)),
 
             .@"extern" => |ext| Hash.hash(seed, asBytes(&ext)),
+
+            .func => |func| Hash.hash(seed, asBytes(&func)),
 
             .func_type => |func| {
                 var hasher = Hash.init(seed);
@@ -274,6 +288,8 @@ pub const Key = union(enum) {
             .string => |a_info| return a_info == b.string,
 
             .@"extern" => |a_info| return std.meta.eql(a_info, b.@"extern"),
+
+            .func => |a_info| return std.meta.eql(a_info, b.func),
 
             .func_type => |a_info| return a_info.eql(b.func_type, ip),
         }
@@ -463,6 +479,13 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
             });
         },
 
+        .func => |func| {
+            ip.items.appendAssumeCapacity(.{
+                .tag = .func,
+                .data = try addExtra(ip, gpa, func),
+            });
+        },
+
         .func_type => unreachable, // use getFuncType() instead
     }
 
@@ -579,6 +602,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .string => .{ .string = @enumFromInt(data) },
 
         .@"extern" => .{ .@"extern" = extraData(ip, Key.Extern, data) },
+
+        .func => .{ .func = extraData(ip, Key.Func, data) },
 
         .type_function => .{ .func_type = extraFuncType(ip, data) },
     };
@@ -783,6 +808,8 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
 
                 .@"extern" => extraData(ip, Key.Extern, item.data).ty,
 
+                .func => extraData(ip, Key.Func, item.data).ty,
+
                 // values, not types
                 .simple_value,
                 => unreachable,
@@ -896,6 +923,9 @@ pub const Tag = enum(u8) {
     /// An extern function (a host import).
     /// `data` is extra index to `Key.Extern`.
     @"extern",
+    /// A function with a body, defined in this module.
+    /// `data` is extra index to `Key.Func`.
+    func,
 
     pub const TypeFunction = struct {
         params_len: u32,
@@ -1003,6 +1033,24 @@ test "InternPool extern dedups" {
     const c = try ip.get(gpa, .{ .@"extern" = .{ .name = puts, .ty = ty, .lib_name = .none } });
     try std.testing.expect(a == b);
     try std.testing.expect(a != c);
+}
+
+test "InternPool func value dedups by owning instruction and has its fn type" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const ty = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+
+    const a = try ip.get(gpa, .{ .func = .{ .ty = ty, .dir_inst = 7 } });
+    const b = try ip.get(gpa, .{ .func = .{ .ty = ty, .dir_inst = 7 } });
+    // Same type but a different owning `func` instruction: a distinct function.
+    const c = try ip.get(gpa, .{ .func = .{ .ty = ty, .dir_inst = 9 } });
+    try std.testing.expect(a == b);
+    try std.testing.expect(a != c);
+    try std.testing.expectEqual(ty, ip.typeOf(a));
+    try std.testing.expectEqual(@as(u32, 7), ip.indexToKey(a).func.dir_inst);
 }
 
 test "InternPool dedups string values" {

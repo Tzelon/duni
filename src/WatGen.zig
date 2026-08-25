@@ -8,75 +8,106 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Air = @import("Sema/Air.zig");
+const Sema = @import("Sema.zig");
 const InternPool = @import("InternPool.zig");
 const NullTerminatedString = @import("string.zig").NullTerminatedString;
 
 gpa: Allocator,
-air: *const Air,
 ip: *const InternPool,
 out: *std.Io.Writer,
 indent: u32 = 0,
-/// String constants referenced by the body, mapped to their offset in linear
+/// String constants referenced by any body, mapped to their offset in linear
 /// memory. Populated by `collectStrings` before anything is written.
 string_offsets: std.AutoArrayHashMapUnmanaged(NullTerminatedString, u32) = .empty,
+/// Defined functions' interned values mapped to their declared names, so a
+/// call to one prints `call $name`.
+func_names: std.AutoArrayHashMapUnmanaged(InternPool.Index, NullTerminatedString) = .empty,
+
+// Per-function state, reset by `writeFunc`:
+
+/// The function currently being emitted.
+air: *const Air,
 /// Every value-producing runtime instruction, mapped to its wasm local index.
 /// The value is `local.set` right after it is produced and `local.get` at
 /// each use — runtime values never stay on the operand stack, because stack
 /// values cannot cross wasm block boundaries and interleave wrongly with
-/// later constant pushes (argument order). Populated by `collectLocals`.
+/// later constant pushes (argument order). An `arg` maps to its parameter's
+/// local slot; declared locals follow the parameters.
 locals: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, u32) = .empty,
+/// How many `(local …)` slots the current function declares (parameters not
+/// included — wasm gives them their slots implicitly).
+declared_locals: u32 = 0,
 
-pub fn emit(gpa: Allocator, air: *const Air, ip: *const InternPool, out: *std.Io.Writer) !void {
-    var gen = WatGen{ .gpa = gpa, .air = air, .ip = ip, .out = out };
+pub fn emit(gpa: Allocator, result: *const Sema.Result, ip: *const InternPool, out: *std.Io.Writer) !void {
+    var gen = WatGen{ .gpa = gpa, .ip = ip, .out = out, .air = &result.main };
     defer gen.string_offsets.deinit(gpa);
+    defer gen.func_names.deinit(gpa);
     defer gen.locals.deinit(gpa);
 
-    try gen.collectStrings();
-    try gen.collectLocals();
+    for (result.funcs) |func| try gen.func_names.put(gpa, func.val, func.name);
+
+    var string_offset: u32 = 0;
+    for (result.funcs) |func| try gen.collectStrings(&func.air, &string_offset);
+    try gen.collectStrings(&result.main, &string_offset);
 
     try out.writeAll("(module\n");
     gen.indent = 1;
-    try gen.writeImports();
+    try gen.writeImports(result);
     try gen.writeDataSection();
-    try gen.writeFunc();
+    for (result.funcs) |func| {
+        const fn_ty = gen.ip.indexToFuncType(gen.ip.typeOf(func.val)).?;
+        try gen.writeFunc(func.name.toSlice(ip), fn_ty.param_types.get(ip), &func.air);
+    }
+    try gen.writeFunc("main", &.{}, &result.main);
     try gen.writeIndent();
     try out.writeAll("(export \"main\" (func $main))\n");
     try out.writeAll(")\n");
 }
 
-/// Assign every referenced string constant an offset in linear memory, in
-/// order of first appearance, deduped by handle (equal strings share one
-/// handle, so they share one data segment).
-fn collectStrings(gen: *WatGen) !void {
-    const tags = gen.air.instructions.items(.tag);
-    const datas = gen.air.instructions.items(.data);
-    var offset: u32 = 0;
+/// Assign every string constant referenced by `air` an offset in linear
+/// memory, in order of first appearance, deduped by handle (equal strings
+/// share one handle, so they share one data segment).
+fn collectStrings(gen: *WatGen, air: *const Air, offset: *u32) !void {
+    const tags = air.instructions.items(.tag);
+    const datas = air.instructions.items(.data);
     for (tags, datas) |tag, data| switch (tag) {
-        .ret => try gen.collectStringRef(data.un_op, &offset),
-        // A call's arguments may be string constants; the callee is an extern,
-        // never a string.
-        .call => for (gen.callArgs(data)) |arg| try gen.collectStringRef(arg, &offset),
+        .ret => try gen.collectStringRef(data.un_op, offset),
+        // A call's arguments may be string constants; the callee is a
+        // function, never a string.
+        .call => for (callArgs(air, data)) |arg| try gen.collectStringRef(arg, offset),
         // Arithmetic operands are numbers — Sema coerces before emitting.
         .add, .sub, .mul, .div => {},
+        .arg => {},
     };
 }
 
 /// Assign a wasm local to every instruction that produces a runtime value.
-/// Unconditional — even an unused result is `local.set`, which keeps the
-/// operand stack empty between statements. All runtime values are `number`
-/// (f64) today, so every local is f64.
-fn collectLocals(gen: *WatGen) !void {
+/// An `arg` takes its parameter's implicit slot; everything else gets a
+/// declared local after the parameters. Unconditional — even an unused
+/// result is `local.set`, which keeps the operand stack empty between
+/// statements. All runtime values are `number` (f64) today, so every
+/// declared local is f64.
+fn collectLocals(gen: *WatGen, params_len: u32) !void {
+    gen.locals.clearRetainingCapacity();
+    gen.declared_locals = 0;
     const tags = gen.air.instructions.items(.tag);
-    for (tags, 0..) |tag, i| {
+    const datas = gen.air.instructions.items(.data);
+    for (tags, datas, 0..) |tag, data, i| {
         const inst: Air.Inst.Index = @enumFromInt(i);
-        const produces_value = switch (tag) {
-            .ret => false,
-            .add, .sub, .mul, .div => true,
-            .call => gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type,
-        };
-        if (!produces_value) continue;
-        try gen.locals.put(gen.gpa, inst, @intCast(gen.locals.count()));
+        switch (tag) {
+            .ret => {},
+            .arg => try gen.locals.put(gen.gpa, inst, data.arg.index),
+            .add, .sub, .mul, .div => try gen.addLocal(inst, params_len),
+            .call => if (gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type) {
+                try gen.addLocal(inst, params_len);
+            },
+        }
     }
+}
+
+fn addLocal(gen: *WatGen, inst: Air.Inst.Index, params_len: u32) !void {
+    try gen.locals.put(gen.gpa, inst, params_len + gen.declared_locals);
+    gen.declared_locals += 1;
 }
 
 /// Assign `ref` a data-segment offset if it is a not-yet-seen string constant.
@@ -95,24 +126,38 @@ fn collectStringRef(gen: *WatGen, ref: Air.Inst.Ref, offset: *u32) !void {
 }
 
 /// The argument refs trailing a `call`'s `Air.Call` header in `air.extra`.
-fn callArgs(gen: *const WatGen, data: Air.Inst.Data) []const Air.Inst.Ref {
-    const extra = gen.air.extra.items;
+fn callArgs(air: *const Air, data: Air.Inst.Data) []const Air.Inst.Ref {
+    const extra = air.extra.items;
     const payload = data.pl_op.payload;
     const args_len = extra[payload]; // Air.Call.args_len is the first field
     return @ptrCast(extra[payload + 1 ..][0..args_len]);
 }
 
-/// Emit an `(import …)` for every distinct extern a `call` references, before
-/// the functions. The import module defaults to "host" (notes/functions.md).
-fn writeImports(gen: *WatGen) !void {
+/// Emit an `(import …)` for every distinct extern any body calls, before the
+/// functions. The import module defaults to "host" (notes/functions.md).
+/// Calls to defined functions need no import.
+fn writeImports(gen: *WatGen, result: *const Sema.Result) !void {
     var seen: std.AutoArrayHashMapUnmanaged(NullTerminatedString, void) = .empty;
     defer seen.deinit(gen.gpa);
 
-    const tags = gen.air.instructions.items(.tag);
-    const datas = gen.air.instructions.items(.data);
+    for (result.funcs) |func| try gen.writeImportsIn(&func.air, &seen);
+    try gen.writeImportsIn(&result.main, &seen);
+}
+
+fn writeImportsIn(
+    gen: *WatGen,
+    air: *const Air,
+    seen: *std.AutoArrayHashMapUnmanaged(NullTerminatedString, void),
+) !void {
+    const tags = air.instructions.items(.tag);
+    const datas = air.instructions.items(.data);
     for (tags, datas) |tag, data| {
         if (tag != .call) continue;
-        const ext = gen.ip.indexToKey(data.pl_op.operand.toInterned().?).@"extern";
+        const ext = switch (gen.ip.indexToKey(data.pl_op.operand.toInterned().?)) {
+            .@"extern" => |ext| ext,
+            .func => continue,
+            else => unreachable,
+        };
         if ((try seen.getOrPut(gen.gpa, ext.name)).found_existing) continue;
 
         const fn_ty = gen.ip.indexToKey(ext.ty).func_type;
@@ -172,19 +217,23 @@ fn writeEscapedBytes(gen: *WatGen, bytes: []const u8) !void {
     };
 }
 
-fn writeFunc(gen: *WatGen) !void {
+fn writeFunc(gen: *WatGen, name: []const u8, param_types: []const InternPool.Index, air: *const Air) !void {
+    gen.air = air;
+    try gen.collectLocals(@intCast(param_types.len));
+
     try gen.writeIndent();
-    try gen.out.writeAll("(func $main");
+    try gen.out.print("(func ${s}", .{name});
+    for (param_types) |param| try gen.out.print(" (param {s})", .{wasmType(param)});
     // A void result has no wasm value type, so the clause is omitted entirely
     // rather than mapped — same gate as `writeImports`.
     const ret_ty = gen.resultType();
     if (ret_ty != .void_type) try gen.out.print(" (result {s})", .{wasmType(ret_ty)});
     try gen.out.writeAll("\n");
     gen.indent += 1;
-    if (gen.locals.count() != 0) {
+    if (gen.declared_locals != 0) {
         try gen.writeIndent();
         try gen.out.writeAll("(local");
-        for (0..gen.locals.count()) |_| try gen.out.writeAll(" f64");
+        for (0..gen.declared_locals) |_| try gen.out.writeAll(" f64");
         try gen.out.writeAll(")\n");
     }
     try gen.writeBody();
@@ -218,13 +267,21 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Ins
             try gen.out.writeAll("return\n");
         },
         .call => {
-            // Push each argument, then call the import by name.
-            for (gen.callArgs(data)) |arg| try gen.writeRef(arg);
-            const ext = gen.ip.indexToKey(data.pl_op.operand.toInterned().?).@"extern";
+            // Push each argument, then call the target by name — an extern's
+            // import name, or a defined function's declared name.
+            for (callArgs(gen.air, data)) |arg| try gen.writeRef(arg);
+            const name = switch (gen.ip.indexToKey(data.pl_op.operand.toInterned().?)) {
+                .@"extern" => |ext| ext.name,
+                .func => gen.func_names.get(data.pl_op.operand.toInterned().?).?,
+                else => unreachable,
+            };
             try gen.writeIndent();
-            try gen.out.print("call ${s}\n", .{ext.name.toSlice(gen.ip)});
+            try gen.out.print("call ${s}\n", .{name.toSlice(gen.ip)});
             try gen.writeLocalSet(inst);
         },
+        // The parameter's value already lives in its local slot; the `arg`
+        // instruction only established the mapping.
+        .arg => {},
         .add, .sub, .mul, .div => {
             try gen.writeRef(data.bin_op.lhs);
             try gen.writeRef(data.bin_op.rhs);
@@ -267,6 +324,7 @@ fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
         .simple_type => @panic("type as value not supported yet"),
         .func_type => @panic("type as value not supported yet"),
         .@"extern" => @panic("type as value not supported yet"),
+        .func => @panic("function as value not supported yet"),
         .string => |handle| {
             // (ptr, len) into linear memory; the data segment was emitted by
             // writeDataSection at the offset collectStrings assigned.
@@ -307,7 +365,8 @@ fn expectWatIndex(ip: *InternPool, ip_index: InternPool.Index, expected: []const
 
     var buf: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try WatGen.emit(gpa, &air, ip, &w);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, ip, &w);
     try std.testing.expectEqualStrings(expected, w.buffer[0..w.end]);
 }
 
@@ -399,7 +458,8 @@ test "emit call to extern" {
 
     var buf: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try WatGen.emit(gpa, &air, &ip, &w);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, &ip, &w);
     try std.testing.expectEqualStrings(
         \\(module
         \\  (import "host" "print" (func $print (param f64) (result f64)))
@@ -468,7 +528,8 @@ test "emit call with a runtime argument after a comptime one" {
 
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try WatGen.emit(gpa, &air, &ip, &w);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, &ip, &w);
     try std.testing.expectEqualStrings(
         \\(module
         \\  (import "host" "print" (func $print (param f64) (result f64)))
@@ -531,7 +592,8 @@ test "emit runtime arithmetic" {
 
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try WatGen.emit(gpa, &air, &ip, &w);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, &ip, &w);
     try std.testing.expectEqualStrings(
         \\(module
         \\  (import "host" "print" (func $print (param f64) (result f64)))
@@ -545,6 +607,80 @@ test "emit runtime arithmetic" {
         \\    f64.add
         \\    local.set 1
         \\    local.get 1
+        \\    return
+        \\  )
+        \\  (export "main" (func $main))
+        \\)
+        \\
+    , w.buffer[0..w.end]);
+}
+
+test "emit defined function and a call to it" {
+    // fn add(x number) number { x + 1 } / main: add(2) — the defined fn gets
+    // its own (func $add) with the param as local 0 and its declared local
+    // after it; main calls it by name with no import.
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    const add_val = try ip.get(gpa, .{ .func = .{ .ty = fn_ty, .dir_inst = 5 } });
+    const one = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1 } } });
+    const two = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 2 } } });
+
+    // add's AIR:  %0 = arg(f64, 0);  %1 = add(%0, 1);  ret %1
+    var fn_insts: std.MultiArrayList(Air.Inst) = .{};
+    try fn_insts.append(gpa, .{ .tag = .arg, .data = .{ .arg = .{ .ty = .fromInterned(.f64_type), .index = 0 } } });
+    const arg_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
+    try fn_insts.append(gpa, .{ .tag = .add, .data = .{ .bin_op = .{ .lhs = arg_ref, .rhs = .fromInterned(one) } } });
+    const add_ref = (@as(Air.Inst.Index, @enumFromInt(1))).toRef();
+    try fn_insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = add_ref } });
+    var fn_air = Air{ .instructions = fn_insts.toOwnedSlice(), .extra = .empty };
+    defer fn_air.deinit(gpa);
+
+    // main's AIR:  %0 = call add(2);  ret %0
+    var main_insts: std.MultiArrayList(Air.Inst) = .{};
+    try main_insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = .fromInterned(add_val),
+        .payload = 0,
+    } } });
+    const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
+    try main_insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = call_ref } });
+    var main_extra: std.ArrayList(u32) = .empty;
+    try main_extra.append(gpa, 1); // Air.Call.args_len
+    try main_extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(two)));
+    var main_air = Air{ .instructions = main_insts.toOwnedSlice(), .extra = main_extra };
+    defer main_air.deinit(gpa);
+
+    const funcs = [_]Sema.Result.Func{.{
+        .name = try ip.getString(gpa, "add"),
+        .val = add_val,
+        .air = fn_air,
+    }};
+    const result = Sema.Result{ .funcs = &funcs, .main = main_air };
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try WatGen.emit(gpa, &result, &ip, &w);
+    try std.testing.expectEqualStrings(
+        \\(module
+        \\  (func $add (param f64) (result f64)
+        \\    (local f64)
+        \\    local.get 0
+        \\    f64.const 1
+        \\    f64.add
+        \\    local.set 1
+        \\    local.get 1
+        \\    return
+        \\  )
+        \\  (func $main (result f64)
+        \\    (local f64)
+        \\    f64.const 2
+        \\    call $add
+        \\    local.set 0
+        \\    local.get 0
         \\    return
         \\  )
         \\  (export "main" (func $main))

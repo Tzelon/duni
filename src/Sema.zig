@@ -50,7 +50,50 @@ arena: Allocator,
 
 code: Dir,
 
-pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
+/// The declared return type of the function whose body is being analyzed.
+/// `ret_node` coerces its operand to it. The module body has no declared
+/// return type and appends its own `ret`, so `void` (the default) only
+/// matters inside `analyzeFnBody`.
+fn_ret_ty: Type = .void,
+
+/// Defined functions discovered while registering decls, in decl order.
+/// Their bodies are analyzed only after every decl is known, so a body can
+/// call a function declared after it.
+fn_queue: std.ArrayList(QueuedFunc) = .empty,
+
+const QueuedFunc = struct {
+    name: Dir.NullTerminatedString,
+    val: InternPool.Index,
+};
+
+/// The output of `analyze`: one `Air` per defined function (as `Air`'s own
+/// doc demands), plus the module body's `Air`.
+pub const Result = struct {
+    funcs: []const Func,
+    main: Air,
+
+    pub const Func = struct {
+        /// The declared name, interned in the pool's string table. Codegen
+        /// prints it; the compiler never matches on it.
+        name: String.NullTerminatedString,
+        /// The function's interned `func` value — what a call's callee
+        /// resolves to.
+        val: InternPool.Index,
+        air: Air,
+    };
+
+    pub fn deinit(result: *Result, gpa: Allocator) void {
+        for (result.funcs) |func| {
+            var func_air = func.air;
+            func_air.deinit(gpa);
+        }
+        gpa.free(result.funcs);
+        result.main.deinit(gpa);
+        result.* = undefined;
+    }
+};
+
+pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Result {
     var analysis_arena: std.heap.ArenaAllocator = .init(gpa);
     defer analysis_arena.deinit();
     var sema = Sema{ .gpa = gpa, .code = code, .arena = analysis_arena.allocator() };
@@ -61,6 +104,22 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
 
     for (module.decls) |decl_inst| {
         try sema.analyzeDeclaration(ip, decl_inst);
+    }
+
+    // Every decl is registered — function bodies can now resolve any of them.
+    const funcs = try gpa.alloc(Result.Func, sema.fn_queue.items.len);
+    var funcs_analyzed: usize = 0;
+    errdefer {
+        for (funcs[0..funcs_analyzed]) |*func| func.air.deinit(gpa);
+        gpa.free(funcs);
+    }
+    for (sema.fn_queue.items, funcs) |queued, *out| {
+        out.* = .{
+            .name = try ip.getString(gpa, sema.code.nullTerminatedString(queued.name)),
+            .val = queued.val,
+            .air = try analyzeFnBody(&sema, ip, queued.val),
+        };
+        funcs_analyzed += 1;
     }
 
     try analyzeBody(&sema, ip, module.body);
@@ -94,6 +153,62 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool) !Air {
     };
     sema.air_extra = .empty;
     sema.air_instructions = .empty;
+    return .{ .funcs = funcs, .main = air };
+}
+
+/// Analyze one defined function's body into its own `Air` (Zig: one `Air`
+/// per function). Borrows the module Sema's resolved decls and arena;
+/// everything else is a fresh analysis.
+fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index) CompileError!Air {
+    const func = ip.indexToKey(func_val).func;
+    const fn_ty = ip.indexToFuncType(func.ty).?;
+
+    var sema = Sema{
+        .gpa = module_sema.gpa,
+        .code = module_sema.code,
+        .arena = module_sema.arena,
+        .decls = module_sema.decls,
+        .fn_ret_ty = .fromInterned(fn_ty.return_type),
+    };
+    defer {
+        // The decls map is borrowed from the module Sema, which owns it.
+        sema.decls = .{};
+        sema.deinit();
+    }
+
+    const func_inst: Dir.Inst.Index = @enumFromInt(func.dir_inst);
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(func_inst)].pl_node;
+    const extra = sema.code.extraData(Dir.Inst.Func, inst_data.payload_index);
+    // The return type occupies `ret_ty.body_len` trailing slots before the body.
+    const body = sema.code.bodySlice(extra.end + extra.data.ret_ty.body_len, extra.data.body_len);
+
+    // Pre-map each `param` instruction in the declaration's value body to an
+    // Air `arg`, in parameter order (Zig: `analyzeFnBody` does the same
+    // before running the body). The body then resolves param refs to args.
+    const tags = sema.code.instructions.items(.tag);
+    const decl = sema.code.getDeclaration(extra.data.param_block);
+    const param_types = fn_ty.param_types.get(ip);
+    var arg_index: u32 = 0;
+    for (decl.value_body.?) |param_inst| {
+        if (tags[@intFromEnum(param_inst)] != .param) continue;
+        try sema.inst_map.ensureSpaceForInstructions(sema.gpa, &.{param_inst});
+        const arg_ref = try sema.addInst(.{ .tag = .arg, .data = .{ .arg = .{
+            .ty = .fromInterned(param_types[arg_index]),
+            .index = arg_index,
+        } } });
+        sema.inst_map.putAssumeCapacity(param_inst, arg_ref);
+        arg_index += 1;
+    }
+
+    // The body terminates with `ret_node`, which appends the Air `ret`.
+    try sema.analyzeBody(ip, body);
+
+    const air = Air{
+        .instructions = sema.air_instructions.slice(),
+        .extra = sema.air_extra,
+    };
+    sema.air_extra = .empty;
+    sema.air_instructions = .empty;
     return air;
 }
 
@@ -102,6 +217,10 @@ fn analyzeBody(
     ip: *InternPool,
     body: []const Dir.Inst.Index,
 ) CompileError!void {
+    // An empty module body is legal (a file of only declarations);
+    // `ensureSpaceForInstructions` requires at least one instruction.
+    if (body.len == 0) return;
+
     try sema.inst_map.ensureSpaceForInstructions(sema.gpa, body);
 
     const tags = sema.code.instructions.items(.tag);
@@ -130,6 +249,7 @@ fn analyzeBody(
             .declaration => unreachable,
 
             .call => try sema.dirCall(ip, inst_idx, .direct),
+            .ret_node => try sema.dirRet(ip, inst_idx),
             .func => try sema.dirFunc(ip, inst_idx),
             .param => try sema.dirParam(ip, inst_idx),
             .block_inline => try sema.dirBlockInline(ip, inst_idx),
@@ -224,28 +344,44 @@ fn analyzeCall(
 
 fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) CompileError!void {
     const decl = sema.code.getDeclaration(decl_inst);
-    //TODO(tzelon) non extern function are later
-    if (decl.linkage != .@"extern") @panic("only extern fn decl are supported");
 
-    const type_body = decl.type_body.?;
-    const ty_ref = try sema.resolveInlineBody(ip, type_body);
-    const fn_ty = ty_ref.toInterned().?; // a function type is always comptime-known
+    const decl_ref: Air.Inst.Ref = switch (decl.linkage) {
+        .@"extern" => extern_ref: {
+            const type_body = decl.type_body.?;
+            const ty_ref = try sema.resolveInlineBody(ip, type_body);
+            const fn_ty = ty_ref.toInterned().?; // a function type is always comptime-known
 
-    const name = try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.name));
-    const lib_name: String.OptionalNullTerminatedString = if (decl.lib_name == .empty)
-        .none
-    else
-        (try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.lib_name))).toOptional();
+            const name = try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.name));
+            const lib_name: String.OptionalNullTerminatedString = if (decl.lib_name == .empty)
+                .none
+            else
+                (try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.lib_name))).toOptional();
 
-    const extern_val = try ip.get(sema.gpa, .{ .@"extern" = .{
-        .lib_name = lib_name,
-        .ty = fn_ty,
-        .name = name,
-    } });
+            const extern_val = try ip.get(sema.gpa, .{ .@"extern" = .{
+                .lib_name = lib_name,
+                .ty = fn_ty,
+                .name = name,
+            } });
 
-    const extern_ref = Air.internedToRef(extern_val);
+            break :extern_ref Air.internedToRef(extern_val);
+        },
+        .normal => func_ref: {
+            // The value body's `func` instruction interns the function value;
+            // the body itself is analyzed later, once every decl is known.
+            const func_ref = try sema.resolveInlineBody(ip, decl.value_body.?);
+            const func_val = func_ref.toInterned().?; // a defined fn folds to its value
+            try sema.fn_queue.append(sema.gpa, .{ .name = decl.name, .val = func_val });
+            break :func_ref func_ref;
+        },
+    };
 
-    try sema.decls.putNoClobber(sema.gpa, decl.name, extern_ref);
+    const gop = try sema.decls.getOrPut(sema.gpa, decl.name);
+    if (gop.found_existing) {
+        // TODO(tzelon): structured Sema error reporting
+        log.warn("duplicate declaration name '{s}'", .{sema.code.nullTerminatedString(decl.name)});
+        return error.AnalysisFail;
+    }
+    gop.value_ptr.* = decl_ref;
 }
 
 fn dirInt(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -424,9 +560,16 @@ fn dirFunc(
     // analyzed before this func in the same body). Zig instead accumulates
     // into `block.params`; we re-derive order from the DIR (`param_block`).
     const tags = sema.code.instructions.items(.tag);
-    const pb = sema.code.instructions.items(.data)[@intFromEnum(extra.data.param_block)].pl_node;
-    const pb_extra = sema.code.extraData(Dir.Inst.Block, pb.payload_index);
-    const param_body = sema.code.bodySlice(pb_extra.end, pb_extra.data.body_len);
+    const param_body = switch (tags[@intFromEnum(extra.data.param_block)]) {
+        // A defined fn: its params live in the owning declaration's value body.
+        .declaration => sema.code.getDeclaration(extra.data.param_block).value_body.?,
+        // An extern proto: its params live in the proto's inline block.
+        else => param_body: {
+            const pb = sema.code.instructions.items(.data)[@intFromEnum(extra.data.param_block)].pl_node;
+            const pb_extra = sema.code.extraData(Dir.Inst.Block, pb.payload_index);
+            break :param_body sema.code.bodySlice(pb_extra.end, pb_extra.data.body_len);
+        },
+    };
     var params: std.ArrayListUnmanaged(InternPool.Index) = .empty;
     for (param_body) |p| {
         if (tags[@intFromEnum(p)] != .param) continue;
@@ -441,7 +584,37 @@ fn dirFunc(
 
     const fn_ty = try ip.getFuncType(sema.gpa, .{ .return_type = ret_ty.toIntern(), .param_types = params.items });
 
-    return .fromInterned(fn_ty);
+    // No body: this is a function *type* (an extern proto). With a body:
+    // a function *value*, identified by its `func` instruction; the body is
+    // analyzed per function by `analyzeFnBody`.
+    if (extra.data.body_len == 0) return .fromInterned(fn_ty);
+
+    const func_val = try ip.get(sema.gpa, .{ .func = .{
+        .ty = fn_ty,
+        .dir_inst = @intFromEnum(inst),
+    } });
+    return .fromInterned(func_val);
+}
+
+fn dirRet(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = sema.resolveInst(inst_data.operand);
+
+    const result = result: {
+        if (sema.fn_ret_ty.toIntern() == .void_type) {
+            if (sema.typeOf(ip, operand).toIntern() != .void_type) {
+                // TODO(tzelon): structured Sema error reporting
+                log.warn("function declared void returns a value", .{});
+                return error.AnalysisFail;
+            }
+            break :result operand;
+        }
+        break :result try sema.coerce(ip, sema.fn_ret_ty, operand);
+    };
+
+    _ = try sema.addInst(.{ .tag = .ret, .data = .{ .un_op = result } });
+    // `ret` is a terminator, not a value.
+    return .fromInterned(.void_value);
 }
 
 //TODO(tzelon): block needs Block struct to function, which we can break out of.
@@ -736,6 +909,7 @@ pub fn deinit(sema: *Sema) void {
     sema.air_extra.deinit(sema.gpa);
     sema.inst_map.deinit(sema.gpa);
     sema.decls.deinit(sema.gpa);
+    sema.fn_queue.deinit(sema.gpa);
     sema.* = undefined;
 }
 
@@ -903,13 +1077,13 @@ fn expectAnalyzed(
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var air = try Sema.analyze(gpa, dir, &ip);
-    defer air.deinit(gpa);
+    var result = try Sema.analyze(gpa, dir, &ip);
+    defer result.deinit(gpa);
 
-    try std.testing.expectEqual(@as(usize, 1), air.instructions.len);
-    try std.testing.expectEqual(Air.Inst.Tag.ret, air.instructions.items(.tag)[0]);
+    try std.testing.expectEqual(@as(usize, 1), result.main.instructions.len);
+    try std.testing.expectEqual(Air.Inst.Tag.ret, result.main.instructions.items(.tag)[0]);
 
-    const actual = air.instructions.items(.data)[0].un_op.toInterned().?;
+    const actual = result.main.instructions.items(.data)[0].un_op.toInterned().?;
     try std.testing.expectEqual(try ip.get(gpa, expected), actual);
 }
 
@@ -984,10 +1158,10 @@ test "analyze string literal" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var air = try Sema.analyze(gpa, dir, &ip);
-    defer air.deinit(gpa);
+    var result = try Sema.analyze(gpa, dir, &ip);
+    defer result.deinit(gpa);
 
-    const actual = air.instructions.items(.data)[0].un_op.toInterned().?;
+    const actual = result.main.instructions.items(.data)[0].un_op.toInterned().?;
     try std.testing.expectEqualStrings("hello", ip.indexToKey(actual).string.toSlice(&ip));
 }
 
@@ -1103,12 +1277,12 @@ test "analyze block" {
     try ip.init(gpa);
     defer ip.deinit(gpa);
 
-    var air = try Sema.analyze(gpa, dir, &ip);
-    defer air.deinit(gpa);
+    var result = try Sema.analyze(gpa, dir, &ip);
+    defer result.deinit(gpa);
 
-    try std.testing.expectEqual(@as(usize, 1), air.instructions.len);
-    try std.testing.expectEqual(Air.Inst.Tag.ret, air.instructions.items(.tag)[0]);
-    const actual = air.instructions.items(.data)[0].un_op.toInterned().?;
+    try std.testing.expectEqual(@as(usize, 1), result.main.instructions.len);
+    try std.testing.expectEqual(Air.Inst.Tag.ret, result.main.instructions.items(.tag)[0]);
+    const actual = result.main.instructions.items(.data)[0].un_op.toInterned().?;
     try std.testing.expectEqual(
         try ip.get(gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 2.0 } } }),
         actual,
@@ -1224,6 +1398,121 @@ test "analyze arithmetic rejects non-numeric operands" {
     defer ip.deinit(gpa);
 
     try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip));
+}
+
+test "analyze a defined fn produces its own Air of arg and ret" {
+    // fn f(x number) number { x } — the declaration registers a `func` value,
+    // and the body analysis emits one Air per function: the param pre-mapped
+    // to an `arg`, and the body's `ret_node` coercing/returning it.
+    const gpa = std.testing.allocator;
+
+    const Ast = @import("Ast.zig");
+
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    defer list.deinit(gpa);
+    // %0 = module_decl(decls={%1})
+    try list.append(gpa, .{ .tag = .extended, .data = .{ .extended = .{
+        .opcode = .module_decl,
+        .small = @bitCast(Dir.Inst.ModuleDecl.Small{}),
+        .operand = 0,
+    } } });
+    // %1 = declaration(value_body={%3, %5, %6})
+    try list.append(gpa, .{ .tag = .declaration, .data = .{ .declaration = .{
+        .src_node = @enumFromInt(0),
+        .payload_index = 4,
+    } } });
+    // %2 = break_inline(%3, f64_type) — the param's type body terminator
+    try list.append(gpa, .{ .tag = .break_inline, .data = .{ .@"break" = .{
+        .operand = .f64_type,
+        .payload_index = 13,
+    } } });
+    // %3 = param(x, {%2})
+    try list.append(gpa, .{ .tag = .param, .data = .{ .pl_tok = .{
+        .src_tok = @enumFromInt(0),
+        .payload_index = 10,
+    } } });
+    // %4 = ret_node(%3)
+    try list.append(gpa, .{ .tag = .ret_node, .data = .{ .un_node = .{
+        .src_node = @enumFromInt(0),
+        .operand = @as(Dir.Inst.Index, @enumFromInt(3)).toRef(),
+    } } });
+    // %5 = func(param_block=%1, ret_ty=f64_type, body={%4})
+    try list.append(gpa, .{ .tag = .func, .data = .{ .pl_node = .{
+        .src_node = @enumFromInt(0),
+        .payload_index = 15,
+    } } });
+    // %6 = break_inline(%1, %5)
+    try list.append(gpa, .{ .tag = .break_inline, .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(5)).toRef(),
+        .payload_index = 20,
+    } } });
+
+    const no_src: u32 = @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none));
+    const extra = try gpa.alloc(u32, 22);
+    // extra[0..4]: ModuleDecl{src_node=root, decls_len=1, body_len=0} + decls {%1}
+    extra[0] = 0;
+    extra[1] = 1;
+    extra[2] = 0;
+    extra[3] = 1;
+    // extra[4..10]: Declaration{flags} + name + value_body_len + value body {%3, %5, %6}
+    extra[4] = @bitCast(Dir.Inst.Declaration.Flags{
+        .kind = .@"const",
+        .linkage = .normal,
+        .has_name = true,
+        .has_lib_name = false,
+        .has_type_body = false,
+        .has_value_body = true,
+    });
+    extra[5] = 1; // name: string_bytes offset of "f"
+    extra[6] = 3; // value_body_len
+    extra[7] = 3; // %3
+    extra[8] = 5; // %5
+    extra[9] = 6; // %6
+    // extra[10..13]: Param{name=x, type{body_len=1}} + type body {%2}
+    extra[10] = 3; // name: string_bytes offset of "x"
+    extra[11] = @bitCast(Dir.Inst.Param.Type{ .body_len = 1 });
+    extra[12] = 2; // type body: %2
+    // extra[13..15]: Break payload for %2
+    extra[13] = no_src;
+    extra[14] = 3; // block_inst = %3
+    // extra[15..20]: Func{ret_ty{body_len=1}, param_block=%1, body_len=1} + ret ref + body {%4}
+    extra[15] = @bitCast(Dir.Inst.Func.RetTy{ .body_len = 1 });
+    extra[16] = 1; // param_block = %1
+    extra[17] = 1; // body_len
+    extra[18] = @intFromEnum(Dir.Inst.Ref.f64_type);
+    extra[19] = 4; // func body: %4
+    // extra[20..22]: Break payload for %6
+    extra[20] = no_src;
+    extra[21] = 1; // block_inst = %1
+
+    var dir: Dir = .{
+        .instructions = list.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = try gpa.dupe(u8, "\x00f\x00x\x00"),
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var result = try Sema.analyze(gpa, dir, &ip);
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), result.funcs.len);
+    const func = result.funcs[0];
+    try std.testing.expectEqualStrings("f", func.name.toSlice(&ip));
+    try std.testing.expectEqual(ip.indexToKey(func.val).func.ty, ip.typeOf(func.val));
+
+    // The function's Air: %0 = arg(f64, 0); %1 = ret(%0)
+    try std.testing.expectEqual(@as(usize, 2), func.air.instructions.len);
+    try std.testing.expectEqual(Air.Inst.Tag.arg, func.air.instructions.items(.tag)[0]);
+    const arg_data = func.air.instructions.items(.data)[0].arg;
+    try std.testing.expectEqual(InternPool.Index.f64_type, arg_data.ty.toIntern());
+    try std.testing.expectEqual(@as(u32, 0), arg_data.index);
+    try std.testing.expectEqual(Air.Inst.Tag.ret, func.air.instructions.items(.tag)[1]);
+    const ret_operand = func.air.instructions.items(.data)[1].un_op;
+    try std.testing.expectEqual((@as(Air.Inst.Index, @enumFromInt(0))).toRef(), ret_operand);
 }
 
 test "dirFunc builds a function type from its params and return type" {

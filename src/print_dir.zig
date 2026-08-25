@@ -149,7 +149,7 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .int_big => try self.writeIntBig(data),
         .float => try self.writeFloat(data),
         .int => try self.writeInt(data),
-        .negate => try self.writeUnNode(data),
+        .negate, .ret_node => try self.writeUnNode(data),
         .str => try self.writeStr(data),
         .decl_val => try self.writeStrTok(data),
         .add, .sub, .mul, .div => try self.writePlNodeBin(data),

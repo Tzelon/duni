@@ -29,6 +29,11 @@ pub const Inst = struct {
         /// Uses the `un_op` field.
         ret,
 
+        /// The value of a function parameter. One per parameter, emitted
+        /// before the function body's instructions, in parameter order.
+        /// Uses the `arg` field.
+        arg,
+
         /// Float addition. Both operands are `number` (f64) — Sema coerces
         /// before emitting, so no integer arithmetic reaches codegen.
         /// Uses the `bin_op` field.
@@ -148,6 +153,12 @@ pub const Inst = struct {
     pub const Data = union {
         un_op: Ref,
 
+        arg: struct {
+            ty: Type,
+            /// The parameter's position — its wasm local index.
+            index: u32,
+        },
+
         bin_op: struct {
             lhs: Ref,
             rhs: Ref,
@@ -182,7 +193,7 @@ pub fn typeOf(air: *const Air, inst: Air.Inst.Ref, ip: *const InternPool) Type {
 pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool) Type {
     const datas = air.instructions.items(.data);
     switch (air.instructions.items(.tag)[@intFromEnum(inst)]) {
-        // .arg => return datas[@intFromEnum(inst)].arg.ty.toType(),
+        .arg => return datas[@intFromEnum(inst)].arg.ty,
 
         .ret,
         => unreachable,

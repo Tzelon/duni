@@ -44,6 +44,12 @@ arena: Allocator,
 /// dedupe table of strings
 string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
 
+/// A declaration failed to lower. The walk keeps going (so every decl gets a
+/// chance to report), but `generate` fails at the end — a DIR with a dropped
+/// decl must never reach Sema. Replaced by `addFailedDeclaration` when
+/// AstGen error reporting phase 1 lands.
+any_failed_decls: bool = false,
+
 pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -80,6 +86,8 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
 
     const module_ref = try rootModuleDecl(&main_gd, .root, tree.rootDecls());
     assert(module_ref.toIndex().? == .main_module_inst);
+
+    if (astgen.any_failed_decls) return error.AnalysisFail;
 
     try astgen.extra.shrinkToLen(gpa);
     try astgen.string_bytes.shrinkToLen(gpa);
@@ -183,15 +191,22 @@ fn rootModuleDecl(
                 error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
-                    std.log.err("boooooom", .{});
-                    // try addFailedDeclaration(
-                    //     wip_decls,
-                    //     gz,
-                    //     .@"const",
-                    //     try astgen.identAsString(full.name_token.?),
-                    //     full.ast.proto_node,
-                    //     full.visib_token != null,
-                    // );
+                    astgen.any_failed_decls = true;
+                    // Stand-in for Zig's `addFailedDeclaration`: record an
+                    // empty declaration in the failed one's slot so the decl
+                    // count scanned ahead of time stays consistent. The DIR
+                    // never reaches Sema — `generate` fails on the flag.
+                    const failed_decl = try block_scope.makeDeclaration(member);
+                    wip_decls.nextDecl(failed_decl);
+                    var empty_type = block_scope.makeSubBlock();
+                    var empty_value = empty_type.makeSubBlock();
+                    try setDeclaration(failed_decl, .{
+                        .kind = .@"const",
+                        .name = try astgen.identAsString(full_proto.name_token),
+                        .linkage = .normal,
+                        .type_gd = &empty_type,
+                        .value_gd = &empty_value,
+                    });
                 },
             };
         },
@@ -237,11 +252,11 @@ fn fnDecl(
 
     const is_extern = if (fn_proto.extern_token) |_| true else false;
 
-    if (body_node == .none) {
-        if (!is_extern) {
-            std.log.err("non-extern function has no body", .{});
-            // return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
-        }
+    if (body_node == .none and !is_extern) {
+        // TODO(tzelon): AstGen error reporting phase 1.
+        // return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
+        std.log.warn("non-extern function has no body", .{});
+        return error.AnalysisFail;
     }
 
     //TODO(tzelon): extract the lib_name l:4013 in zig
@@ -268,10 +283,8 @@ fn fnDecl(
     defer value_gz.unstack();
 
     if (!is_extern) {
-        unreachable;
         // We include a function *value*, not a type.
-        // astgen.restoreSourceCursor(saved_cursor);
-        // try astgen.fnDeclInner(&value_gz, &value_gz.base, saved_cursor, decl_inst, decl_node, body_node.unwrap().?, fn_proto);
+        try astgen.fnDeclInner(&value_gz, decl_inst, decl_node, body_node.unwrap().?, fn_proto);
     }
 
     try setDeclaration(decl_inst, .{
@@ -283,6 +296,85 @@ fn fnDecl(
         .type_gd = &type_gz,
         .value_gd = &value_gz,
     });
+}
+
+/// Lowers a non-extern function declaration's *value* into `decl_gz` (the
+/// declaration's value body): the params (bound as locals so the body sees
+/// them), the body ending in `ret_node` of its last expression (implicit
+/// return), the `func` instruction, and the break to the declaration.
+/// `param_block` is the declaration itself — Sema finds the params in its
+/// value body.
+fn fnDeclInner(
+    astgen: *AstGen,
+    decl_gz: *GenDir,
+    decl_inst: Dir.Inst.Index,
+    decl_node: Ast.Node.Index,
+    body_node: Ast.Node.Index,
+    fn_proto: Ast.full.FnProto,
+) InnerError!void {
+    const tree = astgen.tree;
+
+    const params_scope_start = decl_gz.cursor.tip;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| {
+        const param_type_node = param.type_expr.?;
+        var param_gd = decl_gz.makeSubBlock();
+        defer param_gd.unstack();
+        const param_type = try comptimeExpr(&param_gd, param_type_node);
+        const param_inst_expected: Dir.Inst.Index = @enumFromInt(astgen.instructions.len + 1);
+        _ = try param_gd.addBreakWithSrcNode(.break_inline, param_inst_expected, param_type, param_type_node);
+        const name_token = param.name_token orelse tree.nodeMainToken(param_type_node);
+        const param_name = try astgen.identAsString(name_token);
+
+        // Walk the params bound so far: a second param with the same name
+        // would silently shadow the first inside the body.
+        var scope = decl_gz.cursor.tip;
+        while (scope != params_scope_start) {
+            const previous_param = scope.cast(Scope.LocalVal).?;
+            if (previous_param.name == param_name) {
+                // TODO(tzelon): AstGen error reporting phase 1.
+                std.log.warn("duplicate function parameter name '{s}'", .{try astgen.identifierTokenString(name_token)});
+                return error.AnalysisFail;
+            }
+            scope = previous_param.parent;
+        }
+
+        const param_inst = try decl_gz.addParam(&param_gd, .param, name_token, param_name);
+        assert(param_inst_expected == param_inst);
+
+        const local_val = try astgen.scope_arena.allocator().create(Scope.LocalVal);
+        local_val.* = .{
+            .parent = decl_gz.cursor.tip,
+            .name = param_name,
+            .id_cat = .@"function parameter",
+            .inst = param_inst.toRef(),
+            .token_src = name_token,
+        };
+        decl_gz.cursor.tip = &local_val.base;
+    }
+
+    const ret_ty_node = fn_proto.ast.return_type.unwrap().?;
+    const ret_ty = try comptimeExpr(decl_gz, ret_ty_node);
+
+    // The body is a sub-block that sees the param bindings via the cursor.
+    var body_gz = decl_gz.makeSubBlock();
+    defer body_gz.unstack();
+
+    var result: Dir.Inst.Ref = .void_value;
+    for (tree.blockExpressions(body_node)) |statement| {
+        result = try expr(&body_gz, statement);
+    }
+    _ = try body_gz.addUnNode(.ret_node, result, body_node);
+
+    const func_inst = try decl_gz.addFunc(.{
+        .src_node = fn_proto.ast.proto_node,
+        .param_block = decl_inst,
+        .ret_gd = null,
+        .ret_ref = ret_ty,
+        .body_gd = &body_gz,
+    });
+
+    _ = try decl_gz.addBreakWithSrcNode(.break_inline, decl_inst, func_inst, decl_node);
 }
 
 const Sign = enum { negative, positive };
@@ -1372,6 +1464,10 @@ pub const GenDir = struct {
                 astgen.extra.appendAssumeCapacity(@intFromEnum(ret_ref));
             }
 
+            for (body) |inst| {
+                astgen.extra.appendAssumeCapacity(@intFromEnum(inst));
+            }
+
             break :inst_info .{ .func, payload_index };
         };
 
@@ -1651,6 +1747,41 @@ test "block" {
         \\%3 = break(%1, %2)
         \\
     );
+}
+
+test "fn with body" {
+    // The value body carries the params, the lowered body ending in
+    // `ret_node`, the `func` instruction, and the break to the declaration.
+    // `param_block` is the declaration itself (its value body holds the params).
+    try expect(
+        \\fn add(x number) number {
+        \\x + 1
+        \\}
+    ,
+        \\%0 = module_decl(decls={%1})
+        \\%1 = declaration()
+        \\%2 = break_inline(%3, f64_type)
+        \\%3 = param(x, {%2})
+        \\%4 = int(1)
+        \\%5 = add(%3, %4) node_offset:2:1 to :2:6
+        \\%6 = ret_node(%5) node_offset:1:25 to :1:26
+        \\%7 = func(%1, ret_ty=f64_type, body={%4, %5, %6}) node_offset:1:1 to :1:24
+        \\%8 = break_inline(%1, %7)
+        \\
+    );
+}
+
+test "duplicate param name is an error" {
+    const gpa = std.testing.allocator;
+
+    var tree = try Ast.parse(gpa,
+        \\fn add(x number, x number) number {
+        \\x
+        \\}
+    );
+    defer tree.deinit(gpa);
+    try std.testing.expect(tree.errors.len == 0);
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
 }
 
 test "extern fn" {

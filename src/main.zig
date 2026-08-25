@@ -66,12 +66,12 @@ fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
     var dir = try AstGen.generate(allocator, tree);
     defer dir.deinit(allocator);
 
-    var air = try Sema.analyze(allocator, dir, &ip);
-    defer air.deinit(allocator);
+    var result = try Sema.analyze(allocator, dir, &ip);
+    defer result.deinit(allocator);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try WatGen.emit(allocator, &air, &ip, stdout);
+    try WatGen.emit(allocator, &result, &ip, stdout);
     try stdout.flush();
 }

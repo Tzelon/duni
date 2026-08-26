@@ -122,24 +122,14 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) 
         return error.AnalysisFail;
     }
 
-    for (module.decls) |decl_inst| {
-        try sema.analyzeDeclaration(ip, decl_inst);
-    }
-
-    // Every decl is registered — function bodies can now resolve any of them.
-    const funcs = try gpa.alloc(Result.Func, sema.fn_queue.items.len);
-    var funcs_analyzed: usize = 0;
+    // The two sweeps (notes/type_system.md §8, seam 3): declarations first,
+    // then bodies. No body is analyzed until every declaration is registered —
+    // this is what makes forward and mutual references work.
+    try sema.resolveDeclarations(ip, module.decls);
+    const funcs = try sema.analyzeFnBodies(ip);
     errdefer {
-        for (funcs[0..funcs_analyzed]) |*func| func.air.deinit(gpa);
+        for (funcs) |*func| func.air.deinit(gpa);
         gpa.free(funcs);
-    }
-    for (sema.fn_queue.items, funcs) |queued, *out| {
-        out.* = .{
-            .name = try ip.getString(gpa, sema.code.nullTerminatedString(queued.name)),
-            .val = queued.val,
-            .air = try analyzeFnBody(&sema, ip, queued.val),
-        };
-        funcs_analyzed += 1;
     }
 
     try analyzeBody(&sema, ip, module.body);
@@ -170,6 +160,40 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) 
     sema.air_extra = .empty;
     sema.air_instructions = .empty;
     return .{ .funcs = funcs, .main = air };
+}
+
+/// Sweep 1 of 2: register every module-level declaration in `decls` (externs
+/// intern their value directly; defined fns intern a `func` value and queue
+/// their body on `fn_queue`). Contract: no function body is analyzed during
+/// this sweep — a body may reference any declaration, including ones that
+/// appear after its own (see wat/forward_call).
+fn resolveDeclarations(sema: *Sema, ip: *InternPool, decls: []const Dir.Inst.Index) CompileError!void {
+    for (decls) |decl_inst| {
+        try sema.analyzeDeclaration(ip, decl_inst);
+    }
+}
+
+/// Sweep 2 of 2: analyze the body of every function queued by
+/// `resolveDeclarations`, producing one `Air` per function. Runs only after
+/// sweep 1 completes, so every decl name resolves. The caller owns the
+/// returned slice (and each `Air` in it).
+fn analyzeFnBodies(sema: *Sema, ip: *InternPool) CompileError![]Result.Func {
+    const gpa = sema.gpa;
+    const funcs = try gpa.alloc(Result.Func, sema.fn_queue.items.len);
+    var funcs_analyzed: usize = 0;
+    errdefer {
+        for (funcs[0..funcs_analyzed]) |*func| func.air.deinit(gpa);
+        gpa.free(funcs);
+    }
+    for (sema.fn_queue.items, funcs) |queued, *out| {
+        out.* = .{
+            .name = try ip.getString(gpa, sema.code.nullTerminatedString(queued.name)),
+            .val = queued.val,
+            .air = try analyzeFnBody(sema, ip, queued.val),
+        };
+        funcs_analyzed += 1;
+    }
+    return funcs;
 }
 
 /// Analyze one defined function's body into its own `Air` (Zig: one `Air`
@@ -663,7 +687,9 @@ fn dirRet(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
 
     const result = result: {
         if (sema.fn_ret_ty.toIntern() == .void_type) {
-            if (sema.typeOf(ip, operand).toIntern() != .void_type) {
+            // `void` has no coercion story — the operand's type either
+            // unifies with it or the function is returning a value.
+            if (sema.unify(ip, sema.fn_ret_ty, sema.typeOf(ip, operand)) == null) {
                 try sema.diags.addError(loc, "function declared 'void' returns a value", .{});
                 return error.AnalysisFail;
             }
@@ -785,14 +811,12 @@ fn dirParam(
 /// adds its destinations here.
 fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref, loc: Diagnostics.Loc) CompileError!Air.Inst.Ref {
     const val = sema.resolveValue(inst) orelse {
+        // A runtime value cannot fold, so the only question is type
+        // compatibility — unify's question.
         const inst_ty = sema.typeOf(ip, inst);
-        switch (dest_ty.toIntern()) {
-            .comptime_float_type, .f64_type => switch (inst_ty.toIntern()) {
-                .comptime_float_type, .f64_type => return inst,
-                else => return sema.failTypeMismatch(dest_ty, inst_ty, loc),
-            },
-            else => unreachable,
-        }
+        if (sema.unify(ip, dest_ty, inst_ty) == null)
+            return sema.failTypeMismatch(dest_ty, inst_ty, loc);
+        return inst;
     };
     switch (dest_ty.toIntern()) {
         .comptime_float_type, .f64_type => switch (ip.indexToKey(val.toIntern())) {
@@ -806,6 +830,39 @@ fn coerce(sema: *Sema, ip: *InternPool, dest_ty: Type, inst: Air.Inst.Ref, loc: 
             else => return sema.failTypeMismatch(dest_ty, .fromInterned(ip.typeOf(val.toIntern())), loc),
         },
         else => unreachable,
+    }
+}
+
+/// The unification chokepoint (notes/type_system.md §8, seam 2): every
+/// "are these two types the same type?" question is answered here — this is
+/// where the checker eventually lives. Today's body is interned-index
+/// equality, plus the one legal pair: `comptime_float` and `f64` are the
+/// same runtime type (`number`). Returns `expected` on success so callers
+/// keep the type they asked for; `null` is a mismatch and the caller emits
+/// the diagnostic (so today's error output stays byte-identical).
+///
+/// Deliberately NOT routed through here — don't "fix" these:
+/// - `coerce`'s comptime value paths: int→float refinement is directional
+///   value conversion, not unification;
+/// - `analyzeArithmetic`'s `isNumeric` gate: an operator's operand-kind
+///   requirement, not a compatibility test between two types;
+/// - the module-boundary result in `analyze`: the module has no declared
+///   result type (both `number` and `void` runtime results legally cross
+///   it — see wat/void_return), so there is nothing to unify against.
+fn unify(sema: *Sema, ip: *const InternPool, expected: Type, actual: Type) ?Type {
+    _ = sema;
+    _ = ip;
+    // No producer of type variables exists yet (Type seam 1); when tvars
+    // arrive this arm binds them (with provenance — seam 4).
+    assert(!expected.isTvar() and !actual.isTvar());
+
+    if (expected.toIntern() == actual.toIntern()) return expected;
+    switch (expected.toIntern()) {
+        .comptime_float_type, .f64_type => switch (actual.toIntern()) {
+            .comptime_float_type, .f64_type => return expected,
+            else => return null,
+        },
+        else => return null,
     }
 }
 
@@ -1454,6 +1511,35 @@ test "analyze arithmetic with a runtime operand emits an Air bin op" {
     try std.testing.expectEqual(call_ref, bin_op.lhs);
     const expected_rhs = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1.0 } } });
     try std.testing.expectEqual(Air.internedToRef(expected_rhs), bin_op.rhs);
+}
+
+test "unify: index equality plus the comptime_float/f64 pair" {
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    // `code` is never read: unify works purely on type handles.
+    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
+    defer sema.deinit();
+
+    // Equal interned indexes unify.
+    const string_ty: Type = .fromInterned(.string_type);
+    try std.testing.expectEqual(InternPool.Index.string_type, sema.unify(&ip, string_ty, string_ty).?.toIntern());
+
+    // comptime_float and f64 are the same runtime type (`number`), both ways.
+    const cf: Type = .fromInterned(.comptime_float_type);
+    const f64_ty: Type = .fromInterned(.f64_type);
+    try std.testing.expectEqual(InternPool.Index.comptime_float_type, sema.unify(&ip, cf, f64_ty).?.toIntern());
+    try std.testing.expectEqual(InternPool.Index.f64_type, sema.unify(&ip, f64_ty, cf).?.toIntern());
+
+    // Anything else is a mismatch.
+    try std.testing.expectEqual(@as(?Type, null), sema.unify(&ip, f64_ty, string_ty));
 }
 
 test "analyze arithmetic rejects non-numeric operands" {

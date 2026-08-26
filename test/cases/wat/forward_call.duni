@@ -1,0 +1,46 @@
+extern fn print(x number) number
+
+fn first(x number) number {
+second(x)
+}
+
+fn second(x number) number {
+x + 1
+}
+
+print(first(41))
+
+// wat
+//
+// (module
+//   (import "host" "print" (func $print (param f64) (result f64)))
+//   (func $first (param f64) (result f64)
+//     (local f64)
+//     local.get 0
+//     call $second
+//     local.set 1
+//     local.get 1
+//     return
+//   )
+//   (func $second (param f64) (result f64)
+//     (local f64)
+//     local.get 0
+//     f64.const 1
+//     f64.add
+//     local.set 1
+//     local.get 1
+//     return
+//   )
+//   (func $main (result f64)
+//     (local f64 f64)
+//     f64.const 41
+//     call $first
+//     local.set 0
+//     local.get 0
+//     call $print
+//     local.set 1
+//     local.get 1
+//     return
+//   )
+//   (export "main" (func $main))
+// )

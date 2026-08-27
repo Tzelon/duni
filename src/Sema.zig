@@ -280,6 +280,13 @@ fn analyzeBody(
             .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
             .negate => try sema.dirNegate(ip, inst_idx),
             .div => try sema.dirArithmetic(ip, .div, inst_idx),
+            .cmp_eq => try sema.dirCmp(ip, .eq, inst_idx),
+            .cmp_neq => try sema.dirCmp(ip, .neq, inst_idx),
+            .cmp_lt => try sema.dirCmp(ip, .lt, inst_idx),
+            .cmp_lte => try sema.dirCmp(ip, .lte, inst_idx),
+            .cmp_gt => try sema.dirCmp(ip, .gt, inst_idx),
+            .cmp_gte => try sema.dirCmp(ip, .gte, inst_idx),
+            .bool_not => try sema.dirBoolNot(ip, inst_idx),
             .str => try sema.dirStr(ip, inst_idx),
             .block => try sema.dirBlock(ip, inst_idx),
             .@"break" => try sema.dirBreak(ip, inst_idx),
@@ -487,17 +494,17 @@ fn absNode(sema: *const Sema, offset: Ast.Node.Offset) Ast.Node.Index {
     return offset.toAbsolute(sema.base_node);
 }
 
-fn analyzeArithmetic(
+/// Binary arithmetic and comparison are defined on numbers only — a string
+/// (or Bool) operand must fail here, before either the fold path
+/// (Value.toBigInt) or the runtime coercion would trip on it.
+/// (Zig: "invalid operands to binary expression".)
+fn checkNumericOperands(
     sema: *Sema,
     ip: *InternPool,
-    dir_tag: Dir.Inst.Tag,
     lhs: Air.Inst.Ref,
     rhs: Air.Inst.Ref,
     src_node: Ast.Node.Index,
-) CompileError!Air.Inst.Ref {
-    // Arithmetic is defined on numbers only — a string operand must fail here,
-    // before either the fold path (Value.toBigInt) or the runtime coercion
-    // would trip on it. (Zig: "invalid operands to binary expression".)
+) CompileError!void {
     const lhs_ty = sema.typeOf(ip, lhs);
     const rhs_ty = sema.typeOf(ip, rhs);
     if (!lhs_ty.isNumeric(ip) or !rhs_ty.isNumeric(ip)) {
@@ -508,6 +515,17 @@ fn analyzeArithmetic(
         );
         return error.AnalysisFail;
     }
+}
+
+fn analyzeArithmetic(
+    sema: *Sema,
+    ip: *InternPool,
+    dir_tag: Dir.Inst.Tag,
+    lhs: Air.Inst.Ref,
+    rhs: Air.Inst.Ref,
+    src_node: Ast.Node.Index,
+) CompileError!Air.Inst.Ref {
+    try sema.checkNumericOperands(ip, lhs, rhs, src_node);
 
     const maybe_lhs_val = sema.resolveValue(lhs);
     const maybe_rhs_val = sema.resolveValue(rhs);
@@ -560,6 +578,79 @@ fn analyzeArithmetic(
         .lhs = lhs_coerced,
         .rhs = rhs_coerced,
     } } });
+}
+
+fn dirCmp(
+    sema: *Sema,
+    ip: *InternPool,
+    op: std.math.CompareOperator,
+    inst: Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.code.extraData(Dir.Inst.Bin, inst_data.payload_index).data;
+    const lhs = sema.resolveInst(extra.lhs);
+    const rhs = sema.resolveInst(extra.rhs);
+
+    return sema.analyzeCmp(ip, op, lhs, rhs, sema.absNode(inst_data.src_node));
+}
+
+/// Comparison mirrors arithmetic's shape: numeric operands only, comptime
+/// operands fold (int pairs in exact big-int order, anything with a float
+/// as IEEE f64), a runtime operand emits an Air `cmp_*` on f64-coerced
+/// operands. The result is Bool either way.
+fn analyzeCmp(
+    sema: *Sema,
+    ip: *InternPool,
+    op: std.math.CompareOperator,
+    lhs: Air.Inst.Ref,
+    rhs: Air.Inst.Ref,
+    src_node: Ast.Node.Index,
+) CompileError!Air.Inst.Ref {
+    try sema.checkNumericOperands(ip, lhs, rhs, src_node);
+
+    if (sema.resolveValue(lhs)) |lhs_val| {
+        if (sema.resolveValue(rhs)) |rhs_val| {
+            const lhs_is_float = ip.indexToKey(lhs_val.toIntern()) == .float;
+            const rhs_is_float = ip.indexToKey(rhs_val.toIntern()) == .float;
+            const is_int = !lhs_is_float and !rhs_is_float;
+            const result = arith.cmp(ip, op, lhs_val, rhs_val, is_int);
+            return Air.internedToRef(if (result) .bool_true else .bool_false);
+        }
+    }
+
+    const loc: Diagnostics.Loc = .{ .node_main = src_node };
+    const lhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), lhs, loc);
+    const rhs_coerced = try sema.coerce(ip, .fromInterned(.f64_type), rhs, loc);
+
+    const air_tag: Air.Inst.Tag = switch (op) {
+        .eq => .cmp_eq,
+        .neq => .cmp_neq,
+        .lt => .cmp_lt,
+        .lte => .cmp_lte,
+        .gt => .cmp_gt,
+        .gte => .cmp_gte,
+    };
+    return sema.addInst(.{ .tag = air_tag, .data = .{ .bin_op = .{
+        .lhs = lhs_coerced,
+        .rhs = rhs_coerced,
+    } } });
+}
+
+fn dirBoolNot(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+    const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = sema.resolveInst(inst_data.operand);
+    const loc: Diagnostics.Loc = .{ .node_main = sema.absNode(inst_data.src_node) };
+
+    // `!` is defined on Bool only — no truthiness.
+    const operand_ty = sema.typeOf(ip, operand);
+    if (sema.unify(ip, .fromInterned(.bool_type), operand_ty) == null) {
+        return sema.failTypeMismatch(.fromInterned(.bool_type), operand_ty, loc);
+    }
+
+    if (sema.resolveValue(operand)) |val| {
+        return Air.internedToRef(if (val.toIntern() == .bool_true) .bool_false else .bool_true);
+    }
+    return sema.addInst(.{ .tag = .not, .data = .{ .un_op = operand } });
 }
 
 fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -1511,6 +1602,114 @@ test "analyze arithmetic with a runtime operand emits an Air bin op" {
     try std.testing.expectEqual(call_ref, bin_op.lhs);
     const expected_rhs = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1.0 } } });
     try std.testing.expectEqual(Air.internedToRef(expected_rhs), bin_op.rhs);
+}
+
+test "analyze comparison folds" {
+    // Int pair: exact big-int order.
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .int, .data = .{ .int = 2 } },
+        .{ .tag = .cmp_lt, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .simple_value = .true });
+
+    // A float operand switches to IEEE f64 comparison; the int coerces.
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .float, .data = .{ .float = 1.0 } },
+        .{ .tag = .cmp_neq, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .simple_value = .false });
+}
+
+test "analyze comparison with a runtime operand emits an Air cmp" {
+    // A runtime lhs (a call result) cannot fold: the comparison becomes an
+    // Air `cmp_lt` whose comptime rhs is coerced to a runtime `number` (f64).
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    // `code` is never read: analyzeCmp works purely on AIR refs.
+    var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
+    defer sema.deinit();
+
+    // %0 = call print() where `extern fn print() number`
+    const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
+    const print_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "print"),
+        .ty = fn_ty,
+        .lib_name = .none,
+    } });
+    try sema.air_extra.append(gpa, 0); // Air.Call.args_len
+    const call_ref = try sema.addInst(.{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = Air.internedToRef(print_ext),
+        .payload = 0,
+    } } });
+
+    const one = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } });
+    const result = try sema.analyzeCmp(&ip, .lt, call_ref, Air.internedToRef(one), @enumFromInt(0));
+
+    const result_idx = result.toIndex().?;
+    try std.testing.expectEqual(Air.Inst.Tag.cmp_lt, sema.air_instructions.items(.tag)[@intFromEnum(result_idx)]);
+    const bin_op = sema.air_instructions.items(.data)[@intFromEnum(result_idx)].bin_op;
+    try std.testing.expectEqual(call_ref, bin_op.lhs);
+    const expected_rhs = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1.0 } } });
+    try std.testing.expectEqual(Air.internedToRef(expected_rhs), bin_op.rhs);
+    // The comparison's result type is Bool.
+    try std.testing.expectEqual(
+        InternPool.Index.bool_type,
+        sema.getTmpAir().typeOfIndex(result_idx, &ip).toIntern(),
+    );
+}
+
+test "analyze comparison rejects non-numeric operands" {
+    // `1 < "hey"` — same gate and diagnostic shape as arithmetic.
+    const gpa = std.testing.allocator;
+
+    var dir = try buildTestDir(gpa, &.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .str, .data = .{ .str = .{ .start = @enumFromInt(0), .len = 3 } } },
+        .{ .tag = .cmp_lt, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, "hey");
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
+}
+
+test "analyze bool_not folds and requires a Bool operand" {
+    // !(1 < 2) folds through: cmp folds to true, not flips it to false.
+    try expectAnalyzed(&.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .int, .data = .{ .int = 2 } },
+        .{ .tag = .cmp_lt, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } },
+        .{ .tag = .bool_not, .data = .{ .un_node = .{ .src_node = @enumFromInt(0), .operand = instRef(2) } } },
+    }, &.{ @intFromEnum(instRef(0)), @intFromEnum(instRef(1)) }, &.{}, .{ .simple_value = .false });
+
+    // !1 — no truthiness; a non-Bool operand is a type mismatch.
+    const gpa = std.testing.allocator;
+    var dir = try buildTestDir(gpa, &.{
+        .{ .tag = .int, .data = .{ .int = 1 } },
+        .{ .tag = .bool_not, .data = .{ .un_node = .{ .src_node = @enumFromInt(0), .operand = instRef(0) } } },
+    }, &.{}, &.{});
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
 }
 
 test "unify: index equality plus the comptime_float/f64 pair" {

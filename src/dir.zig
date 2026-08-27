@@ -67,6 +67,21 @@ pub const Inst = struct {
         /// Same as sub with a lhs of 0, split into a separate instruction to save memory.
         /// Uses `un_node`.
         negate,
+        /// `lhs == rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_eq,
+        /// `lhs != rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_neq,
+        /// `lhs < rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_lt,
+        /// `lhs <= rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_lte,
+        /// `lhs > rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_gt,
+        /// `lhs >= rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_gte,
+        /// Boolean negation: `!operand`. The operand must be a Bool.
+        /// Uses `un_node`.
+        bool_not,
         /// A block of code, which return a value.
         /// Uses the `pl_node` union field. Payload is `Block`.
         block,
@@ -184,6 +199,7 @@ pub const Inst = struct {
         f64_type,
         comptime_int_type,
         comptime_float_type,
+        bool_type,
         string_type,
         void_type,
         type_type,
@@ -191,6 +207,8 @@ pub const Inst = struct {
         zero,
         one,
         negative_one,
+        bool_true,
+        bool_false,
         void_value,
 
         /// This Ref does not correspond to any DIR instruction or constant

@@ -106,16 +106,46 @@ pub const Scanner = struct {
                 '=' => {
                     self.index += 1;
                     switch (self.buffer[self.index]) {
+                        '=' => {
+                            result.tag = .equal_equal;
+                            self.index += 1;
+                        },
                         // TODO(tzelon) - enable later
-                        // '=' => {
-                        //     result.tag = .equal_equal;
-                        //     self.index += 1;
-                        // },
                         // '>' => {
                         //     result.tag = .equal_angle_bracket_right;
                         //     self.index += 1;
                         // },
                         else => result.tag = .equal,
+                    }
+                },
+                '!' => {
+                    self.index += 1;
+                    switch (self.buffer[self.index]) {
+                        '=' => {
+                            result.tag = .bang_equal;
+                            self.index += 1;
+                        },
+                        else => result.tag = .bang,
+                    }
+                },
+                '<' => {
+                    self.index += 1;
+                    switch (self.buffer[self.index]) {
+                        '=' => {
+                            result.tag = .angle_left_equal;
+                            self.index += 1;
+                        },
+                        else => result.tag = .angle_left,
+                    }
+                },
+                '>' => {
+                    self.index += 1;
+                    switch (self.buffer[self.index]) {
+                        '=' => {
+                            result.tag = .angle_right_equal;
+                            self.index += 1;
+                        },
+                        else => result.tag = .angle_right,
                     }
                 },
                 '{' => {
@@ -133,7 +163,20 @@ pub const Scanner = struct {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
                     'a'...'z', 'A'...'Z', '_', '0'...'9' => continue :state .identifier,
-                    '!', '?' => self.index += 1, // consume and end token
+                    '?' => self.index += 1, // consume and end token
+                    '!' => {
+                        // A trailing `!` belongs to the name (Elixir-style,
+                        // `map!`) — unless it begins `!=`, the inequality
+                        // operator: `x != y` and `x!= y` both compare.
+                        if (self.buffer[self.index + 1] == '=') {
+                            const ident = self.buffer[result.loc.start..self.index];
+                            if (Token.getKeyword(ident)) |tag| {
+                                result.tag = tag;
+                            }
+                        } else {
+                            self.index += 1; // consume and end token
+                        }
+                    },
                     else => {
                         const ident = self.buffer[result.loc.start..self.index];
                         if (Token.getKeyword(ident)) |tag| {
@@ -270,6 +313,8 @@ pub const Scanner = struct {
             .r_brace,
             .number_literal,
             .string_literal,
+            .keyword_true,
+            .keyword_false,
             .invalid,
             => true,
             else => false,
@@ -284,6 +329,12 @@ pub const Token = struct {
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "fn", .keyword_fn },
         .{ "extern", .keyword_extern },
+        .{ "true", .keyword_true },
+        .{ "false", .keyword_false },
+        .{ "if", .keyword_if },
+        .{ "else", .keyword_else },
+        .{ "and", .keyword_and },
+        .{ "or", .keyword_or },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -305,6 +356,13 @@ pub const Token = struct {
         minus,
         star,
         slash,
+        equal_equal,
+        bang,
+        bang_equal,
+        angle_left,
+        angle_left_equal,
+        angle_right,
+        angle_right_equal,
 
         comma,
 
@@ -317,6 +375,12 @@ pub const Token = struct {
         // keywords
         keyword_fn,
         keyword_extern,
+        keyword_true,
+        keyword_false,
+        keyword_if,
+        keyword_else,
+        keyword_and,
+        keyword_or,
 
         // Expression end
         newline,
@@ -351,11 +415,24 @@ pub const Token = struct {
 
                 .keyword_fn => "fn",
                 .keyword_extern => "extern",
+                .keyword_true => "true",
+                .keyword_false => "false",
+                .keyword_if => "if",
+                .keyword_else => "else",
+                .keyword_and => "and",
+                .keyword_or => "or",
                 .equal => "=",
                 .plus => "+",
                 .minus => "-",
                 .star => "*",
                 .slash => "/",
+                .equal_equal => "==",
+                .bang => "!",
+                .bang_equal => "!=",
+                .angle_left => "<",
+                .angle_left_equal => "<=",
+                .angle_right => ">",
+                .angle_right_equal => ">=",
                 .comma => ",",
                 .l_paren => "(",
                 .r_paren => ")",
@@ -395,4 +472,14 @@ test "tokenizer" {
     try expectToken("\"a\\\"b\"", &.{.string_literal});
     try expectToken("}\nx", &.{ .r_brace, .newline, .identifier });
     try expectToken("extern fn add(x number, y number) number", &.{ .keyword_extern, .keyword_fn, .identifier, .l_paren, .identifier, .identifier, .comma, .identifier, .identifier, .r_paren, .identifier });
+    try expectToken("true false if else and or", &.{ .keyword_true, .keyword_false, .keyword_if, .keyword_else, .keyword_and, .keyword_or });
+    try expectToken("1 == 2 != 3", &.{ .number_literal, .equal_equal, .number_literal, .bang_equal, .number_literal });
+    try expectToken("1 < 2 <= 3 > 4 >= 5", &.{ .number_literal, .angle_left, .number_literal, .angle_left_equal, .number_literal, .angle_right, .number_literal, .angle_right_equal, .number_literal });
+    try expectToken("!x", &.{ .bang, .identifier });
+    // `x!` is an Elixir-style name ending — unless the `!` begins `!=`.
+    try expectToken("x != y", &.{ .identifier, .bang_equal, .identifier });
+    try expectToken("x!= y", &.{ .identifier, .bang_equal, .identifier });
+    try expectToken("map!x", &.{ .identifier, .identifier });
+    // `true` ends an expression: a following newline is a statement break.
+    try expectToken("x = true\ny", &.{ .identifier, .equal, .keyword_true, .newline, .identifier });
 }

@@ -272,7 +272,19 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .star => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         .slash => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         .equal => comptime ParseRule.init(null, Parse.bind, .prec_assignment),
-        // .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
+        .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
+        .bang_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
+        .angle_left => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .angle_left_equal => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .angle_right => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .angle_right_equal => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .keyword_and => comptime ParseRule.init(null, Parse.binary, .prec_and),
+        .keyword_or => comptime ParseRule.init(null, Parse.binary, .prec_or),
+        .bang => comptime ParseRule.init(Parse.unary, null, .prec_none),
+        .keyword_true => comptime ParseRule.init(Parse.boolLiteral, null, .prec_none),
+        .keyword_false => comptime ParseRule.init(Parse.boolLiteral, null, .prec_none),
+        .keyword_if => comptime ParseRule.init(null, null, .prec_none),
+        .keyword_else => comptime ParseRule.init(null, null, .prec_none),
         .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
         .number_literal => comptime ParseRule.init(Parse.number, null, .prec_none),
         .identifier => comptime ParseRule.init(Parse.identifier, null, .prec_none),
@@ -312,10 +324,20 @@ fn string(p: *Parse) !Node.Index {
     });
 }
 
+/// example: true
+fn boolLiteral(p: *Parse) !Node.Index {
+    return p.addNode(.{
+        .tag = .bool_literal,
+        .main_token = p.advance(),
+        .data = undefined,
+    });
+}
+
 /// example: -1
 fn unary(p: *Parse) !Node.Index {
     const tag: Node.Tag = switch (p.current()) {
         .minus => .negation,
+        .bang => .bool_not,
         else => unreachable,
     };
 
@@ -332,6 +354,14 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
         .minus => .sub,
         .star => .mul,
         .slash => .div,
+        .equal_equal => .equal_equal,
+        .bang_equal => .bang_equal,
+        .angle_left => .less_than,
+        .angle_left_equal => .less_or_equal,
+        .angle_right => .greater_than,
+        .angle_right_equal => .greater_or_equal,
+        .keyword_and => .bool_and,
+        .keyword_or => .bool_or,
         else => unreachable,
     };
 

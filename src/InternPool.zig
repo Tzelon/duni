@@ -52,6 +52,7 @@ pub const Index = enum(u32) {
     f64_type,
     comptime_int_type,
     comptime_float_type,
+    bool_type,
     string_type,
     void_type,
     type_type,
@@ -62,6 +63,10 @@ pub const Index = enum(u32) {
     one,
     /// `-1` (comptime_int)
     negative_one,
+    /// `true`
+    bool_true,
+    /// `false`
+    bool_false,
     /// `()`
     void_value,
 
@@ -307,12 +312,15 @@ pub const SimpleType = enum(u32) {
     u64 = @intFromEnum(Index.u64_type),
     i64 = @intFromEnum(Index.i64_type),
     f64 = @intFromEnum(Index.f64_type),
+    bool = @intFromEnum(Index.bool_type),
     string = @intFromEnum(Index.string_type),
     void = @intFromEnum(Index.void_type),
     type = @intFromEnum(Index.type_type),
 };
 
 pub const SimpleValue = enum(u32) {
+    true = @intFromEnum(Index.bool_true),
+    false = @intFromEnum(Index.bool_false),
     void = @intFromEnum(Index.void_value),
 };
 
@@ -337,8 +345,8 @@ pub fn init(ip: *InternPool, gpa: Allocator) !void {
     if (std.debug.runtime_safety) {
         // Sanity check.
         assert(ip.indexToKey(.void_value).simple_value == .void);
-        // assert(ip.indexToKey(.bool_true).simple_value == .true);
-        // assert(ip.indexToKey(.bool_false).simple_value == .false);
+        assert(ip.indexToKey(.bool_true).simple_value == .true);
+        assert(ip.indexToKey(.bool_false).simple_value == .false);
     }
 }
 
@@ -767,12 +775,14 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
         .i32_type,
         .u64_type,
         .i64_type,
+        .bool_type,
         .string_type,
         .void_type,
         .type_type,
         => .type_type,
 
         .zero, .one, .negative_one => .comptime_int_type,
+        .bool_true, .bool_false => .bool_type,
         .void_value => .void_type,
 
         // This optimization on tags is needed so that indexToKey can call
@@ -943,6 +953,7 @@ pub const static_keys: [static_len]Key = .{
     .{ .simple_type = .f64 },
     .{ .simple_type = .comptime_int },
     .{ .simple_type = .comptime_float },
+    .{ .simple_type = .bool },
     .{ .simple_type = .string },
     .{ .simple_type = .void },
     .{ .simple_type = .type },
@@ -959,6 +970,8 @@ pub const static_keys: [static_len]Key = .{
         .ty = .comptime_int_type,
         .storage = .{ .i64 = -1 },
     } },
+    .{ .simple_value = .true },
+    .{ .simple_value = .false },
     .{ .simple_value = .void },
 };
 

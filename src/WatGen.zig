@@ -34,15 +34,17 @@ air: *const Air,
 /// later constant pushes (argument order). An `arg` maps to its parameter's
 /// local slot; declared locals follow the parameters.
 locals: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, u32) = .empty,
-/// How many `(local …)` slots the current function declares (parameters not
-/// included — wasm gives them their slots implicitly).
-declared_locals: u32 = 0,
+/// The wasm value type of each `(local …)` slot the current function
+/// declares, in slot order (parameters not included — wasm gives them their
+/// slots implicitly). Not all locals are f64 anymore: a Bool lives in an i32.
+declared_local_types: std.ArrayList([]const u8) = .empty,
 
 pub fn emit(gpa: Allocator, result: *const Sema.Result, ip: *const InternPool, out: *std.Io.Writer) !void {
     var gen = WatGen{ .gpa = gpa, .ip = ip, .out = out, .air = &result.main };
     defer gen.string_offsets.deinit(gpa);
     defer gen.func_names.deinit(gpa);
     defer gen.locals.deinit(gpa);
+    defer gen.declared_local_types.deinit(gpa);
 
     for (result.funcs) |func| try gen.func_names.put(gpa, func.val, func.name);
 
@@ -75,21 +77,21 @@ fn collectStrings(gen: *WatGen, air: *const Air, offset: *u32) !void {
         // A call's arguments may be string constants; the callee is a
         // function, never a string.
         .call => for (callArgs(air, data)) |arg| try gen.collectStringRef(arg, offset),
-        // Arithmetic operands are numbers — Sema coerces before emitting.
-        .add, .sub, .mul, .div => {},
+        // Arithmetic/comparison operands are numbers (and `not`'s a Bool) —
+        // Sema coerces before emitting; none can be a string constant.
+        .add, .sub, .mul, .div, .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .not => {},
         .arg => {},
     };
 }
 
 /// Assign a wasm local to every instruction that produces a runtime value.
 /// An `arg` takes its parameter's implicit slot; everything else gets a
-/// declared local after the parameters. Unconditional — even an unused
-/// result is `local.set`, which keeps the operand stack empty between
-/// statements. All runtime values are `number` (f64) today, so every
-/// declared local is f64.
+/// declared local (typed by the instruction's result) after the parameters.
+/// Unconditional — even an unused result is `local.set`, which keeps the
+/// operand stack empty between statements.
 fn collectLocals(gen: *WatGen, params_len: u32) !void {
     gen.locals.clearRetainingCapacity();
-    gen.declared_locals = 0;
+    gen.declared_local_types.clearRetainingCapacity();
     const tags = gen.air.instructions.items(.tag);
     const datas = gen.air.instructions.items(.data);
     for (tags, datas, 0..) |tag, data, i| {
@@ -97,17 +99,19 @@ fn collectLocals(gen: *WatGen, params_len: u32) !void {
         switch (tag) {
             .ret => {},
             .arg => try gen.locals.put(gen.gpa, inst, data.arg.index),
-            .add, .sub, .mul, .div => try gen.addLocal(inst, params_len),
+            .add, .sub, .mul, .div => try gen.addLocal(inst, params_len, "f64"),
+            // Comparison results are Bool: i32 at runtime.
+            .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .not => try gen.addLocal(inst, params_len, "i32"),
             .call => if (gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type) {
-                try gen.addLocal(inst, params_len);
+                try gen.addLocal(inst, params_len, wasmType(gen.air.typeOfIndex(inst, gen.ip).toIntern()));
             },
         }
     }
 }
 
-fn addLocal(gen: *WatGen, inst: Air.Inst.Index, params_len: u32) !void {
-    try gen.locals.put(gen.gpa, inst, params_len + gen.declared_locals);
-    gen.declared_locals += 1;
+fn addLocal(gen: *WatGen, inst: Air.Inst.Index, params_len: u32, wasm_ty: []const u8) !void {
+    try gen.locals.put(gen.gpa, inst, params_len + @as(u32, @intCast(gen.declared_local_types.items.len)));
+    try gen.declared_local_types.append(gen.gpa, wasm_ty);
 }
 
 /// Assign `ref` a data-segment offset if it is a not-yet-seen string constant.
@@ -181,6 +185,7 @@ fn writeImportsIn(
 fn wasmType(ty: InternPool.Index) []const u8 {
     return switch (ty) {
         .f64_type, .comptime_float_type => "f64",
+        .bool_type => "i32",
         .string_type => "i32 i32",
         else => @panic("unsupported wasm type"),
     };
@@ -230,10 +235,13 @@ fn writeFunc(gen: *WatGen, name: []const u8, param_types: []const InternPool.Ind
     if (ret_ty != .void_type) try gen.out.print(" (result {s})", .{wasmType(ret_ty)});
     try gen.out.writeAll("\n");
     gen.indent += 1;
-    if (gen.declared_locals != 0) {
+    if (gen.declared_local_types.items.len != 0) {
         try gen.writeIndent();
         try gen.out.writeAll("(local");
-        for (0..gen.declared_locals) |_| try gen.out.writeAll(" f64");
+        for (gen.declared_local_types.items) |local_ty| {
+            try gen.out.writeByte(' ');
+            try gen.out.writeAll(local_ty);
+        }
         try gen.out.writeAll(")\n");
     }
     try gen.writeBody();
@@ -289,6 +297,31 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Ins
             try gen.out.print("f64.{s}\n", .{@tagName(tag)});
             try gen.writeLocalSet(inst);
         },
+        // The wasm f64 comparisons consume two f64 and yield an i32 (0/1) —
+        // exactly Bool's runtime representation.
+        .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte => {
+            try gen.writeRef(data.bin_op.lhs);
+            try gen.writeRef(data.bin_op.rhs);
+            try gen.writeIndent();
+            const op: []const u8 = switch (tag) {
+                .cmp_eq => "eq",
+                .cmp_neq => "ne",
+                .cmp_lt => "lt",
+                .cmp_lte => "le",
+                .cmp_gt => "gt",
+                .cmp_gte => "ge",
+                else => unreachable,
+            };
+            try gen.out.print("f64.{s}\n", .{op});
+            try gen.writeLocalSet(inst);
+        },
+        // `!b` on an i32 Bool is `b == 0`.
+        .not => {
+            try gen.writeRef(data.un_op);
+            try gen.writeIndent();
+            try gen.out.writeAll("i32.eqz\n");
+            try gen.writeLocalSet(inst);
+        },
     }
 }
 
@@ -337,6 +370,15 @@ fn writeRef(gen: *WatGen, ref: Air.Inst.Ref) !void {
         .simple_value => |value| switch (value) {
             // `void` has no runtime representation — nothing to push.
             .void => {},
+            // Bool is i32 at runtime: true = 1, false = 0.
+            .true => {
+                try gen.writeIndent();
+                try gen.out.writeAll("i32.const 1\n");
+            },
+            .false => {
+                try gen.writeIndent();
+                try gen.out.writeAll("i32.const 0\n");
+            },
         },
     }
 }
@@ -681,6 +723,70 @@ test "emit defined function and a call to it" {
         \\    call $add
         \\    local.set 0
         \\    local.get 0
+        \\    return
+        \\  )
+        \\  (export "main" (func $main))
+        \\)
+        \\
+    , w.buffer[0..w.end]);
+}
+
+test "emit runtime comparison with mixed local types" {
+    // print(1) < 2: the call result is an f64 local, the comparison result a
+    // Bool — an i32 local — so the local clause mixes value types.
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const unary_ty = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    const print_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "print"),
+        .ty = unary_ty,
+        .lib_name = .none,
+    } });
+    const one = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1 } } });
+    const two = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 2 } } });
+
+    // AIR:  %0 = call print(1);  %1 = cmp_lt(%0, 2);  ret %1
+    var insts: std.MultiArrayList(Air.Inst) = .{};
+    try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = .fromInterned(print_ext),
+        .payload = 0,
+    } } });
+    const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
+    try insts.append(gpa, .{ .tag = .cmp_lt, .data = .{ .bin_op = .{
+        .lhs = call_ref,
+        .rhs = .fromInterned(two),
+    } } });
+    const cmp_ref = (@as(Air.Inst.Index, @enumFromInt(1))).toRef();
+    try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = cmp_ref } });
+
+    var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 1); // print call: args_len
+    try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(one)));
+
+    var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
+    defer air.deinit(gpa);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, &ip, &w);
+    try std.testing.expectEqualStrings(
+        \\(module
+        \\  (import "host" "print" (func $print (param f64) (result f64)))
+        \\  (func $main (result i32)
+        \\    (local f64 i32)
+        \\    f64.const 1
+        \\    call $print
+        \\    local.set 0
+        \\    local.get 0
+        \\    f64.const 2
+        \\    f64.lt
+        \\    local.set 1
+        \\    local.get 1
         \\    return
         \\  )
         \\  (export "main" (func $main))

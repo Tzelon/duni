@@ -68,6 +68,7 @@ pub fn name(ty: Type) []const u8 {
         .comptime_int_type => "comptime_int",
         .comptime_float_type => "comptime_float",
         .f64_type => "number",
+        .bool_type => "Bool",
         .u32_type => "u32",
         .i32_type => "i32",
         .u64_type => "u64",

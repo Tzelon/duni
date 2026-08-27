@@ -46,6 +46,22 @@ pub const Inst = struct {
         /// by Sema; a runtime zero divisor produces inf/nan per IEEE.
         /// Uses the `bin_op` field.
         div,
+        /// `lhs == rhs`. Operands are f64 (Sema coerces); result is Bool
+        /// (i32 at runtime). Uses the `bin_op` field.
+        cmp_eq,
+        /// `lhs != rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_neq,
+        /// `lhs < rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_lt,
+        /// `lhs <= rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_lte,
+        /// `lhs > rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_gt,
+        /// `lhs >= rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_gte,
+        /// Boolean negation. Operand and result are Bool.
+        /// Uses the `un_op` field.
+        not,
 
         /// Function call.
         /// Result type is the return type of the function being called.
@@ -201,6 +217,8 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
         // Both operands were coerced to one numeric type by Sema, so the
         // lhs type is the result type.
         .add, .sub, .mul, .div => return air.typeOf(datas[@intFromEnum(inst)].bin_op.lhs, ip),
+
+        .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .not => return .fromInterned(.bool_type),
 
         .call => {
             const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);

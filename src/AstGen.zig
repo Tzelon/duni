@@ -111,6 +111,7 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
         switch (tree.nodeTag(current_node)) {
             .number_literal => return numberLiteral(gd, current_node, current_node, .positive),
             .string_literal => return stringLiteral(gd, current_node),
+            .bool_literal => return boolLiteral(gd, current_node),
 
             .identifier => return identifier(gd, current_node),
 
@@ -119,6 +120,27 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             .mul => return simpleBinOp(gd, current_node, .mul),
             .div => return simpleBinOp(gd, current_node, .div),
             .negation => return negation(gd, current_node),
+            .equal_equal => return simpleBinOp(gd, current_node, .cmp_eq),
+            .bang_equal => return simpleBinOp(gd, current_node, .cmp_neq),
+            .less_than => return simpleBinOp(gd, current_node, .cmp_lt),
+            .less_or_equal => return simpleBinOp(gd, current_node, .cmp_lte),
+            .greater_than => return simpleBinOp(gd, current_node, .cmp_gt),
+            .greater_or_equal => return simpleBinOp(gd, current_node, .cmp_gte),
+            .bool_not => {
+                const operand = try expr(gd, tree.nodeData(current_node).node);
+                return gd.addUnNode(.bool_not, operand, current_node);
+            },
+
+            // Short-circuit lowering rides on the `if` machinery (Stage C of
+            // the control-flow arc); reject rather than half-implement.
+            .bool_and, .bool_or => {
+                try gd.astgen.diags.addError(
+                    .{ .byte = tree.tokenStart(tree.nodeMainToken(current_node)) },
+                    "'{s}' is not supported yet",
+                    .{tree.tokenSlice(tree.nodeMainToken(current_node))},
+                );
+                return error.AnalysisFail;
+            },
             .assign => return bind(gd, current_node),
             .block => return blockExpr(gd, current_node),
 
@@ -452,6 +474,16 @@ fn stringLiteral(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             .len = str.len,
         } },
     });
+}
+
+/// `true` / `false` lower to the static refs directly — no instruction.
+fn boolLiteral(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
+    return switch (tree.tokenTag(tree.nodeMainToken(node))) {
+        .keyword_true => .bool_true,
+        .keyword_false => .bool_false,
+        else => unreachable,
+    };
 }
 
 fn negation(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -982,7 +1014,7 @@ fn scanContainer(
 }
 
 const primitive_instrs = std.StaticStringMap(Dir.Inst.Ref).initComptime(.{
-    // .{ "bool", .bool_type },
+    .{ "Bool", .bool_type },
     .{ "comptime_float", .comptime_float_type },
     .{ "comptime_int", .comptime_int_type },
     // .{ "false", .bool_false },
@@ -1659,6 +1691,44 @@ test "simple binary op" {
         \\%7 = div(%5, %6) node_offset:1:1 to :1:17
         \\
     );
+}
+
+test "bool literal and comparisons" {
+    // `true`/`false` are static refs — no instruction of their own.
+    try expect("true == false",
+        \\%0 = module_decl(%1)
+        \\%1 = cmp_eq(bool_true, bool_false) node_offset:1:1 to :1:14
+        \\
+    );
+    // Each comparison operator lowers to its own Dir tag; `!` is un_node.
+    try expect("!(1 < 2 <= 3 > 4 >= 5 != 6)",
+        \\%0 = module_decl(%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = cmp_lt(%1, %2) node_offset:1:3 to :1:8
+        \\%4 = int(3)
+        \\%5 = cmp_lte(%3, %4) node_offset:1:3 to :1:13
+        \\%6 = int(4)
+        \\%7 = cmp_gt(%5, %6) node_offset:1:3 to :1:17
+        \\%8 = int(5)
+        \\%9 = cmp_gte(%7, %8) node_offset:1:3 to :1:22
+        \\%10 = int(6)
+        \\%11 = cmp_neq(%9, %10) node_offset:1:3 to :1:27
+        \\%12 = bool_not(%11) node_offset:1:1 to :1:28
+        \\
+    );
+}
+
+test "and/or are rejected until short-circuit lands" {
+    const gpa = std.testing.allocator;
+
+    var tree = try Ast.parse(gpa, "true and false");
+    defer tree.deinit(gpa);
+    try std.testing.expect(tree.errors.len == 0);
+
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree, &diags));
 }
 
 test "negation" {

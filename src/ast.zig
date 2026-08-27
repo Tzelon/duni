@@ -312,8 +312,10 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
 
         .string_literal,
         .number_literal,
+        .bool_literal,
         .identifier,
         .negation,
+        .bool_not,
         .block,
         .fn_decl,
         .grouped_expression,
@@ -326,7 +328,20 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
             return main_token;
         },
 
-        .add, .sub, .mul, .div, .assign => n = tree.nodeData(n).node_and_node[0],
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .assign,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
+        => n = tree.nodeData(n).node_and_node[0],
 
         .call => n = tree.nodeData(n).node_and_extra[0],
     };
@@ -336,15 +351,23 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
     var n = node;
     while (true) switch (tree.nodeTag(n)) {
         .root => return @intCast(tree.tokens.len - 1),
-        .identifier, .string_literal, .number_literal => return tree.nodeMainToken(n),
+        .identifier, .string_literal, .number_literal, .bool_literal => return tree.nodeMainToken(n),
 
-        .negation => n = tree.nodeData(n).node,
+        .negation, .bool_not => n = tree.nodeData(n).node,
 
         .add,
         .sub,
         .mul,
         .div,
         .assign,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
         .fn_decl,
         => n = tree.nodeData(n).node_and_node[1],
 
@@ -529,11 +552,11 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
     switch (tree.nodeTag(node)) {
         .root => unreachable, // the root is never a child
 
-        .identifier, .number_literal, .string_literal => {
+        .identifier, .number_literal, .string_literal, .bool_literal => {
             try std.testing.expectEqual(0, expected.children.len);
         },
 
-        .negation => {
+        .negation, .bool_not => {
             try std.testing.expectEqual(1, expected.children.len);
             try expectNode(tree, tree.nodeData(node).node, expected.children[0]);
         },
@@ -543,7 +566,21 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
             try expectNode(tree, tree.nodeData(node).node_and_token[0], expected.children[0]);
         },
 
-        .add, .sub, .mul, .div, .assign, .fn_decl => {
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .assign,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
+        .fn_decl,
+        => {
             try std.testing.expectEqual(2, expected.children.len);
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             try expectNode(tree, lhs, expected.children[0]);
@@ -621,6 +658,49 @@ test "left associative & precedence" {
         } },
         .{ .tag = .number_literal },
     } });
+}
+
+test "comparison and logical precedence" {
+    // grammar.y order: or < and < equality < comparison < term. One shape
+    // pins the whole chain: `1 + 2 < 3 and x == true or !y`
+    // = ((((1 + 2) < 3) and (x == true)) or (!y)).
+    try expectAst("1 + 2 < 3 and x == true or !y", .{ .tag = .bool_or, .children = &.{
+        .{ .tag = .bool_and, .children = &.{
+            .{ .tag = .less_than, .children = &.{
+                .{ .tag = .add, .children = &.{
+                    .{ .tag = .number_literal },
+                    .{ .tag = .number_literal },
+                } },
+                .{ .tag = .number_literal },
+            } },
+            .{ .tag = .equal_equal, .children = &.{
+                .{ .tag = .identifier },
+                .{ .tag = .bool_literal },
+            } },
+        } },
+        .{ .tag = .bool_not, .children = &.{
+            .{ .tag = .identifier },
+        } },
+    } });
+
+    // The remaining comparison operators parse to their own tags.
+    try expectAst("1 != 2", .{ .tag = .bang_equal, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("1 <= 2", .{ .tag = .less_or_equal, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("1 > 2", .{ .tag = .greater_than, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("1 >= 2", .{ .tag = .greater_or_equal, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("false", .{ .tag = .bool_literal });
 }
 
 test "block" {

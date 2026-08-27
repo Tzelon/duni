@@ -7,12 +7,11 @@
   to a WASI `_start` returning the value) so codegen is validated by
   _execution_, not just `wat2wasm`. (WASI `_start` parked in
   `notes/deferred.md`.)
-- **Runtime block path (`dirBlock`):** today fold-only (`analyzeBody` then
-  `inst_map.get(body[last])`), kept separate from `dirBlockInline` so it can
-  diverge here. Runtime block values need Air `block` + `break_block` (br) and
-  multi-exit **merges** (`Block.Merges`), replacing the last-inst read — the
-  same seam early `return`/`break`/`continue` land on. See `notes/sema.md`
-  ("`resolveInlineBody` and the control-flow seam").
+- **Runtime block path — landed** (control-flow arc, stage B): Air has
+  structured `block`/`cond_br`/`br` with per-body instruction collection
+  (`Sema.Block`), one merge point per block. Early `return`/`break`/
+  `continue` build on that machinery when they arrive; `match`
+  compilation and `return_call` plug into the same substrate.
 
 ## Error reporting — phase 1
 

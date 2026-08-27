@@ -131,16 +131,8 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
                 return gd.addUnNode(.bool_not, operand, current_node);
             },
 
-            // Short-circuit lowering rides on the `if` machinery (Stage C of
-            // the control-flow arc); reject rather than half-implement.
-            .bool_and, .bool_or => {
-                try gd.astgen.diags.addError(
-                    .{ .byte = tree.tokenStart(tree.nodeMainToken(current_node)) },
-                    "'{s}' is not supported yet",
-                    .{tree.tokenSlice(tree.nodeMainToken(current_node))},
-                );
-                return error.AnalysisFail;
-            },
+            .bool_and => return boolBinOp(gd, current_node, .@"and"),
+            .bool_or => return boolBinOp(gd, current_node, .@"or"),
             .assign => return bind(gd, current_node),
             .block => return blockExpr(gd, current_node),
 
@@ -590,6 +582,87 @@ fn ifExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     }
 
     try setCondBrPayload(condbr, cond, &then_scope, &else_scope);
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+/// Short-circuit lowering (notes/control_flow.md): rides on the `if`
+/// machinery rather than a dedicated instruction.
+///   `a and b` → `if a { if b { true } else { false } } else { false }`
+///   `a or b`  → `if a { true } else { if b { true } else { false } }`
+/// The inner if (`boolCheckExpr`) normalizes the rhs to a Bool literal and
+/// — through the condition's Bool check — rejects a non-Bool rhs even when
+/// the lhs is comptime-known and the rhs branch would otherwise fold away
+/// unchecked.
+fn boolBinOp(gd: *GenDir, node: Ast.Node.Index, comptime op: enum { @"and", @"or" }) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const gpa = astgen.gpa;
+    const lhs_node, const rhs_node = astgen.tree.nodeData(node).node_and_node;
+
+    const block_inst = try gd.makeBlockInst(.block, node);
+    try gd.instructions.append(gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const lhs = try expr(&block_scope, lhs_node);
+    const condbr = try block_scope.makeBlockInst(.condbr, node);
+    try block_scope.instructions.append(gpa, condbr);
+
+    var then_scope = block_scope.makeSubBlock();
+    defer then_scope.unstack();
+    switch (op) {
+        .@"and" => {
+            const rhs_result = try boolCheckExpr(&then_scope, rhs_node);
+            _ = try then_scope.addBreakWithSrcNode(.@"break", block_inst, rhs_result, rhs_node);
+        },
+        // `true or _` short-circuits to true; the rhs is never evaluated.
+        .@"or" => _ = try then_scope.addBreak(.@"break", block_inst, .bool_true),
+    }
+
+    var else_scope = block_scope.makeSubBlock();
+    defer else_scope.unstack();
+    switch (op) {
+        // `false and _` short-circuits to false; the rhs is never evaluated.
+        .@"and" => _ = try else_scope.addBreak(.@"break", block_inst, .bool_false),
+        .@"or" => {
+            const rhs_result = try boolCheckExpr(&else_scope, rhs_node);
+            _ = try else_scope.addBreakWithSrcNode(.@"break", block_inst, rhs_result, rhs_node);
+        },
+    }
+
+    try setCondBrPayload(condbr, lhs, &then_scope, &else_scope);
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+/// Lower `operand` wrapped as `if operand { true } else { false }` — the
+/// Bool normalization the short-circuit operators use for their rhs. The
+/// inner if's condition check is what enforces operand-must-be-Bool.
+fn boolCheckExpr(gd: *GenDir, operand_node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const gpa = gd.astgen.gpa;
+
+    const block_inst = try gd.makeBlockInst(.block, operand_node);
+    try gd.instructions.append(gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const operand = try expr(&block_scope, operand_node);
+    const condbr = try block_scope.makeBlockInst(.condbr, operand_node);
+    try block_scope.instructions.append(gpa, condbr);
+
+    var then_scope = block_scope.makeSubBlock();
+    defer then_scope.unstack();
+    _ = try then_scope.addBreak(.@"break", block_inst, .bool_true);
+
+    var else_scope = block_scope.makeSubBlock();
+    defer else_scope.unstack();
+    _ = try else_scope.addBreak(.@"break", block_inst, .bool_false);
+
+    try setCondBrPayload(condbr, operand, &then_scope, &else_scope);
     try block_scope.setBlockBody(block_inst);
 
     return block_inst.toRef();
@@ -1837,16 +1910,36 @@ test "if lowers to block + condbr with breaking bodies" {
     );
 }
 
-test "and/or are rejected until short-circuit lands" {
-    const gpa = std.testing.allocator;
+test "and/or lower to the short-circuit condbr shape" {
+    // `a and b` → if a { if b { true } else { false } } else { false }:
+    // the rhs sits behind the condbr (short-circuit), wrapped in the inner
+    // Bool-normalizing if.
+    try expect("true and false",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:15
+        \\%2 = condbr(bool_true, then={%3, %7}, else={%8}) node_offset:1:1 to :1:15
+        \\%3 = block(%4) node_offset:1:10 to :1:15
+        \\%4 = condbr(bool_false, then={%5}, else={%6}) node_offset:1:10 to :1:15
+        \\%5 = break(%3, bool_true)
+        \\%6 = break(%3, bool_false)
+        \\%7 = break(%1, %3)
+        \\%8 = break(%1, bool_false)
+        \\
+    );
 
-    var tree = try Ast.parse(gpa, "true and false");
-    defer tree.deinit(gpa);
-    try std.testing.expect(tree.errors.len == 0);
-
-    var diags = Diagnostics{ .gpa = gpa };
-    defer diags.deinit();
-    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree, &diags));
+    // `a or b`: the short-circuit constant is the then branch.
+    try expect("false or true",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:14
+        \\%2 = condbr(bool_false, then={%3}, else={%4, %8}) node_offset:1:1 to :1:14
+        \\%3 = break(%1, bool_true)
+        \\%4 = block(%5) node_offset:1:10 to :1:14
+        \\%5 = condbr(bool_true, then={%6}, else={%7}) node_offset:1:10 to :1:14
+        \\%6 = break(%4, bool_true)
+        \\%7 = break(%4, bool_false)
+        \\%8 = break(%1, %4)
+        \\
+    );
 }
 
 test "negation" {

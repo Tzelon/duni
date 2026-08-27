@@ -80,10 +80,18 @@ Short-circuit is branching, so both ride on the `if` machinery (Zig's
 `bool_br` strategy, without a dedicated instruction — a dedicated Dir tag
 is a later compaction if profiles care):
 
-- `a and b` → `if a { b } else { false }`
-- `a or b` → `if a { true } else { b }`
+- `a and b` → `if a { if b { true } else { false } } else { false }`
+- `a or b` → `if a { true } else { if b { true } else { false } }`
 
-Operands unify against `bool_type`; a non-Bool operand is a compile error.
+The naive `if a { b } else { false }` desugar has a truthiness hole: with
+a comptime-known lhs only the taken branch is analyzed, so `true and 5`
+would fold to `5` with no type check. Wrapping the rhs in its own
+`if b { true } else { false }` closes it — the inner `if`'s condition
+check enforces rhs-must-be-Bool at comptime and runtime alike, and
+normalizes the whole expression's value to a Bool literal.
+
+The lhs is checked by the outer `if`'s condition check. A non-Bool
+operand on either side is the same "expected type 'Bool'" compile error.
 The golden proof of short-circuit is a side effect that must not happen
 (`false and print(1) == 1` prints nothing).
 

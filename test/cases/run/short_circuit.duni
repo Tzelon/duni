@@ -1,0 +1,13 @@
+extern fn print(x number) number
+
+comptime_skip = false and print(1) == 1
+runtime_take = print(2) == 2 and print(3) == 3
+runtime_skip = print(4) == 0 and print(5) == 5
+or_skip = true or print(6) == 6
+print(7)
+
+// run
+// expect_stdout=2
+// expect_stdout=3
+// expect_stdout=4
+// expect_stdout=7

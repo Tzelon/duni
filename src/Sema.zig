@@ -78,6 +78,20 @@ const QueuedFunc = struct {
     val: InternPool.Index,
 };
 
+/// The per-body instruction collector (Zig's `block.instructions` scratch):
+/// every runtime Air instruction lands in exactly one body — the one that is
+/// current when it is emitted. A body is written into `air_extra` when its
+/// owning structured instruction (`block`, `cond_br`) or the function's main
+/// body is finalized; nested instructions appear only in their own body,
+/// never in an enclosing one.
+pub const Block = struct {
+    instructions: std.ArrayList(Air.Inst.Index) = .empty,
+
+    fn deinit(block: *Block, gpa: Allocator) void {
+        block.instructions.deinit(gpa);
+    }
+};
+
 /// The output of `analyze`: one `Air` per defined function (as `Air`'s own
 /// doc demands), plus the module body's `Air`.
 pub const Result = struct {
@@ -112,6 +126,11 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) 
     defer sema.deinit();
 
     try sema.air_instructions.ensureTotalCapacity(gpa, code.instructions.len);
+    // Reserve `extra[0]` for the main body's payload index (Air.ExtraIndex).
+    try sema.air_extra.append(gpa, 0);
+    var root_block: Block = .{};
+    defer root_block.deinit(gpa);
+
     const module = code.getModuleDecl(.main_module_inst);
 
     // `main` returns the module body's last value, so a body is required —
@@ -125,14 +144,14 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) 
     // The two sweeps (notes/type_system.md §8, seam 3): declarations first,
     // then bodies. No body is analyzed until every declaration is registered —
     // this is what makes forward and mutual references work.
-    try sema.resolveDeclarations(ip, module.decls);
+    try sema.resolveDeclarations(ip, &root_block, module.decls);
     const funcs = try sema.analyzeFnBodies(ip);
     errdefer {
         for (funcs) |*func| func.air.deinit(gpa);
         gpa.free(funcs);
     }
 
-    try analyzeBody(&sema, ip, module.body);
+    try analyzeBody(&sema, ip, &root_block, module.body);
 
     const last_ref: Air.Inst.Ref = sema.inst_map.get(module.body[module.body.len - 1]).?;
 
@@ -148,10 +167,12 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) 
         break :blk last_ref;
     };
 
-    try sema.air_instructions.append(sema.gpa, .{
+    _ = try sema.addInst(&root_block, .{
         .tag = .ret,
         .data = .{ .un_op = result_ref },
     });
+
+    try sema.setMainBody(&root_block);
 
     const air = Air{
         .instructions = sema.air_instructions.slice(),
@@ -162,14 +183,25 @@ pub fn analyze(gpa: Allocator, code: Dir, ip: *InternPool, diags: *Diagnostics) 
     return .{ .funcs = funcs, .main = air };
 }
 
+/// Write `block`'s instructions into `air_extra` as the outermost body and
+/// point the reserved `Air.ExtraIndex.main_body` slot at it. Codegen starts
+/// its walk there; nested bodies live in their owning instruction's payload.
+fn setMainBody(sema: *Sema, block: *const Block) !void {
+    const body = block.instructions.items;
+    try sema.air_extra.ensureUnusedCapacity(sema.gpa, @typeInfo(Air.Block).@"struct".fields.len + body.len);
+    const payload_index = sema.addExtraAssumeCapacity(Air.Block{ .body_len = @intCast(body.len) });
+    sema.air_extra.appendSliceAssumeCapacity(@ptrCast(body));
+    sema.air_extra.items[@intFromEnum(Air.ExtraIndex.main_body)] = payload_index;
+}
+
 /// Sweep 1 of 2: register every module-level declaration in `decls` (externs
 /// intern their value directly; defined fns intern a `func` value and queue
 /// their body on `fn_queue`). Contract: no function body is analyzed during
 /// this sweep — a body may reference any declaration, including ones that
 /// appear after its own (see wat/forward_call).
-fn resolveDeclarations(sema: *Sema, ip: *InternPool, decls: []const Dir.Inst.Index) CompileError!void {
+fn resolveDeclarations(sema: *Sema, ip: *InternPool, block: *Block, decls: []const Dir.Inst.Index) CompileError!void {
     for (decls) |decl_inst| {
-        try sema.analyzeDeclaration(ip, decl_inst);
+        try sema.analyzeDeclaration(ip, block, decl_inst);
     }
 }
 
@@ -224,6 +256,11 @@ fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index
         sema.deinit();
     }
 
+    // Reserve `extra[0]` for the main body's payload index (Air.ExtraIndex).
+    try sema.air_extra.append(sema.gpa, 0);
+    var root_block: Block = .{};
+    defer root_block.deinit(sema.gpa);
+
     // The return type occupies `ret_ty.body_len` trailing slots before the body.
     const body = sema.code.bodySlice(func_extra.end + func_extra.data.ret_ty.body_len, func_extra.data.body_len);
 
@@ -236,7 +273,7 @@ fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index
     for (owner_decl.value_body.?) |param_inst| {
         if (tags[@intFromEnum(param_inst)] != .param) continue;
         try sema.inst_map.ensureSpaceForInstructions(sema.gpa, &.{param_inst});
-        const arg_ref = try sema.addInst(.{ .tag = .arg, .data = .{ .arg = .{
+        const arg_ref = try sema.addInst(&root_block, .{ .tag = .arg, .data = .{ .arg = .{
             .ty = .fromInterned(param_types[arg_index]),
             .index = arg_index,
         } } });
@@ -245,7 +282,9 @@ fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index
     }
 
     // The body terminates with `ret_node`, which appends the Air `ret`.
-    try sema.analyzeBody(ip, body);
+    try sema.analyzeBody(ip, &root_block, body);
+
+    try sema.setMainBody(&root_block);
 
     const air = Air{
         .instructions = sema.air_instructions.slice(),
@@ -259,6 +298,7 @@ fn analyzeFnBody(module_sema: *Sema, ip: *InternPool, func_val: InternPool.Index
 fn analyzeBody(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     body: []const Dir.Inst.Index,
 ) CompileError!void {
     // An empty module body is legal (a file of only declarations);
@@ -275,21 +315,26 @@ fn analyzeBody(
             .int => try sema.dirInt(ip, inst_idx),
             .int_big => try sema.dirIntBig(ip, inst_idx),
             .float => try sema.dirFloat(ip, inst_idx),
-            .add => try sema.dirArithmetic(ip, .add, inst_idx),
-            .sub => try sema.dirArithmetic(ip, .sub, inst_idx),
-            .mul => try sema.dirArithmetic(ip, .mul, inst_idx),
-            .negate => try sema.dirNegate(ip, inst_idx),
-            .div => try sema.dirArithmetic(ip, .div, inst_idx),
-            .cmp_eq => try sema.dirCmp(ip, .eq, inst_idx),
-            .cmp_neq => try sema.dirCmp(ip, .neq, inst_idx),
-            .cmp_lt => try sema.dirCmp(ip, .lt, inst_idx),
-            .cmp_lte => try sema.dirCmp(ip, .lte, inst_idx),
-            .cmp_gt => try sema.dirCmp(ip, .gt, inst_idx),
-            .cmp_gte => try sema.dirCmp(ip, .gte, inst_idx),
-            .bool_not => try sema.dirBoolNot(ip, inst_idx),
+            .add => try sema.dirArithmetic(ip, block, .add, inst_idx),
+            .sub => try sema.dirArithmetic(ip, block, .sub, inst_idx),
+            .mul => try sema.dirArithmetic(ip, block, .mul, inst_idx),
+            .negate => try sema.dirNegate(ip, block, inst_idx),
+            .div => try sema.dirArithmetic(ip, block, .div, inst_idx),
+            .cmp_eq => try sema.dirCmp(ip, block, .eq, inst_idx),
+            .cmp_neq => try sema.dirCmp(ip, block, .neq, inst_idx),
+            .cmp_lt => try sema.dirCmp(ip, block, .lt, inst_idx),
+            .cmp_lte => try sema.dirCmp(ip, block, .lte, inst_idx),
+            .cmp_gt => try sema.dirCmp(ip, block, .gt, inst_idx),
+            .cmp_gte => try sema.dirCmp(ip, block, .gte, inst_idx),
+            .bool_not => try sema.dirBoolNot(ip, block, inst_idx),
             .str => try sema.dirStr(ip, inst_idx),
-            .block => try sema.dirBlock(ip, inst_idx),
-            .@"break" => try sema.dirBreak(ip, inst_idx),
+            .block => try sema.dirBlock(ip, block, inst_idx),
+            // A `break` is always its body's terminator and is consumed by
+            // `resolveBodyBreak`/`analyzeBranchBody`, never dispatched here.
+            .@"break" => unreachable,
+            // A `condbr` is always a `block` body's terminator, consumed by
+            // `analyzeIfBlock`.
+            .condbr => unreachable,
             .decl_val => try sema.dirDeclVal(ip, inst_idx),
             // The module instruction is never inside a body; a nested-module
             // mistake should trap here, not be skipped.
@@ -299,11 +344,11 @@ fn analyzeBody(
             // decl list and is reached by name. (Zig: Sema.zig `.declaration => unreachable`.)
             .declaration => unreachable,
 
-            .call => try sema.dirCall(ip, inst_idx, .direct),
-            .ret_node => try sema.dirRet(ip, inst_idx),
+            .call => try sema.dirCall(ip, block, inst_idx, .direct),
+            .ret_node => try sema.dirRet(ip, block, inst_idx),
             .func => try sema.dirFunc(ip, inst_idx),
-            .param => try sema.dirParam(ip, inst_idx),
-            .block_inline => try sema.dirBlockInline(ip, inst_idx),
+            .param => try sema.dirParam(ip, block, inst_idx),
+            .block_inline => try sema.dirBlockInline(ip, block, inst_idx),
             .break_inline => try sema.dirBreakInline(ip, inst_idx),
         };
 
@@ -341,6 +386,7 @@ const CallArgsInfo = union(enum) {
         cai: CallArgsInfo,
         sema: *Sema,
         ip: *InternPool,
+        block: *Block,
         arg_index: usize,
         param_ty: Type,
     ) CompileError!Air.Inst.Ref {
@@ -359,7 +405,7 @@ const CallArgsInfo = union(enum) {
             break :blk dir_call.args_body[start..end];
         };
 
-        const uncoerced_arg = try sema.resolveInlineBody(ip, arg_body);
+        const uncoerced_arg = try sema.resolveInlineBody(ip, block, arg_body);
 
         // The terminating break's operand source node is the argument's own
         // node — where a coercion error points.
@@ -377,6 +423,7 @@ const CallArgsInfo = union(enum) {
 fn analyzeCall(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     callee: Air.Inst.Ref,
     func_ty_info: InternPool.Key.FuncType,
     args_info: CallArgsInfo,
@@ -385,11 +432,11 @@ fn analyzeCall(
 
     for (args, 0..) |*arg, arg_idx| {
         const param_ty: Type = .fromInterned(func_ty_info.param_types.get(ip)[arg_idx]);
-        arg.* = try args_info.analyzeArg(sema, ip, arg_idx, param_ty);
+        arg.* = try args_info.analyzeArg(sema, ip, block, arg_idx, param_ty);
     }
 
     try sema.air_extra.ensureUnusedCapacity(sema.gpa, @typeInfo(Air.Call).@"struct".fields.len + args.len);
-    const call_ref = try sema.addInst(.{
+    const call_ref = try sema.addInst(block, .{
         .tag = .call,
         .data = .{ .pl_op = .{
             .operand = callee,
@@ -403,13 +450,13 @@ fn analyzeCall(
     return call_ref;
 }
 
-fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) CompileError!void {
+fn analyzeDeclaration(sema: *Sema, ip: *InternPool, block: *Block, decl_inst: Dir.Inst.Index) CompileError!void {
     const decl = sema.code.getDeclaration(decl_inst);
 
     const decl_ref: Air.Inst.Ref = switch (decl.linkage) {
         .@"extern" => extern_ref: {
             const type_body = decl.type_body.?;
-            const ty_ref = try sema.resolveInlineBody(ip, type_body);
+            const ty_ref = try sema.resolveInlineBody(ip, block, type_body);
             const fn_ty = ty_ref.toInterned().?; // a function type is always comptime-known
 
             const name = try ip.getString(sema.gpa, sema.code.nullTerminatedString(decl.name));
@@ -429,7 +476,7 @@ fn analyzeDeclaration(sema: *Sema, ip: *InternPool, decl_inst: Dir.Inst.Index) C
         .normal => func_ref: {
             // The value body's `func` instruction interns the function value;
             // the body itself is analyzed later, once every decl is known.
-            const func_ref = try sema.resolveInlineBody(ip, decl.value_body.?);
+            const func_ref = try sema.resolveInlineBody(ip, block, decl.value_body.?);
             const func_val = func_ref.toInterned().?; // a defined fn folds to its value
             try sema.fn_queue.append(sema.gpa, .{ .name = decl.name, .val = func_val });
             break :func_ref func_ref;
@@ -478,6 +525,7 @@ fn dirFloat(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air
 fn dirArithmetic(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     dir_tag: Dir.Inst.Tag,
     inst: Dir.Inst.Index,
 ) CompileError!Air.Inst.Ref {
@@ -486,7 +534,7 @@ fn dirArithmetic(
     const lhs = sema.resolveInst(extra.lhs);
     const rhs = sema.resolveInst(extra.rhs);
 
-    return sema.analyzeArithmetic(ip, dir_tag, lhs, rhs, sema.absNode(inst_data.src_node));
+    return sema.analyzeArithmetic(ip, block, dir_tag, lhs, rhs, sema.absNode(inst_data.src_node));
 }
 
 /// The absolute AST node for an instruction's relative `src_node` offset.
@@ -520,6 +568,7 @@ fn checkNumericOperands(
 fn analyzeArithmetic(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     dir_tag: Dir.Inst.Tag,
     lhs: Air.Inst.Ref,
     rhs: Air.Inst.Ref,
@@ -574,7 +623,7 @@ fn analyzeArithmetic(
         .div => .div,
         else => unreachable,
     };
-    return sema.addInst(.{ .tag = air_tag, .data = .{ .bin_op = .{
+    return sema.addInst(block, .{ .tag = air_tag, .data = .{ .bin_op = .{
         .lhs = lhs_coerced,
         .rhs = rhs_coerced,
     } } });
@@ -583,6 +632,7 @@ fn analyzeArithmetic(
 fn dirCmp(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     op: std.math.CompareOperator,
     inst: Dir.Inst.Index,
 ) CompileError!Air.Inst.Ref {
@@ -591,7 +641,7 @@ fn dirCmp(
     const lhs = sema.resolveInst(extra.lhs);
     const rhs = sema.resolveInst(extra.rhs);
 
-    return sema.analyzeCmp(ip, op, lhs, rhs, sema.absNode(inst_data.src_node));
+    return sema.analyzeCmp(ip, block, op, lhs, rhs, sema.absNode(inst_data.src_node));
 }
 
 /// Comparison mirrors arithmetic's shape: numeric operands only, comptime
@@ -601,6 +651,7 @@ fn dirCmp(
 fn analyzeCmp(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     op: std.math.CompareOperator,
     lhs: Air.Inst.Ref,
     rhs: Air.Inst.Ref,
@@ -630,13 +681,13 @@ fn analyzeCmp(
         .gt => .cmp_gt,
         .gte => .cmp_gte,
     };
-    return sema.addInst(.{ .tag = air_tag, .data = .{ .bin_op = .{
+    return sema.addInst(block, .{ .tag = air_tag, .data = .{ .bin_op = .{
         .lhs = lhs_coerced,
         .rhs = rhs_coerced,
     } } });
 }
 
-fn dirBoolNot(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+fn dirBoolNot(sema: *Sema, ip: *InternPool, block: *Block, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = sema.resolveInst(inst_data.operand);
     const loc: Diagnostics.Loc = .{ .node_main = sema.absNode(inst_data.src_node) };
@@ -650,7 +701,7 @@ fn dirBoolNot(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!A
     if (sema.resolveValue(operand)) |val| {
         return Air.internedToRef(if (val.toIntern() == .bool_true) .bool_false else .bool_true);
     }
-    return sema.addInst(.{ .tag = .not, .data = .{ .un_op = operand } });
+    return sema.addInst(block, .{ .tag = .not, .data = .{ .un_op = operand } });
 }
 
 fn dirStr(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -671,6 +722,7 @@ const ResolvedFieldCallee = union(enum) {
 fn dirCall(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     inst: Dir.Inst.Index,
     comptime kind: enum { direct, field },
 ) CompileError!Air.Inst.Ref {
@@ -715,7 +767,7 @@ fn dirCall(
         },
     };
 
-    const call_inst = try sema.analyzeCall(ip, func, func_ty, args_info);
+    const call_inst = try sema.analyzeCall(ip, block, func, func_ty, args_info);
 
     return call_inst;
 }
@@ -771,7 +823,7 @@ fn dirFunc(
     return .fromInterned(func_val);
 }
 
-fn dirRet(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+fn dirRet(sema: *Sema, ip: *InternPool, block: *Block, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = sema.resolveInst(inst_data.operand);
     const loc: Diagnostics.Loc = .{ .node_main = sema.absNode(inst_data.src_node) };
@@ -789,63 +841,203 @@ fn dirRet(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.I
         break :result try sema.coerce(ip, sema.fn_ret_ty, operand, loc);
     };
 
-    _ = try sema.addInst(.{ .tag = .ret, .data = .{ .un_op = result } });
+    _ = try sema.addInst(block, .{ .tag = .ret, .data = .{ .un_op = result } });
     // `ret` is a terminator, not a value.
     return .fromInterned(.void_value);
 }
 
-//TODO(tzelon): block needs Block struct to function, which we can break out of.
-// Currently we just copy the instructions into the inst_map
-fn dirBlock(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+/// A Dir `block` has two shapes, told apart by its body's terminator:
+/// a plain `{ }` block ends with a `break` (linear, single-break — its value
+/// is the break operand, no Air block); an `if`-block ends with a `condbr`
+/// and takes the structured path.
+fn dirBlock(sema: *Sema, ip: *InternPool, block: *Block, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
     const body = sema.code.bodySlice(extra.end, extra.data.body_len);
 
-    try sema.analyzeBody(ip, body);
+    const tags = sema.code.instructions.items(.tag);
+    if (tags[@intFromEnum(body[body.len - 1])] == .condbr) {
+        return sema.analyzeIfBlock(ip, block, inst, body);
+    }
+    return sema.resolveBodyBreak(ip, block, inst, body);
+}
 
-    //TODO(tzelon): get the break operand and return it from the block which is the owner of the return value
-    const break_data = sema.code.instructions.items(.data)[@intFromEnum(body[body.len - 1])].@"break";
+/// Analyze a body whose terminator is a `break` to `block_dir_inst` and
+/// return the break operand's resolved value — the linear/fold path: no Air
+/// block, no br.
+fn resolveBodyBreak(
+    sema: *Sema,
+    ip: *InternPool,
+    block: *Block,
+    block_dir_inst: Dir.Inst.Index,
+    body: []const Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    const break_inst = body[body.len - 1];
+    assert(sema.code.instructions.items(.tag)[@intFromEnum(break_inst)] == .@"break");
+    try sema.analyzeBody(ip, block, body[0 .. body.len - 1]);
+
+    const break_data = sema.code.instructions.items(.data)[@intFromEnum(break_inst)].@"break";
     const break_extra = sema.code.extraData(Dir.Inst.Break, break_data.payload_index).data;
-    assert(break_extra.block_inst == inst);
-
+    assert(break_extra.block_inst == block_dir_inst);
     return sema.resolveInst(break_data.operand);
 }
 
-fn dirBreak(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
-    // const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].@"break";
-    // const extra = sema.code.extraData(Dir.Inst.Break, inst_data.payload_index).data;
-    // const operand = sema.resolveInst(inst_data.operand);
-    // //TODO(tzelon): unused for now, this is the actual block the break is breaking
-    // _ = extra.block_inst;
-    //
-    // return sema.addInst(.{
-    //     .tag = .br,
-    //     .data = .{ .br = .{
-    //         .block_inst = extra.block_inst,
-    //         .operand = operand,
-    //     } },
-    // });
+/// The runtime block path (`Block.Merges` at Duni scale): the Dir block's
+/// body is condition instructions plus a `condbr`.
+/// - A comptime-known condition analyzes *only the taken branch*, inline —
+///   the untaken branch is never analyzed, so an error inside it is never
+///   seen (Zig semantics; notes/control_flow.md). No Air block is emitted.
+/// - A runtime condition emits an Air `block` whose body is the condition
+///   instructions plus a `cond_br`; each branch body ends with a `br`
+///   carrying its value to the block's merge point, and the block's result
+///   type is `unify(then_ty, else_ty)`.
+fn analyzeIfBlock(
+    sema: *Sema,
+    ip: *InternPool,
+    parent_block: *Block,
+    block_dir_inst: Dir.Inst.Index,
+    body: []const Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    const gpa = sema.gpa;
+    const condbr_inst = body[body.len - 1];
+    const condbr_data = sema.code.instructions.items(.data)[@intFromEnum(condbr_inst)].pl_node;
+    const condbr_extra = sema.code.extraData(Dir.Inst.CondBr, condbr_data.payload_index);
+    const then_body = sema.code.bodySlice(condbr_extra.end, condbr_extra.data.then_body_len);
+    const else_body = sema.code.bodySlice(
+        condbr_extra.end + condbr_extra.data.then_body_len,
+        condbr_extra.data.else_body_len,
+    );
+    const if_loc: Diagnostics.Loc = .{ .node_main = sema.absNode(condbr_data.src_node) };
 
-    _ = ip;
-    // Linear single-break: the break's value is just its operand. No
-    // error.ComptimeBreak unwinding (Zig's analyzeBodyInner).
-    const operand = sema.code.instructions.items(.data)[@intFromEnum(inst)].@"break".operand;
-    return sema.resolveInst(operand);
+    // The condition's instructions go into their own scratch body first:
+    // if the condition folds they belong to the parent body, if it is
+    // runtime they are the head of the Air block's body.
+    var cond_block: Block = .{};
+    defer cond_block.deinit(gpa);
+    try sema.analyzeBody(ip, &cond_block, body[0 .. body.len - 1]);
+
+    const cond = sema.resolveInst(condbr_extra.data.condition);
+    const cond_ty = sema.typeOf(ip, cond);
+    if (sema.unify(ip, .fromInterned(.bool_type), cond_ty) == null) {
+        return sema.failTypeMismatch(.fromInterned(.bool_type), cond_ty, if_loc);
+    }
+
+    if (sema.resolveValue(cond)) |cond_val| {
+        // Runtime side effects from the condition still happen.
+        try parent_block.instructions.appendSlice(gpa, cond_block.instructions.items);
+        const taken = if (cond_val.toIntern() == .bool_true) then_body else else_body;
+        return sema.resolveBodyBreak(ip, parent_block, block_dir_inst, taken);
+    }
+
+    // The block's type and payload are known only after both branches are
+    // analyzed; reserve it now so the brs can name it.
+    const air_block_index = try sema.addInstAsIndex(parent_block, .{
+        .tag = .block,
+        .data = .{ .ty_pl = .{ .ty = undefined, .payload = undefined } },
+    });
+
+    var block_body: Block = .{};
+    defer block_body.deinit(gpa);
+    try block_body.instructions.appendSlice(gpa, cond_block.instructions.items);
+    const cond_br_index = try sema.addInstAsIndex(&block_body, .{
+        .tag = .cond_br,
+        .data = .{ .pl_op = .{ .operand = cond, .payload = undefined } },
+    });
+
+    var then_block: Block = .{};
+    defer then_block.deinit(gpa);
+    const then_result = try sema.analyzeBranchBody(ip, &then_block, block_dir_inst, air_block_index, then_body);
+
+    var else_block: Block = .{};
+    defer else_block.deinit(gpa);
+    const else_result = try sema.analyzeBranchBody(ip, &else_block, block_dir_inst, air_block_index, else_body);
+
+    const then_ty = sema.typeOf(ip, then_result);
+    const else_ty = sema.typeOf(ip, else_result);
+    const result_ty = sema.unify(ip, then_ty, else_ty) orelse {
+        try sema.diags.addError(
+            if_loc,
+            "incompatible if branch types: '{s}' and '{s}'",
+            .{ then_ty.name(), else_ty.name() },
+        );
+        return error.AnalysisFail;
+    };
+
+    try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.CondBr).@"struct".fields.len +
+        then_block.instructions.items.len + else_block.instructions.items.len);
+    const condbr_payload = sema.addExtraAssumeCapacity(Air.CondBr{
+        .then_body_len = @intCast(then_block.instructions.items.len),
+        .else_body_len = @intCast(else_block.instructions.items.len),
+    });
+    sema.air_extra.appendSliceAssumeCapacity(@ptrCast(then_block.instructions.items));
+    sema.air_extra.appendSliceAssumeCapacity(@ptrCast(else_block.instructions.items));
+    sema.air_instructions.items(.data)[@intFromEnum(cond_br_index)].pl_op.payload = condbr_payload;
+
+    try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Block).@"struct".fields.len +
+        block_body.instructions.items.len);
+    const block_payload = sema.addExtraAssumeCapacity(Air.Block{
+        .body_len = @intCast(block_body.instructions.items.len),
+    });
+    sema.air_extra.appendSliceAssumeCapacity(@ptrCast(block_body.instructions.items));
+    sema.air_instructions.items(.data)[@intFromEnum(air_block_index)] = .{ .ty_pl = .{
+        .ty = result_ty,
+        .payload = block_payload,
+    } };
+
+    return air_block_index.toRef();
 }
 
-fn dirBlockInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+/// Analyze one `condbr` branch body into `branch_block`. The body's
+/// terminating Dir `break` becomes an Air `br` carrying the branch's value —
+/// coerced to its runtime representation first (comptime numerics become
+/// runtime `number` constants), since the value crosses the block's merge
+/// point.
+fn analyzeBranchBody(
+    sema: *Sema,
+    ip: *InternPool,
+    branch_block: *Block,
+    block_dir_inst: Dir.Inst.Index,
+    air_block_index: Air.Inst.Index,
+    body: []const Dir.Inst.Index,
+) CompileError!Air.Inst.Ref {
+    const break_inst = body[body.len - 1];
+    assert(sema.code.instructions.items(.tag)[@intFromEnum(break_inst)] == .@"break");
+    try sema.analyzeBody(ip, branch_block, body[0 .. body.len - 1]);
+
+    const break_data = sema.code.instructions.items(.data)[@intFromEnum(break_inst)].@"break";
+    const break_extra = sema.code.extraData(Dir.Inst.Break, break_data.payload_index).data;
+    assert(break_extra.block_inst == block_dir_inst);
+    const loc: Diagnostics.Loc = if (break_extra.operand_src_node.unwrap()) |offset|
+        .{ .node_start = sema.absNode(offset) }
+    else
+        .{ .byte = 0 };
+
+    const operand = sema.resolveInst(break_data.operand);
+    const coerced = coerced: {
+        if (sema.resolveValue(operand) == null) break :coerced operand;
+        if (sema.typeOf(ip, operand).isNumeric(ip))
+            break :coerced try sema.coerce(ip, .fromInterned(.f64_type), operand, loc);
+        break :coerced operand;
+    };
+    _ = try sema.addInst(branch_block, .{ .tag = .br, .data = .{ .br = .{
+        .block_inst = air_block_index,
+        .operand = coerced,
+    } } });
+    return coerced;
+}
+
+fn dirBlockInline(sema: *Sema, ip: *InternPool, block: *Block, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     // NOTE(tzelon):
     // Run the body inline — no runtime Air block. The body ends with a
     // `break_inline` whose value is already in `inst_map`, so the
     // block evaluates to its last instruction. No `error.ComptimeBreak` to
     // catch: Duni's inline bodies are linear and single-break, so unlike
     // Zig (Sema.zig:1757, inlined to drive comptime break-propagation) this
-    // is a self-contained sub-analysis. Kept separate from `dirBlock`: the
-    // two split further when `block` grows a runtime Air path.
+    // is a self-contained sub-analysis.
     const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.code.extraData(Dir.Inst.Block, pl_node.payload_index);
     const body = sema.code.bodySlice(extra.end, extra.data.body_len);
-    return try sema.resolveInlineBody(ip, body);
+    return try sema.resolveInlineBody(ip, block, body);
 }
 
 fn dirBreakInline(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -866,6 +1058,7 @@ fn dirDeclVal(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!A
 fn dirParam(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     inst: Dir.Inst.Index,
 ) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_tok;
@@ -888,7 +1081,7 @@ fn dirParam(
     // Run the type body inline; its result is this param's type. Returning it
     // maps the param inst → its type in `inst_map`, which `func` reads.
     // (Zig: `resolveInlineBody(body)` → `analyzeAsType`; we skip as-type.)
-    return try sema.resolveInlineBody(ip, body);
+    return try sema.resolveInlineBody(ip, block, body);
 }
 
 /// Coerce a value to `dest_ty`.
@@ -993,7 +1186,7 @@ fn coerceIntToFloat(sema: *Sema, ip: *InternPool, val: Value, dest_ty: Type, loc
     return Air.Inst.Ref.fromInterned(ip_index);
 }
 
-fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
+fn dirNegate(sema: *Sema, ip: *InternPool, block: *Block, inst: Dir.Inst.Index) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const rhs = sema.resolveInst(inst_data.operand);
 
@@ -1006,7 +1199,7 @@ fn dirNegate(sema: *Sema, ip: *InternPool, inst: Dir.Inst.Index) CompileError!Ai
 
     // negate is `0 - operand`
     const lhs = Air.internedToRef(.zero);
-    return sema.analyzeArithmetic(ip, .sub, lhs, rhs, sema.absNode(inst_data.src_node));
+    return sema.analyzeArithmetic(ip, block, .sub, lhs, rhs, sema.absNode(inst_data.src_node));
 }
 
 fn addStrLit(sema: *Sema, ip: *InternPool, string: String.NullTerminatedString) CompileError!Air.Inst.Ref {
@@ -1014,17 +1207,19 @@ fn addStrLit(sema: *Sema, ip: *InternPool, string: String.NullTerminatedString) 
     return .fromInterned(val);
 }
 
-pub fn addInst(sema: *Sema, inst: Air.Inst) error{OutOfMemory}!Air.Inst.Ref {
-    return (try sema.addInstAsIndex(inst)).toRef();
+pub fn addInst(sema: *Sema, block: *Block, inst: Air.Inst) error{OutOfMemory}!Air.Inst.Ref {
+    return (try sema.addInstAsIndex(block, inst)).toRef();
 }
 
-pub fn addInstAsIndex(sema: *Sema, inst: Air.Inst) error{OutOfMemory}!Air.Inst.Index {
+pub fn addInstAsIndex(sema: *Sema, block: *Block, inst: Air.Inst) error{OutOfMemory}!Air.Inst.Index {
     const gpa = sema.gpa;
 
     try sema.air_instructions.ensureUnusedCapacity(gpa, 1);
+    try block.instructions.ensureUnusedCapacity(gpa, 1);
 
     const result_index: Air.Inst.Index = @enumFromInt(sema.air_instructions.len);
     sema.air_instructions.appendAssumeCapacity(inst);
+    block.instructions.appendAssumeCapacity(result_index);
     return result_index;
 }
 
@@ -1061,9 +1256,10 @@ fn appendRefsAssumeCapacity(sema: *Sema, refs: []const Air.Inst.Ref) void {
 pub fn resolveInlineBody(
     sema: *Sema,
     ip: *InternPool,
+    block: *Block,
     body: []const Dir.Inst.Index,
 ) CompileError!Air.Inst.Ref {
-    try sema.analyzeBody(ip, body);
+    try sema.analyzeBody(ip, block, body);
 
     // TODO(tzelon): We assume the following
     // 1. The break is the last instruction
@@ -1545,6 +1741,8 @@ test "coerce passes a runtime number through unchanged" {
     // `code` is never read: coerce works purely on AIR refs.
     var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
     defer sema.deinit();
+    var blk: Block = .{};
+    defer blk.deinit(gpa);
 
     // %0 = call print() where `extern fn print() number`
     const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
@@ -1554,7 +1752,7 @@ test "coerce passes a runtime number through unchanged" {
         .lib_name = .none,
     } });
     try sema.air_extra.append(gpa, 0); // Air.Call.args_len
-    const call_ref = try sema.addInst(.{ .tag = .call, .data = .{ .pl_op = .{
+    const call_ref = try sema.addInst(&blk, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = Air.internedToRef(print_ext),
         .payload = 0,
     } } });
@@ -1579,6 +1777,8 @@ test "analyze arithmetic with a runtime operand emits an Air bin op" {
     // `code` is never read: analyzeArithmetic works purely on AIR refs.
     var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
     defer sema.deinit();
+    var blk: Block = .{};
+    defer blk.deinit(gpa);
 
     // %0 = call print() where `extern fn print() number`
     const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
@@ -1588,13 +1788,13 @@ test "analyze arithmetic with a runtime operand emits an Air bin op" {
         .lib_name = .none,
     } });
     try sema.air_extra.append(gpa, 0); // Air.Call.args_len
-    const call_ref = try sema.addInst(.{ .tag = .call, .data = .{ .pl_op = .{
+    const call_ref = try sema.addInst(&blk, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = Air.internedToRef(print_ext),
         .payload = 0,
     } } });
 
     const one = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } });
-    const result = try sema.analyzeArithmetic(&ip, .add, call_ref, Air.internedToRef(one), @enumFromInt(0));
+    const result = try sema.analyzeArithmetic(&ip, &blk, .add, call_ref, Air.internedToRef(one), @enumFromInt(0));
 
     const result_idx = result.toIndex().?;
     try std.testing.expectEqual(Air.Inst.Tag.add, sema.air_instructions.items(.tag)[@intFromEnum(result_idx)]);
@@ -1636,6 +1836,8 @@ test "analyze comparison with a runtime operand emits an Air cmp" {
     // `code` is never read: analyzeCmp works purely on AIR refs.
     var sema = Sema{ .gpa = gpa, .code = undefined, .arena = arena.allocator(), .diags = &diags };
     defer sema.deinit();
+    var blk: Block = .{};
+    defer blk.deinit(gpa);
 
     // %0 = call print() where `extern fn print() number`
     const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
@@ -1645,13 +1847,13 @@ test "analyze comparison with a runtime operand emits an Air cmp" {
         .lib_name = .none,
     } });
     try sema.air_extra.append(gpa, 0); // Air.Call.args_len
-    const call_ref = try sema.addInst(.{ .tag = .call, .data = .{ .pl_op = .{
+    const call_ref = try sema.addInst(&blk, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = Air.internedToRef(print_ext),
         .payload = 0,
     } } });
 
     const one = try ip.get(gpa, .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } });
-    const result = try sema.analyzeCmp(&ip, .lt, call_ref, Air.internedToRef(one), @enumFromInt(0));
+    const result = try sema.analyzeCmp(&ip, &blk, .lt, call_ref, Air.internedToRef(one), @enumFromInt(0));
 
     const result_idx = result.toIndex().?;
     try std.testing.expectEqual(Air.Inst.Tag.cmp_lt, sema.air_instructions.items(.tag)[@intFromEnum(result_idx)]);
@@ -1710,6 +1912,306 @@ test "analyze bool_not folds and requires a Bool operand" {
     var test_diags = Diagnostics{ .gpa = gpa };
     defer test_diags.deinit();
     try std.testing.expectError(error.AnalysisFail, Sema.analyze(gpa, dir, &ip, &test_diags));
+}
+
+test "if with comptime condition folds to the taken branch only" {
+    // if true { 1 } else { !2 } — the else branch contains a type error
+    // (`!` on a number), but a comptime-true condition analyzes only the
+    // taken branch, so analysis succeeds and folds to 1.
+    const gpa = std.testing.allocator;
+
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    defer list.deinit(gpa);
+    // %0 = module_decl(body={%1})
+    try list.append(gpa, .{ .tag = .extended, .data = .{ .extended = .{
+        .opcode = .module_decl,
+        .small = @bitCast(Dir.Inst.ModuleDecl.Small{}),
+        .operand = 0,
+    } } });
+    // %1 = block(body={%2})
+    try list.append(gpa, .{ .tag = .block, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 4 } } });
+    // %2 = condbr(bool_true, then={%3, %4}, else={%5, %6, %7})
+    try list.append(gpa, .{ .tag = .condbr, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 6 } } });
+    // then: %3 = int(1); %4 = break(%1, %3)
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(3)).toRef(),
+        .payload_index = 14,
+    } } });
+    // else: %5 = int(2); %6 = bool_not(%5); %7 = break(%1, %6)
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
+    try list.append(gpa, .{ .tag = .bool_not, .data = .{ .un_node = .{
+        .src_node = @enumFromInt(0),
+        .operand = @as(Dir.Inst.Index, @enumFromInt(5)).toRef(),
+    } } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(6)).toRef(),
+        .payload_index = 16,
+    } } });
+
+    const no_src: u32 = @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none));
+    const extra = try gpa.alloc(u32, 18);
+    // extra[0..4]: ModuleDecl{src_node, decls_len=0, body_len=1} + body {%1}
+    extra[0] = 0;
+    extra[1] = 0;
+    extra[2] = 1;
+    extra[3] = 1;
+    // extra[4..6]: Block payload — body_len=1, %2
+    extra[4] = 1;
+    extra[5] = 2;
+    // extra[6..14]: CondBr{condition=bool_true, then_len=2, else_len=3} + bodies
+    extra[6] = @intFromEnum(Dir.Inst.Ref.bool_true);
+    extra[7] = 2;
+    extra[8] = 3;
+    extra[9] = 3; // then: %3
+    extra[10] = 4; // then: %4
+    extra[11] = 5; // else: %5
+    extra[12] = 6; // else: %6
+    extra[13] = 7; // else: %7
+    // extra[14..18]: Break payloads for %4 and %7
+    extra[14] = no_src;
+    extra[15] = 1; // block_inst = %1
+    extra[16] = no_src;
+    extra[17] = 1;
+
+    var dir: Dir = .{
+        .instructions = list.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = try gpa.dupe(u8, &.{}),
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var test_diags = Diagnostics{ .gpa = gpa };
+    defer test_diags.deinit();
+    var result = try Sema.analyze(gpa, dir, &ip, &test_diags);
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), result.main.instructions.len);
+    const actual = result.main.instructions.items(.data)[0].un_op.toInterned().?;
+    try std.testing.expectEqual(
+        try ip.get(gpa, .{ .float = .{ .ty = .comptime_float_type, .storage = .{ .f64 = 1.0 } } }),
+        actual,
+    );
+}
+
+test "if with runtime condition emits block, cond_br and brs" {
+    const gpa = std.testing.allocator;
+
+    // Dir fragment: a condbr body whose condition (%0) is pre-mapped to a
+    // runtime Air ref, exactly as dirBlock would find it after the condition
+    // instructions ran. Branch values 1 and 2 are comptime numerics — they
+    // must cross the merge point as runtime f64 constants.
+    // %0 = int(0) — cond stand-in, never analyzed (pre-mapped instead)
+    // %1 = condbr(%0, then={%2, %3}, else={%4, %5})
+    // %2 = int(1); %3 = break(#9, %2); %4 = int(2); %5 = break(#9, %4)
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 0 } });
+    try list.append(gpa, .{ .tag = .condbr, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } });
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(2)).toRef(),
+        .payload_index = 7,
+    } } });
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 2 } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(4)).toRef(),
+        .payload_index = 9,
+    } } });
+
+    const no_src: u32 = @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none));
+    const extra = try gpa.alloc(u32, 11);
+    // extra[0..7]: CondBr{condition=%0, then_len=2, else_len=2} + bodies
+    extra[0] = @intFromEnum(@as(Dir.Inst.Index, @enumFromInt(0)).toRef());
+    extra[1] = 2;
+    extra[2] = 2;
+    extra[3] = 2;
+    extra[4] = 3;
+    extra[5] = 4;
+    extra[6] = 5;
+    // extra[7..11]: Break payloads for %3 and %5 (target block index 9)
+    extra[7] = no_src;
+    extra[8] = 9;
+    extra[9] = no_src;
+    extra[10] = 9;
+
+    var dir: Dir = .{
+        .instructions = list.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = try gpa.dupe(u8, &.{}),
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    var sema = Sema{ .gpa = gpa, .code = dir, .arena = arena.allocator(), .diags = &diags };
+    defer sema.deinit();
+    var parent: Block = .{};
+    defer parent.deinit(gpa);
+
+    // %air0 = call flag() where `extern fn flag() Bool` — the runtime cond.
+    const fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .bool_type });
+    const flag_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "flag"),
+        .ty = fn_ty,
+        .lib_name = .none,
+    } });
+    try sema.air_extra.append(gpa, 0); // Air.Call.args_len
+    const call_ref = try sema.addInst(&parent, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = Air.internedToRef(flag_ext),
+        .payload = 0,
+    } } });
+    try sema.inst_map.ensureSpaceForInstructions(gpa, &.{@enumFromInt(0)});
+    sema.inst_map.putAssumeCapacity(@enumFromInt(0), call_ref);
+
+    const body = [_]Dir.Inst.Index{@enumFromInt(1)};
+    const result = try sema.analyzeIfBlock(&ip, &parent, @enumFromInt(9), &body);
+
+    // Air: %0 call, %1 block, %2 cond_br, %3 br(then), %4 br(else).
+    const air_tags = sema.air_instructions.items(.tag);
+    const air_datas = sema.air_instructions.items(.data);
+    try std.testing.expectEqual(@as(usize, 5), sema.air_instructions.len);
+    try std.testing.expectEqual(Air.Inst.Tag.block, air_tags[1]);
+    try std.testing.expectEqual(Air.Inst.Tag.cond_br, air_tags[2]);
+    try std.testing.expectEqual(Air.Inst.Tag.br, air_tags[3]);
+    try std.testing.expectEqual(Air.Inst.Tag.br, air_tags[4]);
+    try std.testing.expectEqual((@as(Air.Inst.Index, @enumFromInt(1))).toRef(), result);
+
+    // The parent body holds the call and the block, in order.
+    try std.testing.expectEqualSlices(
+        Air.Inst.Index,
+        &.{ @enumFromInt(0), @enumFromInt(1) },
+        parent.instructions.items,
+    );
+
+    // The block: result type f64 (both branches coerced to runtime number),
+    // body = {%2 cond_br}.
+    const block_data = air_datas[1].ty_pl;
+    try std.testing.expectEqual(InternPool.Index.f64_type, block_data.ty.toIntern());
+    try std.testing.expectEqual(@as(u32, 1), sema.air_extra.items[block_data.payload]);
+    try std.testing.expectEqual(@as(u32, 2), sema.air_extra.items[block_data.payload + 1]);
+
+    // The cond_br: operand is the call, bodies are the two brs.
+    try std.testing.expectEqual(call_ref, air_datas[2].pl_op.operand);
+    const condbr_payload = air_datas[2].pl_op.payload;
+    try std.testing.expectEqual(@as(u32, 1), sema.air_extra.items[condbr_payload]); // then_body_len
+    try std.testing.expectEqual(@as(u32, 1), sema.air_extra.items[condbr_payload + 1]); // else_body_len
+    try std.testing.expectEqual(@as(u32, 3), sema.air_extra.items[condbr_payload + 2]);
+    try std.testing.expectEqual(@as(u32, 4), sema.air_extra.items[condbr_payload + 3]);
+
+    // Each br targets the block and carries its branch's f64 constant.
+    const one_f64 = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1.0 } } });
+    const two_f64 = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 2.0 } } });
+    try std.testing.expectEqual(@as(Air.Inst.Index, @enumFromInt(1)), air_datas[3].br.block_inst);
+    try std.testing.expectEqual(Air.internedToRef(one_f64), air_datas[3].br.operand);
+    try std.testing.expectEqual(@as(Air.Inst.Index, @enumFromInt(1)), air_datas[4].br.block_inst);
+    try std.testing.expectEqual(Air.internedToRef(two_f64), air_datas[4].br.operand);
+}
+
+test "if branch type mismatch and non-Bool condition fail analysis" {
+    const gpa = std.testing.allocator;
+
+    // Same Dir fragment as the runtime test, but the else branch breaks with
+    // a string — unify(number, string) has no answer.
+    var list: std.MultiArrayList(Dir.Inst) = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 0 } });
+    try list.append(gpa, .{ .tag = .condbr, .data = .{ .pl_node = .{ .src_node = @enumFromInt(0), .payload_index = 0 } } });
+    try list.append(gpa, .{ .tag = .int, .data = .{ .int = 1 } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(2)).toRef(),
+        .payload_index = 7,
+    } } });
+    try list.append(gpa, .{ .tag = .str, .data = .{ .str = .{ .start = @enumFromInt(0), .len = 3 } } });
+    try list.append(gpa, .{ .tag = .@"break", .data = .{ .@"break" = .{
+        .operand = @as(Dir.Inst.Index, @enumFromInt(4)).toRef(),
+        .payload_index = 9,
+    } } });
+
+    const no_src: u32 = @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none));
+    const extra = try gpa.alloc(u32, 11);
+    extra[0] = @intFromEnum(@as(Dir.Inst.Index, @enumFromInt(0)).toRef());
+    extra[1] = 2;
+    extra[2] = 2;
+    extra[3] = 2;
+    extra[4] = 3;
+    extra[5] = 4;
+    extra[6] = 5;
+    extra[7] = no_src;
+    extra[8] = 9;
+    extra[9] = no_src;
+    extra[10] = 9;
+
+    var dir: Dir = .{
+        .instructions = list.toOwnedSlice(),
+        .extra = extra,
+        .string_bytes = try gpa.dupe(u8, "hey"),
+    };
+    defer dir.deinit(gpa);
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    var sema = Sema{ .gpa = gpa, .code = dir, .arena = arena.allocator(), .diags = &diags };
+    defer sema.deinit();
+    var parent: Block = .{};
+    defer parent.deinit(gpa);
+
+    const bool_fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .bool_type });
+    const flag_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "flag"),
+        .ty = bool_fn_ty,
+        .lib_name = .none,
+    } });
+    try sema.air_extra.append(gpa, 0); // Air.Call.args_len
+    const call_ref = try sema.addInst(&parent, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = Air.internedToRef(flag_ext),
+        .payload = 0,
+    } } });
+    try sema.inst_map.ensureSpaceForInstructions(gpa, &.{@enumFromInt(0)});
+    sema.inst_map.putAssumeCapacity(@enumFromInt(0), call_ref);
+
+    const body = [_]Dir.Inst.Index{@enumFromInt(1)};
+    try std.testing.expectError(error.AnalysisFail, sema.analyzeIfBlock(&ip, &parent, @enumFromInt(9), &body));
+
+    // A non-Bool condition is rejected before any branch is analyzed:
+    // remap the condition to a number-returning call.
+    var diags2 = Diagnostics{ .gpa = gpa };
+    defer diags2.deinit();
+    var sema2 = Sema{ .gpa = gpa, .code = dir, .arena = arena.allocator(), .diags = &diags2 };
+    defer sema2.deinit();
+    var parent2: Block = .{};
+    defer parent2.deinit(gpa);
+
+    const num_fn_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .f64_type });
+    const num_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "num"),
+        .ty = num_fn_ty,
+        .lib_name = .none,
+    } });
+    try sema2.air_extra.append(gpa, 0);
+    const num_call = try sema2.addInst(&parent2, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = Air.internedToRef(num_ext),
+        .payload = 0,
+    } } });
+    try sema2.inst_map.ensureSpaceForInstructions(gpa, &.{@enumFromInt(0)});
+    sema2.inst_map.putAssumeCapacity(@enumFromInt(0), num_call);
+    try std.testing.expectError(error.AnalysisFail, sema2.analyzeIfBlock(&ip, &parent2, @enumFromInt(9), &body));
 }
 
 test "unify: index equality plus the comptime_float/f64 pair" {

@@ -89,6 +89,11 @@ pub const Inst = struct {
         /// Uses the `break` union field.
         /// Uses the source information from previous instruction.
         @"break",
+        /// Conditional branch. Terminates the enclosing `block`'s body: each
+        /// of the two trailing bodies ends with a `break` to that block
+        /// carrying its branch's value.
+        /// Uses the `pl_node` union field. Payload is `CondBr`.
+        condbr,
         /// A list of instructions which are analyzed in the parent context, without
         /// generating a runtime block. Must terminate with an "inline" variant of
         /// a noreturn instruction.
@@ -334,6 +339,14 @@ pub const Inst = struct {
     /// Each operand is an `Index`.
     pub const Block = struct {
         body_len: u32,
+    };
+
+    /// Stored inside extra. Trailing: the then body's `then_body_len`
+    /// instruction indices, then the else body's `else_body_len`.
+    pub const CondBr = struct {
+        condition: Ref,
+        then_body_len: u32,
+        else_body_len: u32,
     };
 
     /// Trailing: inst: Index // for every body_len

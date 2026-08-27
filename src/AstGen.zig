@@ -144,6 +144,8 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             .assign => return bind(gd, current_node),
             .block => return blockExpr(gd, current_node),
 
+            .if_simple, .if_else => return ifExpr(gd, current_node),
+
             // Grouping is transparent to lowering: unwrap and go again.
             .grouped_expression => current_node = tree.nodeData(current_node).node_and_token[0],
 
@@ -538,6 +540,89 @@ fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     gd.cursor.tip = &local_val.base;
 
     return rhs;
+}
+
+/// Lower `if` to Zig's shape: a `block` wrapping the condition and a
+/// `condbr`; each branch body ends with a `break` to the block carrying that
+/// branch's value. An else-less `if` gets an implicit `else { void }` — its
+/// else body is a lone void break (so Sema's branch unification enforces the
+/// then-branch-must-be-void rule; see notes/control_flow.md).
+fn ifExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const gpa = astgen.gpa;
+    const tree = astgen.tree;
+
+    const cond_node, const then_node, const else_node = switch (tree.nodeTag(node)) {
+        .if_simple => blk: {
+            const cond, const then_expr = tree.nodeData(node).node_and_node;
+            break :blk .{ cond, then_expr, @as(?Ast.Node.Index, null) };
+        },
+        .if_else => blk: {
+            const cond, const extra_index = tree.nodeData(node).node_and_extra;
+            const if_extra = tree.extraData(extra_index, Node.If);
+            break :blk .{ cond, if_extra.then_expr, @as(?Ast.Node.Index, if_extra.else_expr) };
+        },
+        else => unreachable,
+    };
+
+    const block_inst = try gd.makeBlockInst(.block, node);
+    try gd.instructions.append(gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const cond = try expr(&block_scope, cond_node);
+    const condbr = try block_scope.makeBlockInst(.condbr, node);
+    try block_scope.instructions.append(gpa, condbr);
+
+    var then_scope = block_scope.makeSubBlock();
+    defer then_scope.unstack();
+    const then_result = try expr(&then_scope, then_node);
+    _ = try then_scope.addBreakWithSrcNode(.@"break", block_inst, then_result, then_node);
+
+    var else_scope = block_scope.makeSubBlock();
+    defer else_scope.unstack();
+    if (else_node) |else_expr| {
+        const else_result = try expr(&else_scope, else_expr);
+        _ = try else_scope.addBreakWithSrcNode(.@"break", block_inst, else_result, else_expr);
+    } else {
+        _ = try else_scope.addBreak(.@"break", block_inst, .void_value);
+    }
+
+    try setCondBrPayload(condbr, cond, &then_scope, &else_scope);
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+/// Writes the `CondBr` payload and both trailing bodies for a reserved
+/// `condbr`. Assumes `else_scope` is stacked on `then_scope` and nothing is
+/// stacked on `else_scope`. Unstacks both.
+fn setCondBrPayload(
+    condbr: Dir.Inst.Index,
+    cond: Dir.Inst.Ref,
+    then_scope: *GenDir,
+    else_scope: *GenDir,
+) !void {
+    const astgen = then_scope.astgen;
+    const gpa = astgen.gpa;
+    const then_body = then_scope.instructionsSliceUpto(else_scope);
+    const else_body = else_scope.instructionsSlice();
+
+    try astgen.extra.ensureUnusedCapacity(
+        gpa,
+        @typeInfo(Dir.Inst.CondBr).@"struct".fields.len + then_body.len + else_body.len,
+    );
+    const dir_datas = astgen.instructions.items(.data);
+    dir_datas[@intFromEnum(condbr)].pl_node.payload_index = astgen.addExtraAssumeCapacity(Dir.Inst.CondBr{
+        .condition = cond,
+        .then_body_len = @intCast(then_body.len),
+        .else_body_len = @intCast(else_body.len),
+    });
+    astgen.extra.appendSliceAssumeCapacity(@ptrCast(then_body));
+    astgen.extra.appendSliceAssumeCapacity(@ptrCast(else_body));
+    else_scope.unstack();
+    then_scope.unstack();
 }
 
 fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -1715,6 +1800,39 @@ test "bool literal and comparisons" {
         \\%10 = int(6)
         \\%11 = cmp_neq(%9, %10) node_offset:1:3 to :1:27
         \\%12 = bool_not(%11) node_offset:1:1 to :1:28
+        \\
+    );
+}
+
+test "if lowers to block + condbr with breaking bodies" {
+    // Each branch is a block expression, so it carries its own inner Dir
+    // block; the branch body ends with a break to the if's block (%1).
+    try expect("if true { 1 } else { 2 }",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:25
+        \\%2 = condbr(bool_true, then={%3, %6}, else={%7, %10}) node_offset:1:1 to :1:25
+        \\%3 = block(%4, %5) node_offset:1:9 to :1:14
+        \\%4 = int(1)
+        \\%5 = break(%3, %4)
+        \\%6 = break(%1, %3)
+        \\%7 = block(%8, %9) node_offset:1:20 to :1:25
+        \\%8 = int(2)
+        \\%9 = break(%7, %8)
+        \\%10 = break(%1, %7)
+        \\
+    );
+
+    // Else-less: the implicit else body is a lone void break — Sema's branch
+    // unification then enforces then-must-be-void.
+    try expect("if true { 1 }",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:14
+        \\%2 = condbr(bool_true, then={%3, %6}, else={%7}) node_offset:1:1 to :1:14
+        \\%3 = block(%4, %5) node_offset:1:9 to :1:14
+        \\%4 = int(1)
+        \\%5 = break(%3, %4)
+        \\%6 = break(%1, %3)
+        \\%7 = break(%1, void_value)
         \\
     );
 }

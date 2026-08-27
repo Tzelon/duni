@@ -70,6 +70,22 @@ pub const Inst = struct {
         ///
         /// See `unwrapCall` for a way to load this tag's data.
         call,
+
+        /// A structured block whose value arrives via `br` instructions to
+        /// its merge point (a runtime `if` produces one; its body terminator
+        /// is a `cond_br`). Uses the `ty_pl` field: the type is the block's
+        /// result type, the payload is a `Block` with the trailing body.
+        block,
+
+        /// Conditional branch: terminates a `block`'s body. Each trailing
+        /// body ends with a `br` to the enclosing block. Produces no value.
+        /// Uses the `pl_op` field: operand is the Bool condition, payload is
+        /// a `CondBr` with the two trailing bodies.
+        cond_br,
+
+        /// A value-carrying jump to a `block`'s merge point. Produces no
+        /// value. Uses the `br` field.
+        br,
     };
 
     /// The position of an AIR instruction within the `Air` instructions array.
@@ -186,6 +202,16 @@ pub const Inst = struct {
             operand: Ref,
             payload: u32,
         },
+
+        ty_pl: struct {
+            ty: Type,
+            payload: u32,
+        },
+
+        br: struct {
+            block_inst: Index,
+            operand: Ref,
+        },
     };
 };
 
@@ -193,6 +219,30 @@ pub const Inst = struct {
 pub const Call = struct {
     args_len: u32,
 };
+
+/// Trailing is a list of `Inst.Index` for every `body_len`.
+pub const Block = struct {
+    body_len: u32,
+};
+
+/// Trailing: `then_body_len` instruction indices, then `else_body_len`.
+pub const CondBr = struct {
+    then_body_len: u32,
+    else_body_len: u32,
+};
+
+/// Reserved indexes at the start of `extra`.
+pub const ExtraIndex = enum(u32) {
+    /// The payload index of the outermost body's `Block`. Written by Sema at
+    /// the end of analysis; codegen starts its walk here.
+    main_body,
+};
+
+pub fn getMainBody(air: *const Air) []const Inst.Index {
+    const payload_index = air.extra.items[@intFromEnum(ExtraIndex.main_body)];
+    const body_len = air.extra.items[payload_index];
+    return @ptrCast(air.extra.items[payload_index + 1 ..][0..body_len]);
+}
 
 pub fn internedToRef(ip_index: InternPool.Index) Inst.Ref {
     return .fromInterned(ip_index);
@@ -211,7 +261,12 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
     switch (air.instructions.items(.tag)[@intFromEnum(inst)]) {
         .arg => return datas[@intFromEnum(inst)].arg.ty,
 
+        .block => return datas[@intFromEnum(inst)].ty_pl.ty,
+
+        // Terminators produce no value.
         .ret,
+        .cond_br,
+        .br,
         => unreachable,
 
         // Both operands were coerced to one numeric type by Sema, so the

@@ -283,7 +283,7 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .bang => comptime ParseRule.init(Parse.unary, null, .prec_none),
         .keyword_true => comptime ParseRule.init(Parse.boolLiteral, null, .prec_none),
         .keyword_false => comptime ParseRule.init(Parse.boolLiteral, null, .prec_none),
-        .keyword_if => comptime ParseRule.init(null, null, .prec_none),
+        .keyword_if => comptime ParseRule.init(Parse.ifExpr, null, .prec_none),
         .keyword_else => comptime ParseRule.init(null, null, .prec_none),
         .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
         .number_literal => comptime ParseRule.init(Parse.number, null, .prec_none),
@@ -423,6 +423,45 @@ fn block(p: *Parse) !Node.Index {
                 .rbrace = r_brace,
             }),
         },
+    });
+}
+
+/// `if cond { a } else { b }` — if-as-expression with block branches and no
+/// parens around the condition (grammar.y `ifExpr`). The condition parse
+/// stops at `{` naturally: `l_brace` has no infix rule. `else` is optional;
+/// its branch is a block or another `if` (else-if chains). The `else` must
+/// follow the then-block's `}` on the same line — a newline in between ends
+/// the statement.
+fn ifExpr(p: *Parse) !Node.Index {
+    const if_token = p.advance();
+    const cond = try p.expression();
+
+    if (!p.check(.l_brace)) return p.failExpected(.l_brace);
+    const then_expr = try p.block();
+
+    if (!p.check(.keyword_else)) {
+        return p.addNode(.{
+            .tag = .if_simple,
+            .main_token = if_token,
+            .data = .{ .node_and_node = .{ cond, then_expr } },
+        });
+    }
+    _ = p.advance(); // `else`
+
+    const else_expr = if (p.check(.keyword_if))
+        try p.ifExpr()
+    else if (p.check(.l_brace))
+        try p.block()
+    else
+        return p.failExpected(.l_brace);
+
+    return p.addNode(.{
+        .tag = .if_else,
+        .main_token = if_token,
+        .data = .{ .node_and_extra = .{
+            cond,
+            try p.addExtra(Node.If{ .then_expr = then_expr, .else_expr = else_expr }),
+        } },
     });
 }
 

@@ -126,6 +126,25 @@ pub const Tag = enum {
     ///
     /// The `main_token` field is the `(` token.
     grouped_expression,
+
+    /// `if cond { then }` — no `else`; the whole expression types as void.
+    ///
+    /// The `data` field is a `.node_and_node`:
+    ///   1. a `Node.Index` to the condition expression.
+    ///   2. a `Node.Index` to the then block.
+    ///
+    /// The `main_token` field is the `if` token.
+    if_simple,
+
+    /// `if cond { then } else { els }` — the else branch may also be
+    /// another `if` (else-if chains).
+    ///
+    /// The `data` field is a `.node_and_extra`:
+    ///   1. a `Node.Index` to the condition expression.
+    ///   2. a `ExtraIndex` to an `If`.
+    ///
+    /// The `main_token` field is the `if` token.
+    if_else,
 };
 
 pub const Data = union {
@@ -224,4 +243,9 @@ pub const Block = struct {
     expressions_end: ExtraIndex,
     /// Needed to make lastToken() work.
     rbrace: TokenIndex,
+};
+
+pub const If = struct {
+    then_expr: Index,
+    else_expr: Index,
 };

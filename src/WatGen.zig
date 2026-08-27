@@ -38,6 +38,11 @@ locals: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, u32) = .empty,
 /// declares, in slot order (parameters not included — wasm gives them their
 /// slots implicitly). Not all locals are f64 anymore: a Bool lives in an i32.
 declared_local_types: std.ArrayList([]const u8) = .empty,
+/// Where each Air `block` sits in the wasm label stack (its depth at entry).
+/// A `br` targets it by relative depth: `current depth - 1 - entry depth`.
+block_depths: std.AutoHashMapUnmanaged(Air.Inst.Index, u32) = .empty,
+/// How many wasm labels (`block` / `if`) are currently open.
+depth: u32 = 0,
 
 pub fn emit(gpa: Allocator, result: *const Sema.Result, ip: *const InternPool, out: *std.Io.Writer) !void {
     var gen = WatGen{ .gpa = gpa, .ip = ip, .out = out, .air = &result.main };
@@ -45,6 +50,7 @@ pub fn emit(gpa: Allocator, result: *const Sema.Result, ip: *const InternPool, o
     defer gen.func_names.deinit(gpa);
     defer gen.locals.deinit(gpa);
     defer gen.declared_local_types.deinit(gpa);
+    defer gen.block_depths.deinit(gpa);
 
     for (result.funcs) |func| try gen.func_names.put(gpa, func.val, func.name);
 
@@ -77,10 +83,13 @@ fn collectStrings(gen: *WatGen, air: *const Air, offset: *u32) !void {
         // A call's arguments may be string constants; the callee is a
         // function, never a string.
         .call => for (callArgs(air, data)) |arg| try gen.collectStringRef(arg, offset),
+        // A br carries a branch's value to its block's merge point — it may
+        // be a string constant (`if c { "a" } else { "b" }`).
+        .br => try gen.collectStringRef(data.br.operand, offset),
         // Arithmetic/comparison operands are numbers (and `not`'s a Bool) —
         // Sema coerces before emitting; none can be a string constant.
         .add, .sub, .mul, .div, .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .not => {},
-        .arg => {},
+        .arg, .block, .cond_br => {},
     };
 }
 
@@ -105,6 +114,12 @@ fn collectLocals(gen: *WatGen, params_len: u32) !void {
             .call => if (gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type) {
                 try gen.addLocal(inst, params_len, wasmType(gen.air.typeOfIndex(inst, gen.ip).toIntern()));
             },
+            // A block's merge value lives in a local, set by each br before
+            // it jumps; a void block carries no value.
+            .block => if (gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type) {
+                try gen.addLocal(inst, params_len, wasmType(gen.air.typeOfIndex(inst, gen.ip).toIntern()));
+            },
+            .cond_br, .br => {},
         }
     }
 }
@@ -224,6 +239,8 @@ fn writeEscapedBytes(gen: *WatGen, bytes: []const u8) !void {
 
 fn writeFunc(gen: *WatGen, name: []const u8, param_types: []const InternPool.Index, air: *const Air) !void {
     gen.air = air;
+    gen.block_depths.clearRetainingCapacity();
+    gen.depth = 0;
     try gen.collectLocals(@intCast(param_types.len));
 
     try gen.writeIndent();
@@ -244,7 +261,7 @@ fn writeFunc(gen: *WatGen, name: []const u8, param_types: []const InternPool.Ind
         }
         try gen.out.writeAll(")\n");
     }
-    try gen.writeBody();
+    try gen.writeBody(air.getMainBody());
     gen.indent -= 1;
     try gen.writeIndent();
     try gen.out.writeAll(")\n");
@@ -261,10 +278,15 @@ fn resultType(gen: *const WatGen) InternPool.Index {
     return gen.air.typeOf(ret_ref, gen.ip).toIntern();
 }
 
-fn writeBody(gen: *WatGen) !void {
+/// Emit one body's instructions, in body order. Structured instructions
+/// (`block`, `cond_br`) recurse into their trailing bodies.
+fn writeBody(gen: *WatGen, body: []const Air.Inst.Index) error{ WriteFailed, OutOfMemory }!void {
     const tags = gen.air.instructions.items(.tag);
     const datas = gen.air.instructions.items(.data);
-    for (tags, datas, 0..) |tag, data, i| try gen.writeInst(tag, data, @enumFromInt(i));
+    for (body) |inst| {
+        const i = @intFromEnum(inst);
+        try gen.writeInst(tags[i], datas[i], inst);
+    }
 }
 
 fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Inst.Index) !void {
@@ -321,6 +343,60 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Ins
             try gen.writeIndent();
             try gen.out.writeAll("i32.eqz\n");
             try gen.writeLocalSet(inst);
+        },
+        // A structured block: its merge value lives in its local, stored by
+        // each br before jumping, so the wasm block itself carries no result
+        // type. Its body terminates with a cond_br whose branches both br
+        // out — nothing falls through to `end`.
+        .block => {
+            try gen.block_depths.put(gen.gpa, inst, gen.depth);
+            try gen.writeIndent();
+            try gen.out.writeAll("block\n");
+            gen.depth += 1;
+            gen.indent += 1;
+            const extra = gen.air.extra.items;
+            const body_len = extra[data.ty_pl.payload];
+            try gen.writeBody(@ptrCast(extra[data.ty_pl.payload + 1 ..][0..body_len]));
+            gen.depth -= 1;
+            gen.indent -= 1;
+            try gen.writeIndent();
+            try gen.out.writeAll("end\n");
+        },
+        // The condition is an i32 Bool; wasm `if` consumes it. The `if`
+        // opens a label of its own, so brs inside count it.
+        .cond_br => {
+            try gen.writeRef(data.pl_op.operand);
+            try gen.writeIndent();
+            try gen.out.writeAll("if\n");
+            gen.depth += 1;
+            gen.indent += 1;
+            const extra = gen.air.extra.items;
+            const then_body_len = extra[data.pl_op.payload];
+            const else_body_len = extra[data.pl_op.payload + 1];
+            const bodies_start = data.pl_op.payload + 2;
+            try gen.writeBody(@ptrCast(extra[bodies_start..][0..then_body_len]));
+            gen.indent -= 1;
+            try gen.writeIndent();
+            try gen.out.writeAll("else\n");
+            gen.indent += 1;
+            try gen.writeBody(@ptrCast(extra[bodies_start + then_body_len ..][0..else_body_len]));
+            gen.depth -= 1;
+            gen.indent -= 1;
+            try gen.writeIndent();
+            try gen.out.writeAll("end\n");
+        },
+        // Store the carried value in the target block's local (unless the
+        // block is void and has none), then jump to its `end` by relative
+        // label depth.
+        .br => {
+            const target = data.br.block_inst;
+            if (gen.locals.get(target)) |local| {
+                try gen.writeRef(data.br.operand);
+                try gen.writeIndent();
+                try gen.out.print("local.set {d}\n", .{local});
+            }
+            try gen.writeIndent();
+            try gen.out.print("br {d}\n", .{gen.depth - 1 - gen.block_depths.get(target).?});
         },
     }
 }
@@ -387,6 +463,16 @@ fn writeIndent(gen: *WatGen) !void {
     for (0..gen.indent) |_| try gen.out.writeAll("  ");
 }
 
+/// Append the main body to a hand-built test Air's extra and point the
+/// reserved `extra[0]` slot at it — what `Sema.setMainBody` does. The tests
+/// must have appended the `0` placeholder as their first extra item.
+fn setTestMainBody(gpa: Allocator, extra: *std.ArrayList(u32), body: []const u32) !void {
+    const payload: u32 = @intCast(extra.items.len);
+    try extra.append(gpa, @intCast(body.len));
+    try extra.appendSlice(gpa, body);
+    extra.items[@intFromEnum(Air.ExtraIndex.main_body)] = payload;
+}
+
 fn expectWat(value: InternPool.Key, expected: []const u8) !void {
     const gpa = std.testing.allocator;
 
@@ -402,7 +488,10 @@ fn expectWatIndex(ip: *InternPool, ip_index: InternPool.Index, expected: []const
 
     var insts: std.MultiArrayList(Air.Inst) = .{};
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .fromInterned(ip_index) } });
-    var air = Air{ .instructions = insts.toOwnedSlice(), .extra = .empty };
+    var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
+    try setTestMainBody(gpa, &extra, &.{0});
+    var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
     defer air.deinit(gpa);
 
     var buf: [512]u8 = undefined;
@@ -486,14 +575,16 @@ test "emit call to extern" {
     var insts: std.MultiArrayList(Air.Inst) = .{};
     try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = .fromInterned(print_ext),
-        .payload = 0,
+        .payload = 1,
     } } });
     const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = call_ref } });
 
     var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
     try extra.append(gpa, 1); // Air.Call.args_len
     try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(arg)));
+    try setTestMainBody(gpa, &extra, &.{ 0, 1 });
 
     var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
     defer air.deinit(gpa);
@@ -548,22 +639,24 @@ test "emit call with a runtime argument after a comptime one" {
     var insts: std.MultiArrayList(Air.Inst) = .{};
     try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = .fromInterned(print_ext),
-        .payload = 0,
+        .payload = 1,
     } } });
     try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = .fromInterned(sub_ext),
-        .payload = 2,
+        .payload = 3,
     } } });
     const inner_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
     const outer_ref = (@as(Air.Inst.Index, @enumFromInt(1))).toRef();
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = outer_ref } });
 
     var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
     try extra.append(gpa, 1); // print call: args_len
     try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(three)));
     try extra.append(gpa, 2); // sub call: args_len
     try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(ten)));
     try extra.append(gpa, @intFromEnum(inner_ref));
+    try setTestMainBody(gpa, &extra, &.{ 0, 1, 2 });
 
     var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
     defer air.deinit(gpa);
@@ -615,7 +708,7 @@ test "emit runtime arithmetic" {
     var insts: std.MultiArrayList(Air.Inst) = .{};
     try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = .fromInterned(print_ext),
-        .payload = 0,
+        .payload = 1,
     } } });
     const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
     try insts.append(gpa, .{ .tag = .add, .data = .{ .bin_op = .{
@@ -626,8 +719,10 @@ test "emit runtime arithmetic" {
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = add_ref } });
 
     var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
     try extra.append(gpa, 1); // print call: args_len
     try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(one)));
+    try setTestMainBody(gpa, &extra, &.{ 0, 1, 2 });
 
     var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
     defer air.deinit(gpa);
@@ -679,20 +774,25 @@ test "emit defined function and a call to it" {
     try fn_insts.append(gpa, .{ .tag = .add, .data = .{ .bin_op = .{ .lhs = arg_ref, .rhs = .fromInterned(one) } } });
     const add_ref = (@as(Air.Inst.Index, @enumFromInt(1))).toRef();
     try fn_insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = add_ref } });
-    var fn_air = Air{ .instructions = fn_insts.toOwnedSlice(), .extra = .empty };
+    var fn_extra: std.ArrayList(u32) = .empty;
+    try fn_extra.append(gpa, 0); // reserve the main-body slot
+    try setTestMainBody(gpa, &fn_extra, &.{ 0, 1, 2 });
+    var fn_air = Air{ .instructions = fn_insts.toOwnedSlice(), .extra = fn_extra };
     defer fn_air.deinit(gpa);
 
     // main's AIR:  %0 = call add(2);  ret %0
     var main_insts: std.MultiArrayList(Air.Inst) = .{};
     try main_insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = .fromInterned(add_val),
-        .payload = 0,
+        .payload = 1,
     } } });
     const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
     try main_insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = call_ref } });
     var main_extra: std.ArrayList(u32) = .empty;
+    try main_extra.append(gpa, 0); // reserve the main-body slot
     try main_extra.append(gpa, 1); // Air.Call.args_len
     try main_extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(two)));
+    try setTestMainBody(gpa, &main_extra, &.{ 0, 1 });
     var main_air = Air{ .instructions = main_insts.toOwnedSlice(), .extra = main_extra };
     defer main_air.deinit(gpa);
 
@@ -753,7 +853,7 @@ test "emit runtime comparison with mixed local types" {
     var insts: std.MultiArrayList(Air.Inst) = .{};
     try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
         .operand = .fromInterned(print_ext),
-        .payload = 0,
+        .payload = 1,
     } } });
     const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
     try insts.append(gpa, .{ .tag = .cmp_lt, .data = .{ .bin_op = .{
@@ -764,8 +864,10 @@ test "emit runtime comparison with mixed local types" {
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = cmp_ref } });
 
     var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
     try extra.append(gpa, 1); // print call: args_len
     try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(one)));
+    try setTestMainBody(gpa, &extra, &.{ 0, 1, 2 });
 
     var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
     defer air.deinit(gpa);
@@ -786,6 +888,95 @@ test "emit runtime comparison with mixed local types" {
         \\    f64.const 2
         \\    f64.lt
         \\    local.set 1
+        \\    local.get 1
+        \\    return
+        \\  )
+        \\  (export "main" (func $main))
+        \\)
+        \\
+    , w.buffer[0..w.end]);
+}
+
+test "emit runtime if as block/if/else with br to the merge local" {
+    // if flag() { 1 } else { 2 }: the block's merge value is local 1 (f64),
+    // each branch stores it and brs out past the wasm `if` label (br 1).
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const flag_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .bool_type });
+    const flag_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "flag"),
+        .ty = flag_ty,
+        .lib_name = .none,
+    } });
+    const one = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 1 } } });
+    const two = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 2 } } });
+
+    // AIR:  %1 = block(f64, { %0 = call flag(); %2 = cond_br(%0, {%3 = br(%1, 1)},
+    //       {%4 = br(%1, 2)}) });  %5 = ret %1
+    var insts: std.MultiArrayList(Air.Inst) = .{};
+    try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = .fromInterned(flag_ext),
+        .payload = 1,
+    } } });
+    const call_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
+    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{
+        .ty = .fromInterned(.f64_type),
+        .payload = 6,
+    } } });
+    const block_ref = (@as(Air.Inst.Index, @enumFromInt(1))).toRef();
+    try insts.append(gpa, .{ .tag = .cond_br, .data = .{ .pl_op = .{
+        .operand = call_ref,
+        .payload = 2,
+    } } });
+    try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{
+        .block_inst = @enumFromInt(1),
+        .operand = .fromInterned(one),
+    } } });
+    try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{
+        .block_inst = @enumFromInt(1),
+        .operand = .fromInterned(two),
+    } } });
+    try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = block_ref } });
+
+    var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
+    try extra.append(gpa, 0); // flag call: args_len
+    // cond_br payload at 2: then_len=1, else_len=1, then={%3}, else={%4}
+    try extra.appendSlice(gpa, &.{ 1, 1, 3, 4 });
+    // block payload at 6: body_len=2, body={%0, %2}
+    try extra.appendSlice(gpa, &.{ 2, 0, 2 });
+    try setTestMainBody(gpa, &extra, &.{ 1, 5 });
+
+    var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
+    defer air.deinit(gpa);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, &ip, &w);
+    try std.testing.expectEqualStrings(
+        \\(module
+        \\  (import "host" "flag" (func $flag (result i32)))
+        \\  (func $main (result f64)
+        \\    (local i32 f64)
+        \\    block
+        \\      call $flag
+        \\      local.set 0
+        \\      local.get 0
+        \\      if
+        \\        f64.const 1
+        \\        local.set 1
+        \\        br 1
+        \\      else
+        \\        f64.const 2
+        \\        local.set 1
+        \\        br 1
+        \\      end
+        \\    end
         \\    local.get 1
         \\    return
         \\  )

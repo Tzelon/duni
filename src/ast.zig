@@ -319,6 +319,8 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
         .block,
         .fn_decl,
         .grouped_expression,
+        .if_simple,
+        .if_else,
         => return tree.nodeMainToken(n),
 
         .fn_proto => {
@@ -393,6 +395,13 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
             }
             // No return type (recoverable error): the params `)` ends the proto.
             return tree.extraData(extra_index, Node.FnProto).rparen;
+        },
+
+        .if_simple => n = tree.nodeData(n).node_and_node[1],
+
+        .if_else => {
+            _, const extra_index = tree.nodeData(n).node_and_extra;
+            n = tree.extraData(extra_index, Node.If).else_expr;
         },
     };
 }
@@ -607,6 +616,24 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
             }
         },
 
+        // Children are the condition and the then block.
+        .if_simple => {
+            try std.testing.expectEqual(2, expected.children.len);
+            const cond, const then_expr = tree.nodeData(node).node_and_node;
+            try expectNode(tree, cond, expected.children[0]);
+            try expectNode(tree, then_expr, expected.children[1]);
+        },
+
+        // Children are the condition, the then block, and the else branch.
+        .if_else => {
+            try std.testing.expectEqual(3, expected.children.len);
+            const cond, const extra_index = tree.nodeData(node).node_and_extra;
+            const if_extra = tree.extraData(extra_index, Node.If);
+            try expectNode(tree, cond, expected.children[0]);
+            try expectNode(tree, if_extra.then_expr, expected.children[1]);
+            try expectNode(tree, if_extra.else_expr, expected.children[2]);
+        },
+
         // Children are the param types followed by the return type, if any.
         .fn_proto => {
             const extra_index, const return_type_opt = tree.nodeData(node).extra_and_opt_node;
@@ -701,6 +728,38 @@ test "comparison and logical precedence" {
         .{ .tag = .number_literal },
     } });
     try expectAst("false", .{ .tag = .bool_literal });
+}
+
+test "if expression" {
+    // Else-less: two children. The condition stops at `{` on its own.
+    try expectAst("if x > 1 { 2 }", .{ .tag = .if_simple, .children = &.{
+        .{ .tag = .greater_than, .children = &.{
+            .{ .tag = .identifier },
+            .{ .tag = .number_literal },
+        } },
+        .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+    } });
+
+    // With else, and an else-if chain: the else branch is another if.
+    try expectAst("if a { 1 } else if b { 2 } else { 3 }", .{ .tag = .if_else, .children = &.{
+        .{ .tag = .identifier },
+        .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+        .{ .tag = .if_else, .children = &.{
+            .{ .tag = .identifier },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+        } },
+    } });
+
+    // `if` is an expression: it nests inside a call argument.
+    try expectAst("f(if c { 1 } else { 2 })", .{ .tag = .call, .children = &.{
+        .{ .tag = .identifier },
+        .{ .tag = .if_else, .children = &.{
+            .{ .tag = .identifier },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+        } },
+    } });
 }
 
 test "block" {

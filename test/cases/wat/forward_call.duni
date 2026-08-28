@@ -15,12 +15,8 @@ print(first(41))
 // (module
 //   (import "host" "print" (func $print (param f64) (result f64)))
 //   (func $first (param f64) (result f64)
-//     (local f64)
 //     local.get 0
-//     call $second
-//     local.set 1
-//     local.get 1
-//     return
+//     return_call $second
 //   )
 //   (func $second (param f64) (result f64)
 //     (local f64)
@@ -32,15 +28,12 @@ print(first(41))
 //     return
 //   )
 //   (func $main (result f64)
-//     (local f64 f64)
+//     (local f64)
 //     f64.const 41
 //     call $first
 //     local.set 0
 //     local.get 0
-//     call $print
-//     local.set 1
-//     local.get 1
-//     return
+//     return_call $print
 //   )
 //   (export "main" (func $main))
 // )

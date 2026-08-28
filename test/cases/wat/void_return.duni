@@ -8,8 +8,7 @@ log(1)
 //   (import "host" "log" (func $log (param f64)))
 //   (func $main
 //     f64.const 1
-//     call $log
-//     return
+//     return_call $log
 //   )
 //   (export "main" (func $main))
 // )

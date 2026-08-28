@@ -1,0 +1,20 @@
+extern fn print(x number) number
+
+fn count_down(n number) number {
+if n <= 0 { n } else { count_down(n - 1) }
+}
+
+fn is_even(n number) Bool {
+if n == 0 { true } else { is_odd(n - 1) }
+}
+
+fn is_odd(n number) Bool {
+if n == 0 { false } else { is_even(n - 1) }
+}
+
+print(count_down(1000000))
+print(if is_even(1000001) { 1 } else { 0 })
+
+// run
+// expect_stdout=0
+// expect_stdout=0

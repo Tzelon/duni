@@ -11,7 +11,12 @@
   structured `block`/`cond_br`/`br` with per-body instruction collection
   (`Sema.Block`), one merge point per block. Early `return`/`break`/
   `continue` build on that machinery when they arrive; `match`
-  compilation and `return_call` plug into the same substrate.
+  compilation plugs into the same substrate.
+- **Tail calls — landed** (`notes/tail_calls.md`): every call in tail
+  position emits `return_call`; unbounded loops-as-recursion work
+  (run/tail_loop drives 1M iterations, self and mutual). The harness
+  passes `wat2wasm --enable-tail-call`; wasm tail calls are a minimum
+  engine requirement of the language.
 
 ## Error reporting — phase 1
 

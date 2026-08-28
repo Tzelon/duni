@@ -43,6 +43,10 @@ declared_local_types: std.ArrayList([]const u8) = .empty,
 block_depths: std.AutoHashMapUnmanaged(Air.Inst.Index, u32) = .empty,
 /// How many wasm labels (`block` / `if`) are currently open.
 depth: u32 = 0,
+/// Calls in tail position (notes/tail_calls.md): emitted as `return_call`
+/// with no result local — the call never returns to this function, so the
+/// `br`/`ret` that would have consumed its value emits nothing.
+tail_calls: std.AutoHashMapUnmanaged(Air.Inst.Index, void) = .empty,
 
 pub fn emit(gpa: Allocator, result: *const Sema.Result, ip: *const InternPool, out: *std.Io.Writer) !void {
     var gen = WatGen{ .gpa = gpa, .ip = ip, .out = out, .air = &result.main };
@@ -51,6 +55,7 @@ pub fn emit(gpa: Allocator, result: *const Sema.Result, ip: *const InternPool, o
     defer gen.locals.deinit(gpa);
     defer gen.declared_local_types.deinit(gpa);
     defer gen.block_depths.deinit(gpa);
+    defer gen.tail_calls.deinit(gpa);
 
     for (result.funcs) |func| try gen.func_names.put(gpa, func.val, func.name);
 
@@ -111,7 +116,10 @@ fn collectLocals(gen: *WatGen, params_len: u32) !void {
             .add, .sub, .mul, .div => try gen.addLocal(inst, params_len, "f64"),
             // Comparison results are Bool: i32 at runtime.
             .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .not => try gen.addLocal(inst, params_len, "i32"),
-            .call => if (gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type) {
+            // A tail call never returns here, so it has no result local.
+            .call => if (!gen.tail_calls.contains(inst) and
+                gen.air.typeOfIndex(inst, gen.ip).toIntern() != .void_type)
+            {
                 try gen.addLocal(inst, params_len, wasmType(gen.air.typeOfIndex(inst, gen.ip).toIntern()));
             },
             // A block's merge value lives in a local, set by each br before
@@ -122,6 +130,51 @@ fn collectLocals(gen: *WatGen, params_len: u32) !void {
             .cond_br, .br => {},
         }
     }
+}
+
+/// Mark every call in tail position (notes/tail_calls.md): the final
+/// `ret`'s operand is in tail position, and a `br` to a tail-position block
+/// puts its own operand in tail position — so the property propagates into
+/// every branch of an `if`/`else` chain whose value is returned.
+fn collectTailCalls(gen: *WatGen) !void {
+    gen.tail_calls.clearRetainingCapacity();
+    var tail_blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, void) = .empty;
+    defer tail_blocks.deinit(gen.gpa);
+
+    const tags = gen.air.instructions.items(.tag);
+    const datas = gen.air.instructions.items(.data);
+    // Sema always appends the function's `ret` last.
+    const last = gen.air.instructions.len - 1;
+    std.debug.assert(tags[last] == .ret);
+
+    _ = try gen.markTailRef(&tail_blocks, datas[last].un_op);
+
+    // Brs targeting a tail block are found by linear scan (the Air has no
+    // back-references); iterate to a fixpoint since a marked block's brs
+    // can mark nested blocks.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (tags, datas) |tag, data| {
+            if (tag != .br) continue;
+            if (!tail_blocks.contains(data.br.block_inst)) continue;
+            if (try gen.markTailRef(&tail_blocks, data.br.operand)) changed = true;
+        }
+    }
+}
+
+/// Returns true if the ref was newly marked (a call or a block).
+fn markTailRef(
+    gen: *WatGen,
+    tail_blocks: *std.AutoHashMapUnmanaged(Air.Inst.Index, void),
+    ref: Air.Inst.Ref,
+) !bool {
+    const inst = ref.toIndex() orelse return false;
+    return switch (gen.air.instructions.items(.tag)[@intFromEnum(inst)]) {
+        .call => (try gen.tail_calls.fetchPut(gen.gpa, inst, {})) == null,
+        .block => (try tail_blocks.fetchPut(gen.gpa, inst, {})) == null,
+        else => false,
+    };
 }
 
 fn addLocal(gen: *WatGen, inst: Air.Inst.Index, params_len: u32, wasm_ty: []const u8) !void {
@@ -241,6 +294,8 @@ fn writeFunc(gen: *WatGen, name: []const u8, param_types: []const InternPool.Ind
     gen.air = air;
     gen.block_depths.clearRetainingCapacity();
     gen.depth = 0;
+    // Tail calls first: `collectLocals` gives them no result local.
+    try gen.collectTailCalls();
     try gen.collectLocals(@intCast(param_types.len));
 
     try gen.writeIndent();
@@ -292,13 +347,19 @@ fn writeBody(gen: *WatGen, body: []const Air.Inst.Index) error{ WriteFailed, Out
 fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Inst.Index) !void {
     switch (tag) {
         .ret => {
+            // A tail call already left the function — nothing to return.
+            if (data.un_op.toIndex()) |op| {
+                if (gen.tail_calls.contains(op)) return;
+            }
             try gen.writeRef(data.un_op);
             try gen.writeIndent();
             try gen.out.writeAll("return\n");
         },
         .call => {
             // Push each argument, then call the target by name — an extern's
-            // import name, or a defined function's declared name.
+            // import name, or a defined function's declared name. A tail
+            // call exits the function instead of storing a result
+            // (notes/tail_calls.md).
             for (callArgs(gen.air, data)) |arg| try gen.writeRef(arg);
             const name = switch (gen.ip.indexToKey(data.pl_op.operand.toInterned().?)) {
                 .@"extern" => |ext| ext.name,
@@ -306,6 +367,10 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Ins
                 else => unreachable,
             };
             try gen.writeIndent();
+            if (gen.tail_calls.contains(inst)) {
+                try gen.out.print("return_call ${s}\n", .{name.toSlice(gen.ip)});
+                return;
+            }
             try gen.out.print("call ${s}\n", .{name.toSlice(gen.ip)});
             try gen.writeLocalSet(inst);
         },
@@ -389,6 +454,11 @@ fn writeInst(gen: *WatGen, tag: Air.Inst.Tag, data: Air.Inst.Data, inst: Air.Ins
         // block is void and has none), then jump to its `end` by relative
         // label depth.
         .br => {
+            // A tail-call operand already left the function — the br is
+            // unreachable and emits nothing.
+            if (data.br.operand.toIndex()) |op| {
+                if (gen.tail_calls.contains(op)) return;
+            }
             const target = data.br.block_inst;
             if (gen.locals.get(target)) |local| {
                 try gen.writeRef(data.br.operand);
@@ -593,16 +663,14 @@ test "emit call to extern" {
     var w = std.Io.Writer.fixed(&buf);
     const result = Sema.Result{ .funcs = &.{}, .main = air };
     try WatGen.emit(gpa, &result, &ip, &w);
+    // The call is the ret's operand — tail position — so it becomes a
+    // `return_call` with no result local and no store/return tail.
     try std.testing.expectEqualStrings(
         \\(module
         \\  (import "host" "print" (func $print (param f64) (result f64)))
         \\  (func $main (result f64)
-        \\    (local f64)
         \\    f64.const 42
-        \\    call $print
-        \\    local.set 0
-        \\    local.get 0
-        \\    return
+        \\    return_call $print
         \\  )
         \\  (export "main" (func $main))
         \\)
@@ -665,21 +733,21 @@ test "emit call with a runtime argument after a comptime one" {
     var w = std.Io.Writer.fixed(&buf);
     const result = Sema.Result{ .funcs = &.{}, .main = air };
     try WatGen.emit(gpa, &result, &ip, &w);
+    // The inner print call feeds sub's argument list — not a tail position —
+    // so it keeps its local; the outer sub call is the ret's operand and
+    // tail-calls.
     try std.testing.expectEqualStrings(
         \\(module
         \\  (import "host" "print" (func $print (param f64) (result f64)))
         \\  (import "host" "sub" (func $sub (param f64) (param f64) (result f64)))
         \\  (func $main (result f64)
-        \\    (local f64 f64)
+        \\    (local f64)
         \\    f64.const 3
         \\    call $print
         \\    local.set 0
         \\    f64.const 10
         \\    local.get 0
-        \\    call $sub
-        \\    local.set 1
-        \\    local.get 1
-        \\    return
+        \\    return_call $sub
         \\  )
         \\  (export "main" (func $main))
         \\)
@@ -806,6 +874,7 @@ test "emit defined function and a call to it" {
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try WatGen.emit(gpa, &result, &ip, &w);
+    // main's call to add is its ret operand — a tail call.
     try std.testing.expectEqualStrings(
         \\(module
         \\  (func $add (param f64) (result f64)
@@ -818,12 +887,8 @@ test "emit defined function and a call to it" {
         \\    return
         \\  )
         \\  (func $main (result f64)
-        \\    (local f64)
         \\    f64.const 2
-        \\    call $add
-        \\    local.set 0
-        \\    local.get 0
-        \\    return
+        \\    return_call $add
         \\  )
         \\  (export "main" (func $main))
         \\)
@@ -971,6 +1036,111 @@ test "emit runtime if as block/if/else with br to the merge local" {
         \\        f64.const 1
         \\        local.set 1
         \\        br 1
+        \\      else
+        \\        f64.const 2
+        \\        local.set 1
+        \\        br 1
+        \\      end
+        \\    end
+        \\    local.get 1
+        \\    return
+        \\  )
+        \\  (export "main" (func $main))
+        \\)
+        \\
+    , w.buffer[0..w.end]);
+}
+
+test "emit tail call in branch position" {
+    // if flag() { print(9) } else { 2 }: tail position propagates through
+    // the block's merge into each br's operand — the then branch's call
+    // becomes a `return_call` and its br disappears; the else branch still
+    // merges normally into the block's local.
+    const gpa = std.testing.allocator;
+
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const flag_ty = try ip.getFuncType(gpa, .{ .param_types = &.{}, .return_type = .bool_type });
+    const flag_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "flag"),
+        .ty = flag_ty,
+        .lib_name = .none,
+    } });
+    const print_ty = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+    const print_ext = try ip.get(gpa, .{ .@"extern" = .{
+        .name = try ip.getString(gpa, "print"),
+        .ty = print_ty,
+        .lib_name = .none,
+    } });
+    const nine = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 9 } } });
+    const two = try ip.get(gpa, .{ .float = .{ .ty = .f64_type, .storage = .{ .f64 = 2 } } });
+
+    // AIR:  %1 = block(f64, { %0 = call flag(); %2 = cond_br(%0,
+    //       { %3 = call print(9); %4 = br(%1, %3) }, { %5 = br(%1, 2) }) });
+    //       %6 = ret %1
+    var insts: std.MultiArrayList(Air.Inst) = .{};
+    try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = .fromInterned(flag_ext),
+        .payload = 1,
+    } } });
+    const flag_ref = (@as(Air.Inst.Index, @enumFromInt(0))).toRef();
+    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{
+        .ty = .fromInterned(.f64_type),
+        .payload = 9,
+    } } });
+    const block_ref = (@as(Air.Inst.Index, @enumFromInt(1))).toRef();
+    try insts.append(gpa, .{ .tag = .cond_br, .data = .{ .pl_op = .{
+        .operand = flag_ref,
+        .payload = 4,
+    } } });
+    try insts.append(gpa, .{ .tag = .call, .data = .{ .pl_op = .{
+        .operand = .fromInterned(print_ext),
+        .payload = 2,
+    } } });
+    const print_ref = (@as(Air.Inst.Index, @enumFromInt(3))).toRef();
+    try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{
+        .block_inst = @enumFromInt(1),
+        .operand = print_ref,
+    } } });
+    try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{
+        .block_inst = @enumFromInt(1),
+        .operand = .fromInterned(two),
+    } } });
+    try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = block_ref } });
+
+    var extra: std.ArrayList(u32) = .empty;
+    try extra.append(gpa, 0); // reserve the main-body slot
+    try extra.append(gpa, 0); // flag call: args_len
+    try extra.append(gpa, 1); // print call: args_len
+    try extra.append(gpa, @intFromEnum(Air.Inst.Ref.fromInterned(nine)));
+    // cond_br payload at 4: then_len=2, else_len=1, then={%3, %4}, else={%5}
+    try extra.appendSlice(gpa, &.{ 2, 1, 3, 4, 5 });
+    // block payload at 9: body_len=2, body={%0, %2}
+    try extra.appendSlice(gpa, &.{ 2, 0, 2 });
+    try setTestMainBody(gpa, &extra, &.{ 1, 6 });
+
+    var air = Air{ .instructions = insts.toOwnedSlice(), .extra = extra };
+    defer air.deinit(gpa);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const result = Sema.Result{ .funcs = &.{}, .main = air };
+    try WatGen.emit(gpa, &result, &ip, &w);
+    try std.testing.expectEqualStrings(
+        \\(module
+        \\  (import "host" "flag" (func $flag (result i32)))
+        \\  (import "host" "print" (func $print (param f64) (result f64)))
+        \\  (func $main (result f64)
+        \\    (local i32 f64)
+        \\    block
+        \\      call $flag
+        \\      local.set 0
+        \\      local.get 0
+        \\      if
+        \\        f64.const 9
+        \\        return_call $print
         \\      else
         \\        f64.const 2
         \\        local.set 1

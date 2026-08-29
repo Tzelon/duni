@@ -6,9 +6,15 @@ Sema (semantic analysis) is the pass between AstGen and codegen. It takes
 untyped IR (DIR) and produces analyzed IR (AIR), interning every
 comptime-known value in the `InternPool`.
 
-Today Sema is **fold-only**: every value is comptime-known, every operation
-folds, and the produced AIR is a single `ret` of an interned value. Runtime
-values (and with them real AIR arithmetic instructions) don't exist yet.
+Today Sema is **fold-only for values**: every arithmetic operand must be
+comptime-known, and every arithmetic operation folds to an interned value.
+A runtime operand reaches `unreachable` in `analyzeArithmetic`
+(`src/Sema.zig:321`), which is why `test/cases/run/runtime_arithmetic.duni`
+panics rather than failing.
+
+AIR is not empty, though: calls survive analysis. `Air.Inst.Tag` has two
+variants, `ret` and `call`, so a program that calls a host import produces a
+real instruction stream, while its arguments are folded constants.
 
 ## Pipeline
 
@@ -17,7 +23,7 @@ values (and with them real AIR arithmetic instructions) don't exist yet.
     │            │              │
     ▼            ▼              ▼
   DIR  ──────► AIR  ────────► WAT
-(untyped)   (ret of interned value)
+(untyped)    (typed: ret, call)
 ```
 
 ## Structure
@@ -27,16 +33,27 @@ is **exhaustive with no `else`**, so adding a DIR tag forces a Sema decision
 at compile time. Handlers:
 
 ```
-.int      dirInt        intern .{ .u64 = value }, ty comptime_int
-.int_big  dirIntBig     slice Dir.string_bytes, unaligned-copy limbs into
-                        the arena, intern .big_int (always positive —
-                        AstGen's invariant; sign arrives as .negate)
-.float    dirFloat      intern .{ .f64 = value }, ty comptime_float
-.negate   dirNegate     float operand → arith.floatNeg (bit sign-flip,
-                        preserves -0.0 — `0 - x` would lose it);
-                        else fold `0 - x` via the `zero` static
-.add/.sub/.mul          dirArithmetic → analyzeArithmetic
-.div      dirDiv        zero-divisor check, then arith.div
+.int          dirInt         intern .{ .u64 = value }, ty comptime_int
+.int_big      dirIntBig      slice Dir.string_bytes, unaligned-copy limbs into
+                             the arena, intern .big_int (always positive —
+                             AstGen's invariant; sign arrives as .negate)
+.float        dirFloat       intern .{ .f64 = value }, ty comptime_float
+.str          dirStr         intern the string handle
+.negate       dirNegate      float operand → arith.floatNeg (bit sign-flip,
+                             preserves -0.0 — `0 - x` would lose it);
+                             else fold `0 - x` via the `zero` static
+.add .sub     dirArithmetic  → analyzeArithmetic
+.mul .div                    (`.div` carries its zero-divisor check there)
+.block        dirBlock
+.break        dirBreak
+.block_inline dirBlockInline
+.break_inline dirBreakInline
+.decl_val     dirDeclVal     lookup in the eagerly-resolved `decls` map
+.func         dirFunc
+.param        dirParam
+.call         dirCall        → analyzeCall
+.extended     unreachable    the module instruction is never inside a body
+.declaration  unreachable    declarations live in the module's decl list
 ```
 
 `Sema.arena` is scratch for analysis temporaries (big-int result limbs);
@@ -63,7 +80,7 @@ rounding), so `comptime_int → comptime_float` coercion is implicit.
 ```
 1 + 2        → comptime_int 3
 1 + 2.5      → comptime_float 3.5     (int side coerced)
-7 / 2        → comptime_int 3         (integer `/` is trunc)
+7 / 2        → comptime_float 3.5     (`/` is always IEEE division)
 7.5 / 2.5    → comptime_float 3.0     (float `/` is IEEE division)
 ```
 
@@ -82,8 +99,9 @@ location lives; the arith value-helpers assume the precondition).
 ## Errors
 
 `error.AnalysisFail` with no recorded message — error reporting is designed
-(`notes/astgen_error_reporting.md`) but not built. Every `AnalysisFail` site
-is a future call into it.
+([DP-0001](../proposals/0001-diagnostics.md)) but not built. Every
+`AnalysisFail` site is a future call into it, and several paths that should
+fail are `unreachable` instead.
 
 ## Tests
 
@@ -110,8 +128,8 @@ resolved on first reference (`ensureNavResolved`), memoized via the two-state
 `Nav`. Duni collapses all of that: AstGen already produced `module.decls` (the
 registration), and Sema resolves every decl up front. The map lives on
 `Sema` (not a `Namespace`) because one module is analyzed in one pass; the
-trigger to move it to a `Namespace`/`Nav` is multi-module (see
-`notes/deferred.md`). Zig ref: `zirDeclVal` → `lookupIdentifier` →
+trigger to move it to a `Namespace`/`Nav` is multi-module — a deliberately
+deferred decision. Zig ref: `zirDeclVal` → `lookupIdentifier` →
 `lookupInNamespace`; `analyzeNavVal` for the resolution.
 
 ## Resolving an extern's type — the inline body arms

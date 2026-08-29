@@ -1,79 +1,71 @@
-# Functions — Elixir-shaped decl, Zig-shaped lowering
+# Functions
 
-This note records the design for function declarations and calls: the syntax,
-the AST shape (and why it deviates from Zig's), and the decisions settled
-before implementation. Functions are the feature that ends the fold-only era —
-parameters are the first runtime values, so this arc eventually touches every
-stage.
+How function declarations and calls are represented and lowered. Functions are
+the feature that ends the fold-only era — parameters are the first runtime
+values, so the arc touches every stage.
 
-> **Update (2026-08-01): the AST-shape layer of this note is superseded.**
-> The open-form design below was implemented, then reversed with the general
-> move to Zig-style closed node tags (status note in `ast_structure.md`).
-> What stands today:
->
-> - `fn_decl` — `node_and_node` {proto, body block}; main_token = `fn`.
-> - `fn_proto` — main_token = `fn`; the fn name is the token at
->   `main_token + 1`, not a node. data = `extra_and_opt_node`
->   {ExtraIndex → `Node.FnProto` {params_start, params_end, rparen},
->   optional return-type node}. The params span holds the param *type
->   expression* nodes only; a param's name is the token before its type's
->   first token. The `params`/`param`/`ret` wrappers are gone.
-> - `extern fn` — a bare `fn_proto` decl (no body, no `extern_fn` node);
->   the `extern` keyword is the token before the proto's `fn` (Zig's model).
-> - `call` — `node_and_extra` {callee node, ExtraIndex → `Node.Call`
->   {args_start, args_end, rparen}}; main_token = `(`. Identifier callees
->   only for now, checked in the parser (AstGen has no error reporting yet).
-> - The closing `)`/`}` are stored in the extra structs (`rparen`/`rbrace`,
->   also `Node.Block`) so `lastToken` returns stored tokens or child answers,
->   never derived offsets or scans — required for correct spans under error
->   recovery (`{ + }` skips tokens no derivation can see).
-> - **The parser takes no InternPool** (`Ast.parse(gpa, source)`); names
->   live in tokens and are interned by AstGen (`identAsString`). The
->   macro/quote rationale in "Dynamic ops" moves to a later lowering stage
->   rather than being the AST's shape.
->
-> The Syntax, Multi-clause, Lowering plan, Extern semantics, and Staging
-> sections still stand. Stage A is done.
+## AST shape
 
-> **Update (2026-08-08): extern fn + params lowered in AstGen — Zig-faithful
-> shape, not the `extern_func`/`call` single-instruction plan the old
-> Staging predicted.** The lowering follows Zig's `fnDecl` / `fnProtoExpr` /
-> `setDeclaration` / `addFunc` / `addParam` directly:
->
-> - `rootModuleDecl` scans the container (`scanContainer` → `WipDecls` over a
->   reusable `Scratch` region on `astgen.scratch`), lowers each
->   `fn_proto`/`fn_decl` via `fnDecl`, then the implicit main body.
-> - **Extern = a body-less `fn_proto` → a function *type* only** (Zig's
->   split): `fnDecl` emits a `declaration` envelope, and `fnProtoExpr`
->   lowers each param (`addParam`, the param's type in its own
->   `break_inline`-terminated sub-body) and the return type, then `addFunc`
->   with `body_gd = null`. A non-extern body is still `unreachable`.
-> - **New DIR, mirroring ZIR:** `declaration` (envelope carrying optional
->   type/value bodies), `func` (a *type* when `body_len == 0`), `param`
->   (name + a type sub-body), and `block_inline`/`break_inline` (inline
->   bodies exited by breaking to their block). Plus a `void_type` sentinel
->   `Ref`/`Index` for "no return", a `pl_tok` data variant, and
->   `number` → `.f64_type` in `primitive_instrs`.
->
-> `extern fn print(x number) number` lowers as: a `declaration` whose
-> type-body is one `block_inline` holding the `param`, the `func`, and the
-> `break_inline` that yields the func. 21/21 AstGen tests green.
->
-> **Call lowering done (2026-08-08):** `.call` in `expr` → `callExpr`. The
-> callee is lowered via `expr` (identifier → namespace hit → `decl_val` by
-> name); each arg is lowered into its own sub-block terminated by
-> `break_inline`, the arg bodies are staged through `astgen.scratch`, and a
-> `call` Dir instruction is emitted with `Call{callee, args_len}` plus the
-> trailing arg bodies. `extern fn print(x number) number` + `print(42)`
-> lowers to the expected DIR (test "call").
->
-> **Not yet done, blocking end-to-end:** (1) `Sema.zig:86` is non-exhaustive
-> over the new tags (`block_inline`/`break_inline`/`declaration`/`param`/
-> `func`/`call`), so full `zig build test` doesn't build (AstGen tests pass
-> in isolation). (2) The `Declaration` payload has no flags word yet, so a
-> decl's name/linkage/bodies aren't decodable (print's `writeDeclaration`
-> is a stub); Zig's `Flags` (kind, linkage, has-name/-lib_name/-type_body/
-> -value_body) is the missing piece Sema needs to tell extern from normal.
+- `fn_decl` — `node_and_node` {proto, body block}; main_token = `fn`.
+- `fn_proto` — main_token = `fn`; the fn name is the token at
+  `main_token + 1`, not a node. data = `extra_and_opt_node`
+  {ExtraIndex → `Node.FnProto` {params_start, params_end, rparen},
+  optional return-type node}. The params span holds the param *type
+  expression* nodes only; a param's name is the token before its type's
+  first token. The `params`/`param`/`ret` wrappers are gone.
+- `extern fn` — a bare `fn_proto` decl (no body, no `extern_fn` node);
+  the `extern` keyword is the token before the proto's `fn` (Zig's model).
+- `call` — `node_and_extra` {callee node, ExtraIndex → `Node.Call`
+  {args_start, args_end, rparen}}; main_token = `(`. Identifier callees
+  only for now, checked in the parser (AstGen has no error reporting yet).
+- The closing `)`/`}` are stored in the extra structs (`rparen`/`rbrace`,
+  also `Node.Block`) so `lastToken` returns stored tokens or child answers,
+  never derived offsets or scans — required for correct spans under error
+  recovery (`{ + }` skips tokens no derivation can see).
+- **The parser takes no InternPool** (`Ast.parse(gpa, source)`); names
+  live in tokens and are interned by AstGen (`identAsString`). The
+  macro/quote rationale in "Dynamic ops" moves to a later lowering stage
+  rather than being the AST's shape.
+
+## Lowering
+
+`extern fn` and parameters lower in AstGen following Zig's `fnDecl` /
+`fnProtoExpr` / `setDeclaration` / `addFunc` / `addParam` directly:
+
+- `rootModuleDecl` scans the container (`scanContainer` → `WipDecls` over a
+  reusable `Scratch` region on `astgen.scratch`), lowers each
+  `fn_proto`/`fn_decl` via `fnDecl`, then the implicit main body.
+- **Extern = a body-less `fn_proto` → a function *type* only** (Zig's
+  split): `fnDecl` emits a `declaration` envelope, and `fnProtoExpr`
+  lowers each param (`addParam`, the param's type in its own
+  `break_inline`-terminated sub-body) and the return type, then `addFunc`
+  with `body_gd = null`. A non-extern body is still `unreachable`.
+- **New DIR, mirroring ZIR:** `declaration` (envelope carrying optional
+  type/value bodies), `func` (a *type* when `body_len == 0`), `param`
+  (name + a type sub-body), and `block_inline`/`break_inline` (inline
+  bodies exited by breaking to their block). Plus a `void_type` sentinel
+  `Ref`/`Index` for "no return", a `pl_tok` data variant, and
+  `number` → `.f64_type` in `primitive_instrs`.
+
+`extern fn print(x number) number` lowers as: a `declaration` whose
+type-body is one `block_inline` holding the `param`, the `func`, and the
+`break_inline` that yields the func. 21/21 AstGen tests green.
+
+**Call lowering done (2026-08-08):** `.call` in `expr` → `callExpr`. The
+callee is lowered via `expr` (identifier → namespace hit → `decl_val` by
+name); each arg is lowered into its own sub-block terminated by
+`break_inline`, the arg bodies are staged through `astgen.scratch`, and a
+`call` Dir instruction is emitted with `Call{callee, args_len}` plus the
+trailing arg bodies. `extern fn print(x number) number` + `print(42)`
+lowers to the expected DIR (test "call").
+
+**Not yet done, blocking end-to-end:** (1) `Sema.zig:86` is non-exhaustive
+over the new tags (`block_inline`/`break_inline`/`declaration`/`param`/
+`func`/`call`), so full `zig build test` doesn't build (AstGen tests pass
+in isolation). (2) The `Declaration` payload has no flags word yet, so a
+decl's name/linkage/bodies aren't decodable (print's `writeDeclaration`
+is a stub); Zig's `Flags` (kind, linkage, has-name/-lib_name/-type_body/
+-value_body) is the missing piece Sema needs to tell extern from normal.
 
 ## Syntax
 
@@ -89,6 +81,15 @@ fn add(x number, y number) number {
 - `typeExpr` is a bare identifier today (`number`, `string`).
 - Trailing comma in the param list is allowed (Zig does the same; call
   arguments will match).
+
+## Historical — the form-based AST design
+
+Everything in this section describes a design that was implemented and then
+reversed. It is kept for its reasoning, not as a description of the compiler.
+See [0006](../decisions/historical/0006-closed-node-tags-over-open-forms.md).
+
+<details>
+<summary>The form-based design and why it lost</summary>
 
 ## AST shape — mimic Elixir's `def`
 
@@ -211,7 +212,13 @@ Accepted costs: `Ast.parse` signature change (main and every parse test
 constructs/threads a pool), and the Ast is only interpretable next to its
 pool — already true of Dir and Air.
 
-## Multi-clause functions — wanted
+
+</details>
+
+## Multi-clause functions — not built
+
+> Design intent, not current behavior. Nothing below exists; when this is
+> taken up it should become a proposal.
 
 Duni will have Elixir-style multi-clause functions:
 
@@ -309,7 +316,11 @@ varargs, `noalias`, export, inferred error sets, and `pub` — the grammar has
 no visibility keyword; everything is public for now. (extern is *in* scope —
 see above; only the explicit module string is deferred.)
 
-## Staging
+## Staging — historical
+
+> The plan this feature was built against, kept for the reasoning. Stages A
+> through B½ landed; C is partial — Sema folds but does not yet emit runtime
+> arithmetic (see [Sema](./sema.md)).
 
 - **A — syntax. Done.** Scanner: `keyword_fn`, `comma`. Parser: fn decl /
   extern fn / call suffix at the Pratt `call` precedence, plus

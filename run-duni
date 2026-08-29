@@ -10,9 +10,13 @@ if [[ $# -ne 1 ]]; then
 fi
 
 src="$1"
-wat="/tmp/duni.wat"
-wasm="/tmp/duni.wasm"
+out_dir="duni-out"
+mkdir -p "$out_dir"
+wat="$out_dir/duni.wat"
+wasm="$out_dir/duni.wasm"
 
 zig build run -- "$src" 2>/dev/null >"$wat"
 wat2wasm "$wat" -o "$wasm"
-wasmtime run --invoke main "$wasm"
+# node + host.js, not wasmtime: wasmtime cannot supply the `host` import that
+# `extern fn print` needs. Same runner the test harness uses (test/cases.zig).
+node host.js "$wasm"

@@ -35,9 +35,12 @@ built at a later lowering stage instead of being the AST's native shape. That is
 the bill this record exists to make visible — see
 [0003](../0003-no-built-ins.md), which depends on macros arriving.
 
-Stale references to the form design remain in `notes/ast_structure.md` (which
-carries a superseded banner), `notes/functions.md`, and `todo.md`, where the
-bind design is still described as producing a form rather than an `assign` node.
+The full argument for the form-based design — why operators were not going to be
+Zig enum variants, and the memory trade-offs behind that — lived in
+`notes/ast_structure.md`, deleted once this record existed. Recover it from git
+history if the reasoning is ever needed again. A condensed version survives in
+[architecture/functions.md](../../architecture/functions.md) under
+"Historical — the form-based AST design".
 
 **Revisit if:** building the quoted representation at a later stage turns out to
 need information the closed-tag AST has already discarded.

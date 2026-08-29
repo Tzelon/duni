@@ -153,13 +153,11 @@ The `run/` cases prove the other half: a host reading what the rules promise.
 - **Allocator algorithm** — free lists, size classes, or bump-with-reset for an
   arena policy; and which raw-memory primitives the compiler exposes to
   `lib/allocator.duni`, and how they are spelled.
-- **Memory management** is the larger prerequisite and deserves its own
-  proposal. `notes/memory_layout.md` argues for reference counting on the Roc
-  model — immutability makes plain RC sound, and a tracing collector would have
-  to ship inside every module. That argument has not been ratified: language
-  pillar 4 says "automatic memory management" and deliberately leaves the
-  mechanism open. It should be settled in a proposal of its own, not inherited
-  from this one.
+- **Memory management** is the larger prerequisite and has its own proposal:
+  [DP-0004](0004-memory-management.md), which argues for reference counting on
+  the Roc model. It is a pitch, not a settled decision — language pillar 4
+  leaves the mechanism open — and nothing in this proposal assumes its
+  outcome.
 
 ## Alternatives considered
 

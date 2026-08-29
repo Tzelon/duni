@@ -63,6 +63,8 @@ and the same idea arrives again about once a year.
   encoding guarantees; constants already work
 - [0003 — Host boundary ABI](./0003-host-boundary-abi.md) (pitch) — internal vs
   boundary ABI, canonical layout rules, flattening
+- [0004 — Memory management](./0004-memory-management.md) (pitch) — reference
+  counting, the allocator written in Duni, ambient inc/dec
 
 ## Implemented
 

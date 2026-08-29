@@ -9,8 +9,9 @@ an instruction.
 Name resolution:
 - Maintains a chain of lexical scopes.
 - Looks up identifiers by walking the chain.
-- Pushes new bindings onto the chain. Rebinding an existing name is
-  allowed (Elixir-style) — the new binding shadows the old one.
+- Pushes new bindings onto the chain. Rebinding an existing name is allowed
+  (Elixir-style) — the new binding shadows the old one. See
+  [0005](../decisions/0005-rebinding-allowed.md).
 - Detects use of undeclared identifiers.
 
 ## Where it lives
@@ -35,14 +36,14 @@ link pointing one level outward.
   tip (innermost)                                          root (outermost)
        │                                                          │
        ▼                                                          ▼
-  LocalVal "y"  ──►  LocalVal "x"  ──►  GenDir  ──►  Namespace  ──►  Top
+  LocalVal "y"  ──►  LocalVal "x"  ──►  Namespace  ──►  Top
                           (parent links)
 ```
 
 To look up a name, start at the tip and follow `parent` links. The **first
-match wins** — that's why inner bindings shadow outer ones. (Today only
-`LocalVal` and `Top` exist; `GenDir`/`Namespace` arrive with blocks and
-containers.)
+match wins** — that's why inner bindings shadow outer ones. `Scope.Tag` has
+three variants: `local_val`, `namespace`, and `top`. `GenDir` is not a scope —
+it is AstGen's per-block instruction list, and it *carries* the cursor.
 
 A new binding pushes one more node onto the tip. Leaving a block pops the
 tip back to where it was.
@@ -51,16 +52,16 @@ tip back to where it was.
 
 Because `=` is an *expression*, a bind inside an operand must be visible to
 its sibling (`(x = 1) + x`), so Zig's pass-scope-down/return-scope-up shape
-doesn't fit. Instead the tip lives in a `Scope.Cursor { tip: *Scope }` and
-every lowering function receives `*Cursor` — a pointer to the *caller's*
-cursor variable:
+doesn't fit. Instead the tip lives in a `Scope.Cursor { tip: *Scope }` held on
+the `GenDir` that lowering functions already thread through (`gd.cursor`):
 
-- **Bind** writes `cursor.tip = &new_local_val.base` — the mutation travels
-  through the shared cursor, so later siblings and statements see it.
-- **Lookup** walks from `cursor.tip`.
-- **Blocks (future)** copy the cursor (`var inner = .{ .tip = cursor.tip }`)
-  and pass `&inner` down — leaving the block is just the copy dying with its
-  stack frame. Scope exit stays structural, nothing to restore.
+- **Bind** writes `gd.cursor.tip = &local_val.base` — the mutation travels
+  through the shared cursor, so later siblings and statements see it. The rhs
+  is lowered *before* the push, so `x = x + 1` sees the old binding.
+- **Lookup** walks from `gd.cursor.tip`.
+- **Blocks** get a `GenDir` with a copied cursor — leaving the block is the
+  copy dying with its stack frame. Scope exit stays structural, nothing to
+  restore.
 
 `LocalVal` nodes are allocated from `scope_arena` on AstGen and freed all at
 once after `generate` — the chain holds pointers, so notes need stable

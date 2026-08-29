@@ -9,10 +9,9 @@ AstGen:
 - Walks every AST node, emits zero or more DIR instructions.
 - Parses literal token text into actual values (`"42_2"` → `u64(422)`).
 - Erases syntax-only constructs (parentheses, etc.).
-- Resolves identifiers to instruction references — see `name_resolution.md`.
-- Detects shadowing / redeclaration errors.
-- Reports compile errors with source locations — see `astgen_error_reporting.md`.
-- Manages per-block instruction lists via a `GenDir` scope stack — see `zir.md`.
+- Resolves identifiers to instruction references — see
+  [name resolution](./name-resolution.md).
+- Manages per-block instruction lists via a `GenDir` scope stack.
 
 It does **not**:
 - Decide types — Sema's job.
@@ -46,7 +45,7 @@ expr(node):
         .add                => binOp(node, .add)     // emits .add
         .grouped_expression => expr(child)           // returns child's Ref
         .identifier         => lookup in scope       // returns existing Ref
-        .bind               => bindDecl(node)        // emits rhs, pushes scope
+        .assign             => bind(node)            // emits rhs, pushes binding
         .block              => block(node)           // opens GenDir, emits .block
         ...
     }
@@ -71,13 +70,12 @@ AST                       AstGen action                  DIR
 
 Source: `(42)`
 
-As implemented, parens are erased one stage *earlier* than this note first
-planned: `Parse.grouping` returns the inner expression's node directly, so
-there is no `grouped_expression` AST node at all and AstGen never sees the
-parens. Consequence: source spans stop at the inner expression (`-(1 + 2)`
-reports a span without the `)`), and a TODO(tzelon) on `Parse.grouping`
-covers restoring paren tokens (a grouped node storing `r_paren`, Zig-style)
-when the LSP needs exact spans.
+Parse builds a `grouped_expression` node that stores the inner expression and
+its `)` token. AstGen erases it: the `.grouped_expression` arm replaces the
+current node with the child and loops, so no DIR instruction is emitted for the
+parentheses. Keeping the node in the AST is what lets `lastToken` return a
+stored `)` rather than deriving one, which matters for spans under error
+recovery.
 
 ## Example 3 — binding + name resolution
 
@@ -86,7 +84,7 @@ Source: `x = 1; x + 2`
 ```
 AST                       AstGen action                  DIR
 ─────────────────        ──────────────────────────     ─────────────────────
-.bind (x = 1)      ──►   lower rhs → %0                 %0 = int 1
+.assign (x = 1)    ──►   lower rhs → %0                 %0 = int 1
                          push LocalVal "x" → %0
 .add               ──►   lower lhs (.identifier "x")
                          scope lookup → %0 (reuse)
@@ -104,20 +102,13 @@ Final DIR is one flat list with no AST and no names:
 
 ## Errors
 
-Design (not built yet — see `notes/astgen_error_reporting.md`): AstGen
-records a diagnostic against a token (and optionally an offset within the
-token) and either:
+Today AstGen has no diagnostics. Error sites — `-0`, an unparseable literal —
+do `std.log.warn` followed by `error.AnalysisFail`. Warn rather than err
+because the Zig test runner fails any run that logs at error level.
 
-- Continues, leaving a sentinel in place of the bad value — recoverable.
-- Aborts the current expression with `error.AnalysisFail` — unrecoverable.
-
-Errors travel out alongside DIR, the same way Parse's errors travel
-alongside the AST.
-
-Interim reality: error sites (`-0`, unparseable literal) do
-`std.log.warn` + `error.AnalysisFail`. Warn, not err, because the Zig test
-runner fails any run that logs at error level — tests exercising error
-paths would fail a green suite.
+Several paths that should be errors are `unreachable` instead, so bad input
+panics rather than being rejected. Replacing all of this is
+[DP-0001](../proposals/0001-diagnostics.md).
 
 ## What "untyped" means
 

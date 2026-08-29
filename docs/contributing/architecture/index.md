@@ -17,6 +17,12 @@ pattern is the key to working here.
 
 ## Stage map
 
+Per-stage detail lives in its own page: [AstGen](./astgen.md),
+[name resolution](./name-resolution.md), [functions](./functions.md),
+[Sema](./sema.md), [InternPool](./intern-pool.md),
+[number literals](./number-literals.md). The list below is the map;
+those pages are the territory.
+
 - **`src/scanner.zig`** — hand-written lexer driven by a labeled-switch state
   machine (`continue :state`). `Token.Tag` is the full token enum;
   `Token.lexeme`/`symbol` map tags back to text for error rendering.
@@ -63,10 +69,11 @@ conventions are in [code style — memory](../code-style.md#memory).
 
 ## Where the "why" lives
 
-- **`notes/`** — design notes and prior-art writeups. **Check here first when
-  looking for the reasoning behind a decision** (AST shape, AstGen lowering,
-  error reporting, name resolution, Sema, number/string literals, lessons from
-  Zap). The code says *what*; these notes say *why*.
+- **[Decision records](../decisions/index.md)** — choices already made, usually
+  a no with a revisit-if. Read before proposing a new node tag, IR instruction,
+  or compiler stage.
+- **[Proposals](../proposals/index.md)** — designs for what does not exist yet.
+- **Per-stage pages below** — how each stage works today.
 - **`grammar.y`** — the destination grammar. It describes the language Duni is
   becoming, not what the parser accepts today (see
   [what not to assume](../project-intent.md#what-not-to-assume)).

@@ -25,13 +25,24 @@ exists to exploit it.
 tag                     data means                      value class
 ──────────────────────  ──────────────────────────────  ─────────────────
 simple_type             (unused; index IS the type)     types
+simple_value            (unused; index IS the value)    values
 int_comptime_int_u32    the value itself                0 ..= u32.max
 int_comptime_int_i32    @bitCast(i32 value)             i32.min ..= -1
 int_positive            limbs index of `Int` header     > u64-range
 int_negative            limbs index of `Int` header     < i64-range
 float_comptime_float    extra index of `Float64`        any f64
-int_u32/int_i32/float_f64  reserved, no producer — `unreachable` in decode
+int_u32                 the value itself                typed `u32`
+int_i32                 @bitCast(i32 value)             typed `i32`
+float_f64               extra index of `Float64`        typed `number`
+string                  a `NullTerminatedString` handle strings
+type_function           extra index of `TypeFunction`   function types
+extern                  extra index of `Key.Extern`     host imports
 ```
+
+The typed arms (`int_u32`, `int_i32`, `float_f64`) are no longer reserved —
+`get` produces them for values whose type is a concrete `u32`/`i32`/`f64`
+rather than a comptime type, and `typeOf` maps them to `u32_type`, `i32_type`,
+and `f64_type`.
 
 ## Encode funnels down, decode narrows up
 
@@ -210,7 +221,7 @@ All three are fixed-width handles, so it's a leaf value on the generic
 struct). This is Duni's whole "callable decl" representation — Zig's `Nav`
 (the decl-level slot with lazy/incremental/namespace/backend/generic
 machinery) is deliberately **not** ported. Reasoning + revival trigger:
-`notes/deferred.md` (Sema / InternPool). The extern's `name` duplicates the
+a deferred decision (Sema / InternPool). The extern's `name` duplicates the
 `Sema.decls` key on purpose — the value must stand alone for WatGen to emit
 `(import "host" "print" …)` without the decl map.
 

@@ -39,6 +39,11 @@ compiler stage.
 - [0003 — No built-ins; the library is written in Duni](./0003-no-built-ins.md)
 - [0004 — No statement/expression split](./0004-everything-is-an-expression.md)
 - [0005 — Rebinding is allowed; there is no redeclaration error](./0005-rebinding-allowed.md)
+- [0007 — One numeric type, `number`, semantically f64](./0007-one-numeric-type.md)
+- [0008 — Comptime integers materialize exactly, or error](./0008-exact-or-error-materialization.md)
+- [0009 — A module is a script, not a program with `fn main`](./0009-script-mode-not-fn-main.md)
+- [0010 — No `void` type yet; `extern fn` return types may lie](./0010-no-void-type.md)
+- [0011 — No `Nav` layer — a `decls` map is the declaration layer](./0011-no-nav-layer.md)
 
 ## Historical / implementation
 

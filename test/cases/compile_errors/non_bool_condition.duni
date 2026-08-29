@@ -1,0 +1,5 @@
+if 1 { 2 } else { 3 }
+
+// error
+//
+// :1:1: error: expected type 'Bool', found 'comptime_int'

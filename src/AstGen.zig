@@ -7,6 +7,7 @@ const Node = Ast.Node;
 const full = Ast.full;
 
 const Dir = @import("Dir.zig");
+const Diagnostics = @import("Diagnostics.zig");
 
 const Scope = @import("AstGen/Scope.zig");
 
@@ -26,6 +27,7 @@ const InnerError = error{ OutOfMemory, AnalysisFail };
 
 gpa: Allocator,
 tree: *const Ast,
+diags: *Diagnostics,
 instructions: std.MultiArrayList(Dir.Inst) = .{},
 extra: ArrayList(u32) = .empty,
 
@@ -44,12 +46,19 @@ arena: Allocator,
 /// dedupe table of strings
 string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
 
-pub fn generate(gpa: Allocator, tree: Ast) !Dir {
+/// A declaration failed to lower. The walk keeps going (so every decl gets a
+/// chance to report), but `generate` fails at the end — a DIR with a dropped
+/// decl must never reach Sema. Replaced by `addFailedDeclaration` when
+/// AstGen error reporting phase 1 lands.
+any_failed_decls: bool = false,
+
+pub fn generate(gpa: Allocator, tree: Ast, diags: *Diagnostics) !Dir {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
     var astgen = AstGen{
         .tree = &tree,
+        .diags = diags,
         .arena = arena.allocator(),
         .gpa = gpa,
         .scope_arena = std.heap.ArenaAllocator.init(gpa),
@@ -81,6 +90,8 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     const module_ref = try rootModuleDecl(&main_gd, .root, tree.rootDecls());
     assert(module_ref.toIndex().? == .main_module_inst);
 
+    if (astgen.any_failed_decls) return error.AnalysisFail;
+
     try astgen.extra.shrinkToLen(gpa);
     try astgen.string_bytes.shrinkToLen(gpa);
 
@@ -100,6 +111,7 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
         switch (tree.nodeTag(current_node)) {
             .number_literal => return numberLiteral(gd, current_node, current_node, .positive),
             .string_literal => return stringLiteral(gd, current_node),
+            .bool_literal => return boolLiteral(gd, current_node),
 
             .identifier => return identifier(gd, current_node),
 
@@ -108,8 +120,23 @@ fn expr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             .mul => return simpleBinOp(gd, current_node, .mul),
             .div => return simpleBinOp(gd, current_node, .div),
             .negation => return negation(gd, current_node),
+            .equal_equal => return simpleBinOp(gd, current_node, .cmp_eq),
+            .bang_equal => return simpleBinOp(gd, current_node, .cmp_neq),
+            .less_than => return simpleBinOp(gd, current_node, .cmp_lt),
+            .less_or_equal => return simpleBinOp(gd, current_node, .cmp_lte),
+            .greater_than => return simpleBinOp(gd, current_node, .cmp_gt),
+            .greater_or_equal => return simpleBinOp(gd, current_node, .cmp_gte),
+            .bool_not => {
+                const operand = try expr(gd, tree.nodeData(current_node).node);
+                return gd.addUnNode(.bool_not, operand, current_node);
+            },
+
+            .bool_and => return boolBinOp(gd, current_node, .@"and"),
+            .bool_or => return boolBinOp(gd, current_node, .@"or"),
             .assign => return bind(gd, current_node),
             .block => return blockExpr(gd, current_node),
+
+            .if_simple, .if_else => return ifExpr(gd, current_node),
 
             // Grouping is transparent to lowering: unwrap and go again.
             .grouped_expression => current_node = tree.nodeData(current_node).node_and_token[0],
@@ -183,15 +210,22 @@ fn rootModuleDecl(
                 error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
-                    std.log.err("boooooom", .{});
-                    // try addFailedDeclaration(
-                    //     wip_decls,
-                    //     gz,
-                    //     .@"const",
-                    //     try astgen.identAsString(full.name_token.?),
-                    //     full.ast.proto_node,
-                    //     full.visib_token != null,
-                    // );
+                    astgen.any_failed_decls = true;
+                    // Stand-in for Zig's `addFailedDeclaration`: record an
+                    // empty declaration in the failed one's slot so the decl
+                    // count scanned ahead of time stays consistent. The DIR
+                    // never reaches Sema — `generate` fails on the flag.
+                    const failed_decl = try block_scope.makeDeclaration(member);
+                    wip_decls.nextDecl(failed_decl);
+                    var empty_type = block_scope.makeSubBlock();
+                    var empty_value = empty_type.makeSubBlock();
+                    try setDeclaration(failed_decl, .{
+                        .kind = .@"const",
+                        .name = try astgen.identAsString(full_proto.name_token),
+                        .linkage = .normal,
+                        .type_gd = &empty_type,
+                        .value_gd = &empty_value,
+                    });
                 },
             };
         },
@@ -237,11 +271,13 @@ fn fnDecl(
 
     const is_extern = if (fn_proto.extern_token) |_| true else false;
 
-    if (body_node == .none) {
-        if (!is_extern) {
-            std.log.err("non-extern function has no body", .{});
-            // return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
-        }
+    if (body_node == .none and !is_extern) {
+        try astgen.diags.addError(
+            .{ .byte = astgen.tree.tokenStart(fn_proto.ast.fn_token) },
+            "non-extern function has no body",
+            .{},
+        );
+        return error.AnalysisFail;
     }
 
     //TODO(tzelon): extract the lib_name l:4013 in zig
@@ -268,10 +304,8 @@ fn fnDecl(
     defer value_gz.unstack();
 
     if (!is_extern) {
-        unreachable;
         // We include a function *value*, not a type.
-        // astgen.restoreSourceCursor(saved_cursor);
-        // try astgen.fnDeclInner(&value_gz, &value_gz.base, saved_cursor, decl_inst, decl_node, body_node.unwrap().?, fn_proto);
+        try astgen.fnDeclInner(&value_gz, decl_inst, decl_node, body_node.unwrap().?, fn_proto);
     }
 
     try setDeclaration(decl_inst, .{
@@ -285,6 +319,88 @@ fn fnDecl(
     });
 }
 
+/// Lowers a non-extern function declaration's *value* into `decl_gz` (the
+/// declaration's value body): the params (bound as locals so the body sees
+/// them), the body ending in `ret_node` of its last expression (implicit
+/// return), the `func` instruction, and the break to the declaration.
+/// `param_block` is the declaration itself — Sema finds the params in its
+/// value body.
+fn fnDeclInner(
+    astgen: *AstGen,
+    decl_gz: *GenDir,
+    decl_inst: Dir.Inst.Index,
+    decl_node: Ast.Node.Index,
+    body_node: Ast.Node.Index,
+    fn_proto: Ast.full.FnProto,
+) InnerError!void {
+    const tree = astgen.tree;
+
+    const params_scope_start = decl_gz.cursor.tip;
+    var it = fn_proto.iterate(tree);
+    while (it.next()) |param| {
+        const param_type_node = param.type_expr.?;
+        var param_gd = decl_gz.makeSubBlock();
+        defer param_gd.unstack();
+        const param_type = try comptimeExpr(&param_gd, param_type_node);
+        const param_inst_expected: Dir.Inst.Index = @enumFromInt(astgen.instructions.len + 1);
+        _ = try param_gd.addBreakWithSrcNode(.break_inline, param_inst_expected, param_type, param_type_node);
+        const name_token = param.name_token orelse tree.nodeMainToken(param_type_node);
+        const param_name = try astgen.identAsString(name_token);
+
+        // Walk the params bound so far: a second param with the same name
+        // would silently shadow the first inside the body.
+        var scope = decl_gz.cursor.tip;
+        while (scope != params_scope_start) {
+            const previous_param = scope.cast(Scope.LocalVal).?;
+            if (previous_param.name == param_name) {
+                try astgen.diags.addError(
+                    .{ .byte = tree.tokenStart(name_token) },
+                    "duplicate function parameter name '{s}'",
+                    .{try astgen.identifierTokenString(name_token)},
+                );
+                return error.AnalysisFail;
+            }
+            scope = previous_param.parent;
+        }
+
+        const param_inst = try decl_gz.addParam(&param_gd, .param, name_token, param_name);
+        assert(param_inst_expected == param_inst);
+
+        const local_val = try astgen.scope_arena.allocator().create(Scope.LocalVal);
+        local_val.* = .{
+            .parent = decl_gz.cursor.tip,
+            .name = param_name,
+            .id_cat = .@"function parameter",
+            .inst = param_inst.toRef(),
+            .token_src = name_token,
+        };
+        decl_gz.cursor.tip = &local_val.base;
+    }
+
+    const ret_ty_node = fn_proto.ast.return_type.unwrap().?;
+    const ret_ty = try comptimeExpr(decl_gz, ret_ty_node);
+
+    // The body is a sub-block that sees the param bindings via the cursor.
+    var body_gz = decl_gz.makeSubBlock();
+    defer body_gz.unstack();
+
+    var result: Dir.Inst.Ref = .void_value;
+    for (tree.blockExpressions(body_node)) |statement| {
+        result = try expr(&body_gz, statement);
+    }
+    _ = try body_gz.addUnNode(.ret_node, result, body_node);
+
+    const func_inst = try decl_gz.addFunc(.{
+        .src_node = fn_proto.ast.proto_node,
+        .param_block = decl_inst,
+        .ret_gd = null,
+        .ret_ref = ret_ty,
+        .body_gd = &body_gz,
+    });
+
+    _ = try decl_gz.addBreakWithSrcNode(.break_inline, decl_inst, func_inst, decl_node);
+}
+
 const Sign = enum { negative, positive };
 
 fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index, sign: Sign) InnerError!Dir.Inst.Ref {
@@ -296,9 +412,7 @@ fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index,
     const result: Dir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
         .int => |num| switch (num) {
             0 => if (sign == .positive) try gd.addInt(num) else {
-                // TODO(tzelon): report through AstGen error reporting once it
-                // exists; log.warn because the test runner fails on log.err.
-                std.log.warn("0 cannot be negative", .{});
+                try astgen.diags.addError(.{ .byte = tree.tokenStart(num_token) }, "0 cannot be negative", .{});
                 return error.AnalysisFail;
             },
 
@@ -331,7 +445,7 @@ fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index,
             return try gd.addFloat(smaller_float);
         },
         .failure => {
-            std.log.warn("failed to parse literal number", .{});
+            try astgen.diags.addError(.{ .byte = tree.tokenStart(num_token) }, "invalid number literal", .{});
             return error.AnalysisFail;
         },
     };
@@ -354,6 +468,16 @@ fn stringLiteral(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
             .len = str.len,
         } },
     });
+}
+
+/// `true` / `false` lower to the static refs directly — no instruction.
+fn boolLiteral(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const tree = gd.astgen.tree;
+    return switch (tree.tokenTag(tree.nodeMainToken(node))) {
+        .keyword_true => .bool_true,
+        .keyword_false => .bool_false,
+        else => unreachable,
+    };
 }
 
 fn negation(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -385,8 +509,7 @@ fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
 
     // The lhs is a pattern; today only a plain identifier is supported.
     if (tree.nodeTag(lhs_node) != .identifier) {
-        // TODO(tzelon): AstGen error reporting phase 1.
-        std.log.warn("unsupported pattern", .{});
+        try astgen.diags.addError(.{ .byte = tree.tokenStart(tree.firstToken(lhs_node)) }, "unsupported pattern", .{});
         return error.AnalysisFail;
     }
 
@@ -409,6 +532,170 @@ fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     gd.cursor.tip = &local_val.base;
 
     return rhs;
+}
+
+/// Lower `if` to Zig's shape: a `block` wrapping the condition and a
+/// `condbr`; each branch body ends with a `break` to the block carrying that
+/// branch's value. An else-less `if` gets an implicit `else { void }` — its
+/// else body is a lone void break (so Sema's branch unification enforces the
+/// then-branch-must-be-void rule; see notes/control_flow.md).
+fn ifExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const gpa = astgen.gpa;
+    const tree = astgen.tree;
+
+    const cond_node, const then_node, const else_node = switch (tree.nodeTag(node)) {
+        .if_simple => blk: {
+            const cond, const then_expr = tree.nodeData(node).node_and_node;
+            break :blk .{ cond, then_expr, @as(?Ast.Node.Index, null) };
+        },
+        .if_else => blk: {
+            const cond, const extra_index = tree.nodeData(node).node_and_extra;
+            const if_extra = tree.extraData(extra_index, Node.If);
+            break :blk .{ cond, if_extra.then_expr, @as(?Ast.Node.Index, if_extra.else_expr) };
+        },
+        else => unreachable,
+    };
+
+    const block_inst = try gd.makeBlockInst(.block, node);
+    try gd.instructions.append(gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const cond = try expr(&block_scope, cond_node);
+    const condbr = try block_scope.makeBlockInst(.condbr, node);
+    try block_scope.instructions.append(gpa, condbr);
+
+    var then_scope = block_scope.makeSubBlock();
+    defer then_scope.unstack();
+    const then_result = try expr(&then_scope, then_node);
+    _ = try then_scope.addBreakWithSrcNode(.@"break", block_inst, then_result, then_node);
+
+    var else_scope = block_scope.makeSubBlock();
+    defer else_scope.unstack();
+    if (else_node) |else_expr| {
+        const else_result = try expr(&else_scope, else_expr);
+        _ = try else_scope.addBreakWithSrcNode(.@"break", block_inst, else_result, else_expr);
+    } else {
+        _ = try else_scope.addBreak(.@"break", block_inst, .void_value);
+    }
+
+    try setCondBrPayload(condbr, cond, &then_scope, &else_scope);
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+/// Short-circuit lowering (notes/control_flow.md): rides on the `if`
+/// machinery rather than a dedicated instruction.
+///   `a and b` → `if a { if b { true } else { false } } else { false }`
+///   `a or b`  → `if a { true } else { if b { true } else { false } }`
+/// The inner if (`boolCheckExpr`) normalizes the rhs to a Bool literal and
+/// — through the condition's Bool check — rejects a non-Bool rhs even when
+/// the lhs is comptime-known and the rhs branch would otherwise fold away
+/// unchecked.
+fn boolBinOp(gd: *GenDir, node: Ast.Node.Index, comptime op: enum { @"and", @"or" }) InnerError!Dir.Inst.Ref {
+    const astgen = gd.astgen;
+    const gpa = astgen.gpa;
+    const lhs_node, const rhs_node = astgen.tree.nodeData(node).node_and_node;
+
+    const block_inst = try gd.makeBlockInst(.block, node);
+    try gd.instructions.append(gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const lhs = try expr(&block_scope, lhs_node);
+    const condbr = try block_scope.makeBlockInst(.condbr, node);
+    try block_scope.instructions.append(gpa, condbr);
+
+    var then_scope = block_scope.makeSubBlock();
+    defer then_scope.unstack();
+    switch (op) {
+        .@"and" => {
+            const rhs_result = try boolCheckExpr(&then_scope, rhs_node);
+            _ = try then_scope.addBreakWithSrcNode(.@"break", block_inst, rhs_result, rhs_node);
+        },
+        // `true or _` short-circuits to true; the rhs is never evaluated.
+        .@"or" => _ = try then_scope.addBreak(.@"break", block_inst, .bool_true),
+    }
+
+    var else_scope = block_scope.makeSubBlock();
+    defer else_scope.unstack();
+    switch (op) {
+        // `false and _` short-circuits to false; the rhs is never evaluated.
+        .@"and" => _ = try else_scope.addBreak(.@"break", block_inst, .bool_false),
+        .@"or" => {
+            const rhs_result = try boolCheckExpr(&else_scope, rhs_node);
+            _ = try else_scope.addBreakWithSrcNode(.@"break", block_inst, rhs_result, rhs_node);
+        },
+    }
+
+    try setCondBrPayload(condbr, lhs, &then_scope, &else_scope);
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+/// Lower `operand` wrapped as `if operand { true } else { false }` — the
+/// Bool normalization the short-circuit operators use for their rhs. The
+/// inner if's condition check is what enforces operand-must-be-Bool.
+fn boolCheckExpr(gd: *GenDir, operand_node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
+    const gpa = gd.astgen.gpa;
+
+    const block_inst = try gd.makeBlockInst(.block, operand_node);
+    try gd.instructions.append(gpa, block_inst);
+
+    var block_scope = gd.makeSubBlock();
+    defer block_scope.unstack();
+
+    const operand = try expr(&block_scope, operand_node);
+    const condbr = try block_scope.makeBlockInst(.condbr, operand_node);
+    try block_scope.instructions.append(gpa, condbr);
+
+    var then_scope = block_scope.makeSubBlock();
+    defer then_scope.unstack();
+    _ = try then_scope.addBreak(.@"break", block_inst, .bool_true);
+
+    var else_scope = block_scope.makeSubBlock();
+    defer else_scope.unstack();
+    _ = try else_scope.addBreak(.@"break", block_inst, .bool_false);
+
+    try setCondBrPayload(condbr, operand, &then_scope, &else_scope);
+    try block_scope.setBlockBody(block_inst);
+
+    return block_inst.toRef();
+}
+
+/// Writes the `CondBr` payload and both trailing bodies for a reserved
+/// `condbr`. Assumes `else_scope` is stacked on `then_scope` and nothing is
+/// stacked on `else_scope`. Unstacks both.
+fn setCondBrPayload(
+    condbr: Dir.Inst.Index,
+    cond: Dir.Inst.Ref,
+    then_scope: *GenDir,
+    else_scope: *GenDir,
+) !void {
+    const astgen = then_scope.astgen;
+    const gpa = astgen.gpa;
+    const then_body = then_scope.instructionsSliceUpto(else_scope);
+    const else_body = else_scope.instructionsSlice();
+
+    try astgen.extra.ensureUnusedCapacity(
+        gpa,
+        @typeInfo(Dir.Inst.CondBr).@"struct".fields.len + then_body.len + else_body.len,
+    );
+    const dir_datas = astgen.instructions.items(.data);
+    dir_datas[@intFromEnum(condbr)].pl_node.payload_index = astgen.addExtraAssumeCapacity(Dir.Inst.CondBr{
+        .condition = cond,
+        .then_body_len = @intCast(then_body.len),
+        .else_body_len = @intCast(else_body.len),
+    });
+    astgen.extra.appendSliceAssumeCapacity(@ptrCast(then_body));
+    astgen.extra.appendSliceAssumeCapacity(@ptrCast(else_body));
+    else_scope.unstack();
+    then_scope.unstack();
 }
 
 fn blockExpr(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
@@ -579,8 +866,11 @@ fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) 
 
     // No namespaces yet: the scope chain is the complete set of names,
     // so a miss means the identifier is undeclared.
-    // TODO(tzelon): AstGen error reporting phase 1.
-    std.log.warn("use of undeclared identifier '{s}'", .{try astgen.identifierTokenString(ident_token)});
+    try astgen.diags.addError(
+        .{ .byte = astgen.tree.tokenStart(ident_token) },
+        "use of undeclared identifier '{s}'",
+        .{try astgen.identifierTokenString(ident_token)},
+    );
     return error.AnalysisFail;
 }
 
@@ -673,7 +963,6 @@ fn parseStrLit(
     bytes: []const u8,
     offset: u32,
 ) InnerError!void {
-    _ = token;
     const raw_string = bytes[offset..];
     const result = r: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(astgen.gpa, buf);
@@ -684,7 +973,10 @@ fn parseStrLit(
     };
     switch (result) {
         .success => return,
-        .failure => |err| return std.log.warn("{f}", .{err.fmt(raw_string)}), //astgen.failWithStrLitError(err, token, bytes, offset),
+        .failure => |err| {
+            try astgen.diags.addError(.{ .byte = astgen.tree.tokenStart(token) }, "{f}", .{err.fmt(raw_string)});
+            return error.AnalysisFail;
+        },
     }
 }
 
@@ -880,7 +1172,7 @@ fn scanContainer(
 }
 
 const primitive_instrs = std.StaticStringMap(Dir.Inst.Ref).initComptime(.{
-    // .{ "bool", .bool_type },
+    .{ "Bool", .bool_type },
     .{ "comptime_float", .comptime_float_type },
     .{ "comptime_int", .comptime_int_type },
     // .{ "false", .bool_false },
@@ -1372,6 +1664,10 @@ pub const GenDir = struct {
                 astgen.extra.appendAssumeCapacity(@intFromEnum(ret_ref));
             }
 
+            for (body) |inst| {
+                astgen.extra.appendAssumeCapacity(@intFromEnum(inst));
+            }
+
             break :inst_info .{ .func, payload_index };
         };
 
@@ -1477,7 +1773,9 @@ fn expect(source: [:0]const u8, expected: [:0]const u8) !void {
     defer tree.deinit(gpa);
     try std.testing.expect(tree.errors.len == 0);
 
-    var dir = try AstGen.generate(gpa, tree);
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    var dir = try AstGen.generate(gpa, tree, &diags);
     defer dir.deinit(gpa);
 
     var buf: [1024]u8 = undefined;
@@ -1553,6 +1851,97 @@ test "simple binary op" {
     );
 }
 
+test "bool literal and comparisons" {
+    // `true`/`false` are static refs — no instruction of their own.
+    try expect("true == false",
+        \\%0 = module_decl(%1)
+        \\%1 = cmp_eq(bool_true, bool_false) node_offset:1:1 to :1:14
+        \\
+    );
+    // Each comparison operator lowers to its own Dir tag; `!` is un_node.
+    try expect("!(1 < 2 <= 3 > 4 >= 5 != 6)",
+        \\%0 = module_decl(%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12)
+        \\%1 = int(1)
+        \\%2 = int(2)
+        \\%3 = cmp_lt(%1, %2) node_offset:1:3 to :1:8
+        \\%4 = int(3)
+        \\%5 = cmp_lte(%3, %4) node_offset:1:3 to :1:13
+        \\%6 = int(4)
+        \\%7 = cmp_gt(%5, %6) node_offset:1:3 to :1:17
+        \\%8 = int(5)
+        \\%9 = cmp_gte(%7, %8) node_offset:1:3 to :1:22
+        \\%10 = int(6)
+        \\%11 = cmp_neq(%9, %10) node_offset:1:3 to :1:27
+        \\%12 = bool_not(%11) node_offset:1:1 to :1:28
+        \\
+    );
+}
+
+test "if lowers to block + condbr with breaking bodies" {
+    // Each branch is a block expression, so it carries its own inner Dir
+    // block; the branch body ends with a break to the if's block (%1).
+    try expect("if true { 1 } else { 2 }",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:25
+        \\%2 = condbr(bool_true, then={%3, %6}, else={%7, %10}) node_offset:1:1 to :1:25
+        \\%3 = block(%4, %5) node_offset:1:9 to :1:14
+        \\%4 = int(1)
+        \\%5 = break(%3, %4)
+        \\%6 = break(%1, %3)
+        \\%7 = block(%8, %9) node_offset:1:20 to :1:25
+        \\%8 = int(2)
+        \\%9 = break(%7, %8)
+        \\%10 = break(%1, %7)
+        \\
+    );
+
+    // Else-less: the implicit else body is a lone void break — Sema's branch
+    // unification then enforces then-must-be-void.
+    try expect("if true { 1 }",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:14
+        \\%2 = condbr(bool_true, then={%3, %6}, else={%7}) node_offset:1:1 to :1:14
+        \\%3 = block(%4, %5) node_offset:1:9 to :1:14
+        \\%4 = int(1)
+        \\%5 = break(%3, %4)
+        \\%6 = break(%1, %3)
+        \\%7 = break(%1, void_value)
+        \\
+    );
+}
+
+test "and/or lower to the short-circuit condbr shape" {
+    // `a and b` → if a { if b { true } else { false } } else { false }:
+    // the rhs sits behind the condbr (short-circuit), wrapped in the inner
+    // Bool-normalizing if.
+    try expect("true and false",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:15
+        \\%2 = condbr(bool_true, then={%3, %7}, else={%8}) node_offset:1:1 to :1:15
+        \\%3 = block(%4) node_offset:1:10 to :1:15
+        \\%4 = condbr(bool_false, then={%5}, else={%6}) node_offset:1:10 to :1:15
+        \\%5 = break(%3, bool_true)
+        \\%6 = break(%3, bool_false)
+        \\%7 = break(%1, %3)
+        \\%8 = break(%1, bool_false)
+        \\
+    );
+
+    // `a or b`: the short-circuit constant is the then branch.
+    try expect("false or true",
+        \\%0 = module_decl(%1)
+        \\%1 = block(%2) node_offset:1:1 to :1:14
+        \\%2 = condbr(bool_false, then={%3}, else={%4, %8}) node_offset:1:1 to :1:14
+        \\%3 = break(%1, bool_true)
+        \\%4 = block(%5) node_offset:1:10 to :1:14
+        \\%5 = condbr(bool_true, then={%6}, else={%7}) node_offset:1:10 to :1:14
+        \\%6 = break(%4, bool_true)
+        \\%7 = break(%4, bool_false)
+        \\%8 = break(%1, %4)
+        \\
+    );
+}
+
 test "negation" {
     // int literal: stored positive, sign is a negate instruction
     try expect("-5",
@@ -1584,7 +1973,10 @@ test "negative zero int is rejected" {
 
     var tree = try Ast.parse(gpa, "-0");
     defer tree.deinit(gpa);
-    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree, &diags));
+    try std.testing.expect(diags.hasErrors());
 }
 
 test "bind expression" {
@@ -1651,6 +2043,44 @@ test "block" {
         \\%3 = break(%1, %2)
         \\
     );
+}
+
+test "fn with body" {
+    // The value body carries the params, the lowered body ending in
+    // `ret_node`, the `func` instruction, and the break to the declaration.
+    // `param_block` is the declaration itself (its value body holds the params).
+    try expect(
+        \\fn add(x number) number {
+        \\x + 1
+        \\}
+    ,
+        \\%0 = module_decl(decls={%1})
+        \\%1 = declaration()
+        \\%2 = break_inline(%3, f64_type)
+        \\%3 = param(x, {%2})
+        \\%4 = int(1)
+        \\%5 = add(%3, %4) node_offset:2:1 to :2:6
+        \\%6 = ret_node(%5) node_offset:1:25 to :1:26
+        \\%7 = func(%1, ret_ty=f64_type, body={%4, %5, %6}) node_offset:1:1 to :1:24
+        \\%8 = break_inline(%1, %7)
+        \\
+    );
+}
+
+test "duplicate param name is an error" {
+    const gpa = std.testing.allocator;
+
+    var tree = try Ast.parse(gpa,
+        \\fn add(x number, x number) number {
+        \\x
+        \\}
+    );
+    defer tree.deinit(gpa);
+    try std.testing.expect(tree.errors.len == 0);
+    var diags = Diagnostics{ .gpa = gpa };
+    defer diags.deinit();
+    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree, &diags));
+    try std.testing.expect(diags.hasErrors());
 }
 
 test "extern fn" {

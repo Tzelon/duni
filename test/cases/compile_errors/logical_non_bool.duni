@@ -1,0 +1,5 @@
+true and 5
+
+// error
+//
+// :1:10: error: expected type 'Bool', found 'comptime_int'

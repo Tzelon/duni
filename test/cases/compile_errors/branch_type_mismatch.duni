@@ -1,0 +1,7 @@
+extern fn print(x number) number
+
+if print(1) < 2 { 1 } else { "a" }
+
+// error
+//
+// :3:1: error: incompatible if branch types: 'number' and 'string'

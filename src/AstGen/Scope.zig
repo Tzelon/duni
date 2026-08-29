@@ -53,6 +53,7 @@ pub const Tag = enum {
 /// The category of identifier. These tag names are user-visible in compile errors.
 const IdCat = enum {
     @"local variable",
+    @"function parameter",
 };
 
 /// This is always a `const` local and importantly the `inst` is a value type, not a pointer.

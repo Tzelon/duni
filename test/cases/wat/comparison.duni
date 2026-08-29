@@ -1,0 +1,22 @@
+extern fn print(x number) number
+
+print(1) < 2
+
+// wat
+//
+// (module
+//   (import "host" "print" (func $print (param f64) (result f64)))
+//   (func $main (result i32)
+//     (local f64 i32)
+//     f64.const 1
+//     call $print
+//     local.set 0
+//     local.get 0
+//     f64.const 2
+//     f64.lt
+//     local.set 1
+//     local.get 1
+//     return
+//   )
+//   (export "main" (func $main))
+// )

@@ -29,6 +29,40 @@ pub const Inst = struct {
         /// Uses the `un_op` field.
         ret,
 
+        /// The value of a function parameter. One per parameter, emitted
+        /// before the function body's instructions, in parameter order.
+        /// Uses the `arg` field.
+        arg,
+
+        /// Float addition. Both operands are `number` (f64) — Sema coerces
+        /// before emitting, so no integer arithmetic reaches codegen.
+        /// Uses the `bin_op` field.
+        add,
+        /// Float subtraction. Uses the `bin_op` field.
+        sub,
+        /// Float multiplication. Uses the `bin_op` field.
+        mul,
+        /// Float division (IEEE). A comptime-known zero divisor is rejected
+        /// by Sema; a runtime zero divisor produces inf/nan per IEEE.
+        /// Uses the `bin_op` field.
+        div,
+        /// `lhs == rhs`. Operands are f64 (Sema coerces); result is Bool
+        /// (i32 at runtime). Uses the `bin_op` field.
+        cmp_eq,
+        /// `lhs != rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_neq,
+        /// `lhs < rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_lt,
+        /// `lhs <= rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_lte,
+        /// `lhs > rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_gt,
+        /// `lhs >= rhs`. See `cmp_eq`. Uses the `bin_op` field.
+        cmp_gte,
+        /// Boolean negation. Operand and result are Bool.
+        /// Uses the `un_op` field.
+        not,
+
         /// Function call.
         /// Result type is the return type of the function being called.
         /// Uses the `pl_op` field with the `Call` payload. operand is the callee.
@@ -36,6 +70,22 @@ pub const Inst = struct {
         ///
         /// See `unwrapCall` for a way to load this tag's data.
         call,
+
+        /// A structured block whose value arrives via `br` instructions to
+        /// its merge point (a runtime `if` produces one; its body terminator
+        /// is a `cond_br`). Uses the `ty_pl` field: the type is the block's
+        /// result type, the payload is a `Block` with the trailing body.
+        block,
+
+        /// Conditional branch: terminates a `block`'s body. Each trailing
+        /// body ends with a `br` to the enclosing block. Produces no value.
+        /// Uses the `pl_op` field: operand is the Bool condition, payload is
+        /// a `CondBr` with the two trailing bodies.
+        cond_br,
+
+        /// A value-carrying jump to a `block`'s merge point. Produces no
+        /// value. Uses the `br` field.
+        br,
     };
 
     /// The position of an AIR instruction within the `Air` instructions array.
@@ -135,11 +185,32 @@ pub const Inst = struct {
     pub const Data = union {
         un_op: Ref,
 
+        arg: struct {
+            ty: Type,
+            /// The parameter's position — its wasm local index.
+            index: u32,
+        },
+
+        bin_op: struct {
+            lhs: Ref,
+            rhs: Ref,
+        },
+
         ty: Type,
 
         pl_op: struct {
             operand: Ref,
             payload: u32,
+        },
+
+        ty_pl: struct {
+            ty: Type,
+            payload: u32,
+        },
+
+        br: struct {
+            block_inst: Index,
+            operand: Ref,
         },
     };
 };
@@ -148,6 +219,30 @@ pub const Inst = struct {
 pub const Call = struct {
     args_len: u32,
 };
+
+/// Trailing is a list of `Inst.Index` for every `body_len`.
+pub const Block = struct {
+    body_len: u32,
+};
+
+/// Trailing: `then_body_len` instruction indices, then `else_body_len`.
+pub const CondBr = struct {
+    then_body_len: u32,
+    else_body_len: u32,
+};
+
+/// Reserved indexes at the start of `extra`.
+pub const ExtraIndex = enum(u32) {
+    /// The payload index of the outermost body's `Block`. Written by Sema at
+    /// the end of analysis; codegen starts its walk here.
+    main_body,
+};
+
+pub fn getMainBody(air: *const Air) []const Inst.Index {
+    const payload_index = air.extra.items[@intFromEnum(ExtraIndex.main_body)];
+    const body_len = air.extra.items[payload_index];
+    return @ptrCast(air.extra.items[payload_index + 1 ..][0..body_len]);
+}
 
 pub fn internedToRef(ip_index: InternPool.Index) Inst.Ref {
     return .fromInterned(ip_index);
@@ -164,10 +259,21 @@ pub fn typeOf(air: *const Air, inst: Air.Inst.Ref, ip: *const InternPool) Type {
 pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool) Type {
     const datas = air.instructions.items(.data);
     switch (air.instructions.items(.tag)[@intFromEnum(inst)]) {
-        // .arg => return datas[@intFromEnum(inst)].arg.ty.toType(),
+        .arg => return datas[@intFromEnum(inst)].arg.ty,
 
+        .block => return datas[@intFromEnum(inst)].ty_pl.ty,
+
+        // Terminators produce no value.
         .ret,
+        .cond_br,
+        .br,
         => unreachable,
+
+        // Both operands were coerced to one numeric type by Sema, so the
+        // lhs type is the result type.
+        .add, .sub, .mul, .div => return air.typeOf(datas[@intFromEnum(inst)].bin_op.lhs, ip),
+
+        .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .not => return .fromInterned(.bool_type),
 
         .call => {
             const callee_ty = air.typeOf(datas[@intFromEnum(inst)].pl_op.operand, ip);

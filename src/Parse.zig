@@ -37,7 +37,14 @@ errors: std.ArrayList(Ast.Error),
 /// temp array of nodes
 scratch: std.ArrayList(Node.Index),
 
-pub fn parseRoot(p: *Parse) !void {
+/// Expression nesting depth — how many `parsePrecedence` frames are on the
+/// stack. Bounded so pathological input (a thousand parens) reports an error
+/// instead of overflowing the native stack.
+nesting: u32 = 0,
+
+const max_nesting = 256;
+
+pub fn parseRoot(p: *Parse) Error!void {
     // Root node must be index 0.
     p.nodes.appendAssumeCapacity(.{
         .tag = .root,
@@ -45,20 +52,31 @@ pub fn parseRoot(p: *Parse) !void {
         .data = undefined,
     });
 
-    const span = try p.parseBlock();
+    const span = try p.parseBlock(.root);
     p.nodes.items(.data)[0] = .{ .extra_range = span };
 }
 
-/// Statement-level resync: skip to just past the next newline (or stop at eof).
+/// Statement-level resync: skip to just past the next newline (or stop at
+/// eof). Braces opened after the failure point belong to the broken
+/// construct and are skipped as a unit — only an *enclosing* `}` (depth 0)
+/// stops the resync, unconsumed, so a block terminator is never eaten.
 fn findNextStmt(p: *Parse) void {
+    var brace_depth: u32 = 0;
     while (true) switch (p.current()) {
         .newline => {
             _ = p.advance();
-            return;
+            if (brace_depth == 0) return;
         },
-        .eof,
-        .r_brace,
-        => return,
+        .l_brace => {
+            brace_depth += 1;
+            _ = p.advance();
+        },
+        .r_brace => {
+            if (brace_depth == 0) return;
+            brace_depth -= 1;
+            _ = p.advance();
+        },
+        .eof => return,
         else => _ = p.advance(),
     };
 }
@@ -67,13 +85,21 @@ fn expression(p: *Parse) !Node.Index {
     return p.parsePrecedence(.prec_assignment);
 }
 
-fn parseBlock(p: *Parse) !Node.SubRange {
+fn parseBlock(p: *Parse, comptime context: enum { root, brace_block }) !Node.SubRange {
     const scratch_top = p.scratch.items.len;
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
     while (true) {
         while (p.check(.newline)) _ = p.advance(); // blank lines / separators
-        if (p.check(.eof) or p.check(.r_brace)) break;
+        if (p.check(.eof)) break;
+        if (p.check(.r_brace)) {
+            // Inside braces this is the terminator; at the root it is a
+            // stray — report it, skip it, keep parsing statements.
+            if (context == .brace_block) break;
+            try p.warnMsg(.{ .tag = .expected_expression, .token = p.token_index });
+            _ = p.advance();
+            continue;
+        }
 
         const stmt = p.expression() catch |err| switch (err) {
             error.ParseError => {
@@ -104,7 +130,9 @@ fn parseProto(p: *Parse, fn_token: TokenIndex) !Node.Index {
     const return_type: Node.OptionalIndex = if (try p.parseTypeExpr()) |type_node|
         type_node.toOptional()
     else blk: {
-        try p.warn(.expected_return_type);
+        // Point at the token before the cursor (the closing paren) — that is
+        // where the return type was expected.
+        try p.warnMsg(.{ .tag = .expected_return_type, .token = p.token_index, .token_is_prev = true });
         break :blk .none;
     };
 
@@ -161,6 +189,15 @@ fn parseTypeExpr(p: *Parse) !?Node.Index {
 
 // Pratt Parsing
 fn parsePrecedence(p: *Parse, precedence: Precedence) !Node.Index {
+    if (p.nesting == max_nesting) {
+        return p.failMsg(.{
+            .tag = .expression_nested_too_deeply,
+            .token = p.token_index,
+        });
+    }
+    p.nesting += 1;
+    defer p.nesting -= 1;
+
     const prefixRule = p.getRule(p.current()).prefix orelse {
         // no expression starting here
         return p.failMsg(.{
@@ -178,6 +215,13 @@ fn parsePrecedence(p: *Parse, precedence: Precedence) !Node.Index {
         };
 
         node = try infixRule(p, node);
+    }
+
+    // An invalid token can neither continue nor end an expression — report
+    // it here rather than letting a statement terminator blame a missing
+    // newline (the recoverable expected-expression path for `.invalid`).
+    if (p.check(.invalid)) {
+        return p.failMsg(.{ .tag = .expected_expression, .token = p.token_index });
     }
 
     return node;
@@ -228,7 +272,19 @@ fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
         .star => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         .slash => comptime ParseRule.init(null, Parse.binary, .prec_factor),
         .equal => comptime ParseRule.init(null, Parse.bind, .prec_assignment),
-        // .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
+        .equal_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
+        .bang_equal => comptime ParseRule.init(null, Parse.binary, .prec_equality),
+        .angle_left => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .angle_left_equal => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .angle_right => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .angle_right_equal => comptime ParseRule.init(null, Parse.binary, .prec_comparison),
+        .keyword_and => comptime ParseRule.init(null, Parse.binary, .prec_and),
+        .keyword_or => comptime ParseRule.init(null, Parse.binary, .prec_or),
+        .bang => comptime ParseRule.init(Parse.unary, null, .prec_none),
+        .keyword_true => comptime ParseRule.init(Parse.boolLiteral, null, .prec_none),
+        .keyword_false => comptime ParseRule.init(Parse.boolLiteral, null, .prec_none),
+        .keyword_if => comptime ParseRule.init(Parse.ifExpr, null, .prec_none),
+        .keyword_else => comptime ParseRule.init(null, null, .prec_none),
         .string_literal => comptime ParseRule.init(Parse.string, null, .prec_none),
         .number_literal => comptime ParseRule.init(Parse.number, null, .prec_none),
         .identifier => comptime ParseRule.init(Parse.identifier, null, .prec_none),
@@ -268,10 +324,20 @@ fn string(p: *Parse) !Node.Index {
     });
 }
 
+/// example: true
+fn boolLiteral(p: *Parse) !Node.Index {
+    return p.addNode(.{
+        .tag = .bool_literal,
+        .main_token = p.advance(),
+        .data = undefined,
+    });
+}
+
 /// example: -1
 fn unary(p: *Parse) !Node.Index {
     const tag: Node.Tag = switch (p.current()) {
         .minus => .negation,
+        .bang => .bool_not,
         else => unreachable,
     };
 
@@ -288,6 +354,14 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
         .minus => .sub,
         .star => .mul,
         .slash => .div,
+        .equal_equal => .equal_equal,
+        .bang_equal => .bang_equal,
+        .angle_left => .less_than,
+        .angle_left_equal => .less_or_equal,
+        .angle_right => .greater_than,
+        .angle_right_equal => .greater_or_equal,
+        .keyword_and => .bool_and,
+        .keyword_or => .bool_or,
         else => unreachable,
     };
 
@@ -304,6 +378,11 @@ fn binary(p: *Parse, lhs: Node.Index) !Node.Index {
 }
 
 fn function(p: *Parse) !Node.Index {
+    // A fn declaration is a top-level form, not an expression operand
+    // (grammar.y: `declaration`, never `primary`).
+    if (p.nesting != 1) {
+        return p.failMsg(.{ .tag = .expected_expression, .token = p.token_index });
+    }
     const fn_token = p.advance();
     const proto = try p.parseProto(fn_token);
 
@@ -320,6 +399,10 @@ fn function(p: *Parse) !Node.Index {
 /// An extern function is a bare `fn_proto` with no body; the `extern`
 /// keyword is the token before the proto's `fn` token.
 fn externFunction(p: *Parse) !Node.Index {
+    // Same top-level-only rule as `function`.
+    if (p.nesting != 1) {
+        return p.failMsg(.{ .tag = .expected_expression, .token = p.token_index });
+    }
     _ = p.advance(); // `extern`
     const fn_token = try p.consume(.keyword_fn);
     return p.parseProto(fn_token);
@@ -327,7 +410,7 @@ fn externFunction(p: *Parse) !Node.Index {
 
 fn block(p: *Parse) !Node.Index {
     const main_token = p.advance();
-    const span = try p.parseBlock();
+    const span = try p.parseBlock(.brace_block);
     const r_brace = try p.consume(.r_brace);
 
     return p.addNode(.{
@@ -340,6 +423,45 @@ fn block(p: *Parse) !Node.Index {
                 .rbrace = r_brace,
             }),
         },
+    });
+}
+
+/// `if cond { a } else { b }` — if-as-expression with block branches and no
+/// parens around the condition (grammar.y `ifExpr`). The condition parse
+/// stops at `{` naturally: `l_brace` has no infix rule. `else` is optional;
+/// its branch is a block or another `if` (else-if chains). The `else` must
+/// follow the then-block's `}` on the same line — a newline in between ends
+/// the statement.
+fn ifExpr(p: *Parse) !Node.Index {
+    const if_token = p.advance();
+    const cond = try p.expression();
+
+    if (!p.check(.l_brace)) return p.failExpected(.l_brace);
+    const then_expr = try p.block();
+
+    if (!p.check(.keyword_else)) {
+        return p.addNode(.{
+            .tag = .if_simple,
+            .main_token = if_token,
+            .data = .{ .node_and_node = .{ cond, then_expr } },
+        });
+    }
+    _ = p.advance(); // `else`
+
+    const else_expr = if (p.check(.keyword_if))
+        try p.ifExpr()
+    else if (p.check(.l_brace))
+        try p.block()
+    else
+        return p.failExpected(.l_brace);
+
+    return p.addNode(.{
+        .tag = .if_else,
+        .main_token = if_token,
+        .data = .{ .node_and_extra = .{
+            cond,
+            try p.addExtra(Node.If{ .then_expr = then_expr, .else_expr = else_expr }),
+        } },
     });
 }
 
@@ -492,7 +614,6 @@ fn check(p: *Parse, expected_tag: Token.Tag) bool {
 /// consume the current token only if the current token matches the type
 fn consume(p: *Parse, expected_tag: Token.Tag) !TokenIndex {
     if (!p.check(expected_tag)) {
-        log.err("failed to consume {}\n", .{expected_tag});
         return p.failExpected(expected_tag);
     }
 

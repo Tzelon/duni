@@ -126,7 +126,12 @@ pub fn parse(gpa: Allocator, source: [:0]const u8) !Ast {
     const estimated_node_count = (tokens_slice.len + 2) / 2;
     try parser.nodes.ensureTotalCapacity(gpa, estimated_node_count);
 
-    try parser.parseRoot();
+    // A fatal parse error is still a *parse result*: the error is already
+    // recorded, and the caller reads `errors` — never a Zig error.
+    parser.parseRoot() catch |err| switch (err) {
+        error.ParseError => assert(parser.errors.items.len > 0),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 
     try parser.extra_data.shrinkToLen(gpa);
     try parser.errors.shrinkToLen(gpa);
@@ -249,6 +254,7 @@ pub const Error = struct {
 
     pub const Tag = enum {
         expected_return_type,
+        expression_nested_too_deeply,
         expected_comma_after_arg,
         expected_token,
         expected_expression,
@@ -306,11 +312,15 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
 
         .string_literal,
         .number_literal,
+        .bool_literal,
         .identifier,
         .negation,
+        .bool_not,
         .block,
         .fn_decl,
         .grouped_expression,
+        .if_simple,
+        .if_else,
         => return tree.nodeMainToken(n),
 
         .fn_proto => {
@@ -320,7 +330,20 @@ pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {
             return main_token;
         },
 
-        .add, .sub, .mul, .div, .assign => n = tree.nodeData(n).node_and_node[0],
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .assign,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
+        => n = tree.nodeData(n).node_and_node[0],
 
         .call => n = tree.nodeData(n).node_and_extra[0],
     };
@@ -330,15 +353,23 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
     var n = node;
     while (true) switch (tree.nodeTag(n)) {
         .root => return @intCast(tree.tokens.len - 1),
-        .identifier, .string_literal, .number_literal => return tree.nodeMainToken(n),
+        .identifier, .string_literal, .number_literal, .bool_literal => return tree.nodeMainToken(n),
 
-        .negation => n = tree.nodeData(n).node,
+        .negation, .bool_not => n = tree.nodeData(n).node,
 
         .add,
         .sub,
         .mul,
         .div,
         .assign,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
         .fn_decl,
         => n = tree.nodeData(n).node_and_node[1],
 
@@ -364,6 +395,13 @@ pub fn lastToken(tree: *const Ast, node: Node.Index) TokenIndex {
             }
             // No return type (recoverable error): the params `)` ends the proto.
             return tree.extraData(extra_index, Node.FnProto).rparen;
+        },
+
+        .if_simple => n = tree.nodeData(n).node_and_node[1],
+
+        .if_else => {
+            _, const extra_index = tree.nodeData(n).node_and_extra;
+            n = tree.extraData(extra_index, Node.If).else_expr;
         },
     };
 }
@@ -523,11 +561,11 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
     switch (tree.nodeTag(node)) {
         .root => unreachable, // the root is never a child
 
-        .identifier, .number_literal, .string_literal => {
+        .identifier, .number_literal, .string_literal, .bool_literal => {
             try std.testing.expectEqual(0, expected.children.len);
         },
 
-        .negation => {
+        .negation, .bool_not => {
             try std.testing.expectEqual(1, expected.children.len);
             try expectNode(tree, tree.nodeData(node).node, expected.children[0]);
         },
@@ -537,7 +575,21 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
             try expectNode(tree, tree.nodeData(node).node_and_token[0], expected.children[0]);
         },
 
-        .add, .sub, .mul, .div, .assign, .fn_decl => {
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .assign,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
+        .fn_decl,
+        => {
             try std.testing.expectEqual(2, expected.children.len);
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             try expectNode(tree, lhs, expected.children[0]);
@@ -562,6 +614,24 @@ fn expectNode(tree: *const Ast, node: Node.Index, expected: Expected) !void {
             for (args, expected.children[1..]) |arg, expected_child| {
                 try expectNode(tree, arg, expected_child);
             }
+        },
+
+        // Children are the condition and the then block.
+        .if_simple => {
+            try std.testing.expectEqual(2, expected.children.len);
+            const cond, const then_expr = tree.nodeData(node).node_and_node;
+            try expectNode(tree, cond, expected.children[0]);
+            try expectNode(tree, then_expr, expected.children[1]);
+        },
+
+        // Children are the condition, the then block, and the else branch.
+        .if_else => {
+            try std.testing.expectEqual(3, expected.children.len);
+            const cond, const extra_index = tree.nodeData(node).node_and_extra;
+            const if_extra = tree.extraData(extra_index, Node.If);
+            try expectNode(tree, cond, expected.children[0]);
+            try expectNode(tree, if_extra.then_expr, expected.children[1]);
+            try expectNode(tree, if_extra.else_expr, expected.children[2]);
         },
 
         // Children are the param types followed by the return type, if any.
@@ -614,6 +684,81 @@ test "left associative & precedence" {
             .{ .tag = .number_literal },
         } },
         .{ .tag = .number_literal },
+    } });
+}
+
+test "comparison and logical precedence" {
+    // grammar.y order: or < and < equality < comparison < term. One shape
+    // pins the whole chain: `1 + 2 < 3 and x == true or !y`
+    // = ((((1 + 2) < 3) and (x == true)) or (!y)).
+    try expectAst("1 + 2 < 3 and x == true or !y", .{ .tag = .bool_or, .children = &.{
+        .{ .tag = .bool_and, .children = &.{
+            .{ .tag = .less_than, .children = &.{
+                .{ .tag = .add, .children = &.{
+                    .{ .tag = .number_literal },
+                    .{ .tag = .number_literal },
+                } },
+                .{ .tag = .number_literal },
+            } },
+            .{ .tag = .equal_equal, .children = &.{
+                .{ .tag = .identifier },
+                .{ .tag = .bool_literal },
+            } },
+        } },
+        .{ .tag = .bool_not, .children = &.{
+            .{ .tag = .identifier },
+        } },
+    } });
+
+    // The remaining comparison operators parse to their own tags.
+    try expectAst("1 != 2", .{ .tag = .bang_equal, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("1 <= 2", .{ .tag = .less_or_equal, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("1 > 2", .{ .tag = .greater_than, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("1 >= 2", .{ .tag = .greater_or_equal, .children = &.{
+        .{ .tag = .number_literal },
+        .{ .tag = .number_literal },
+    } });
+    try expectAst("false", .{ .tag = .bool_literal });
+}
+
+test "if expression" {
+    // Else-less: two children. The condition stops at `{` on its own.
+    try expectAst("if x > 1 { 2 }", .{ .tag = .if_simple, .children = &.{
+        .{ .tag = .greater_than, .children = &.{
+            .{ .tag = .identifier },
+            .{ .tag = .number_literal },
+        } },
+        .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+    } });
+
+    // With else, and an else-if chain: the else branch is another if.
+    try expectAst("if a { 1 } else if b { 2 } else { 3 }", .{ .tag = .if_else, .children = &.{
+        .{ .tag = .identifier },
+        .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+        .{ .tag = .if_else, .children = &.{
+            .{ .tag = .identifier },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+        } },
+    } });
+
+    // `if` is an expression: it nests inside a call argument.
+    try expectAst("f(if c { 1 } else { 2 })", .{ .tag = .call, .children = &.{
+        .{ .tag = .identifier },
+        .{ .tag = .if_else, .children = &.{
+            .{ .tag = .identifier },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+            .{ .tag = .block, .children = &.{.{ .tag = .number_literal }} },
+        } },
     } });
 }
 

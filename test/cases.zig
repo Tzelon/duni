@@ -93,6 +93,9 @@ pub fn addCases(b: *std.Build, step: *std.Build.Step, options: Options) !void {
 
                 const assemble = b.addSystemCommand(&.{wat2wasm_path});
                 assemble.setName(b.fmt("wat2wasm {s}", .{case_name}));
+                // Tail calls are a minimum engine requirement of the
+                // language (notes/tail_calls.md).
+                assemble.addArg("--enable-tail-call");
                 assemble.addFileArg(wat);
                 assemble.addArg("-o");
                 const wasm = assemble.addOutputFileArg("case.wasm");

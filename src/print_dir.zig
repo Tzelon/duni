@@ -121,6 +121,13 @@ fn markBody(self: *Print, baselines: []Ast.Node.Index, body: []const Dir.Inst.In
                 const body_len = self.code.extra[idx];
                 self.markBody(baselines, self.code.bodySlice(idx + 1, body_len), baseline);
             },
+            .condbr => {
+                const idx = datas[@intFromEnum(inst)].pl_node.payload_index;
+                const then_body_len = self.code.extra[idx + 1];
+                const else_body_len = self.code.extra[idx + 2];
+                self.markBody(baselines, self.code.bodySlice(idx + 3, then_body_len), baseline);
+                self.markBody(baselines, self.code.bodySlice(idx + 3 + then_body_len, else_body_len), baseline);
+            },
             .param => {
                 const idx = datas[@intFromEnum(inst)].pl_tok.payload_index;
                 const ptype: Dir.Inst.Param.Type = @bitCast(self.code.extra[idx + 1]);
@@ -149,11 +156,12 @@ fn writeInst(self: *Print, tag: Dir.Inst.Tag, data: Dir.Inst.Data) !void {
         .int_big => try self.writeIntBig(data),
         .float => try self.writeFloat(data),
         .int => try self.writeInt(data),
-        .negate => try self.writeUnNode(data),
+        .negate, .bool_not, .ret_node => try self.writeUnNode(data),
         .str => try self.writeStr(data),
         .decl_val => try self.writeStrTok(data),
-        .add, .sub, .mul, .div => try self.writePlNodeBin(data),
+        .add, .sub, .mul, .div, .cmp_eq, .cmp_neq, .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte => try self.writePlNodeBin(data),
         .block, .block_inline => try self.writeBlock(data),
+        .condbr => try self.writeCondBr(data),
         .@"break", .break_inline => try self.writeBreak(data),
         .declaration => try self.writeDeclaration(data),
         .func => try self.writeFunc(data),
@@ -202,6 +210,31 @@ fn writeBlock(self: *Print, data: Dir.Inst.Data) !void {
         try self.writeRef(inst_idx.toRef());
     }
     try self.w.writeAll(")");
+    try self.writeSrcNode(data.pl_node.src_node);
+}
+
+fn writeCondBr(self: *Print, data: Dir.Inst.Data) !void {
+    // CondBr payload: { condition, then_body_len, else_body_len }, then the
+    // two bodies.
+    const idx = data.pl_node.payload_index;
+    const condition: Dir.Inst.Ref = @enumFromInt(self.code.extra[idx]);
+    const then_body_len = self.code.extra[idx + 1];
+    const else_body_len = self.code.extra[idx + 2];
+
+    try self.writeRef(condition);
+    try self.w.writeAll(", then={");
+    for (0..then_body_len) |i| {
+        if (i > 0) try self.w.writeAll(", ");
+        const inst: Dir.Inst.Index = @enumFromInt(self.code.extra[idx + 3 + i]);
+        try self.writeRef(inst.toRef());
+    }
+    try self.w.writeAll("}, else={");
+    for (0..else_body_len) |i| {
+        if (i > 0) try self.w.writeAll(", ");
+        const inst: Dir.Inst.Index = @enumFromInt(self.code.extra[idx + 3 + then_body_len + i]);
+        try self.writeRef(inst.toRef());
+    }
+    try self.w.writeAll("})");
     try self.writeSrcNode(data.pl_node.src_node);
 }
 

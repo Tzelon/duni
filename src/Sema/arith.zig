@@ -52,6 +52,20 @@ pub fn div(sema: *Sema, ip: *InternPool, lhs_val: Value, rhs_val: Value) !Value 
     return floatDiv(sema, ip, lhs_val, rhs_val);
 }
 
+/// Applies a comparison operator to comptime-known numeric values.
+/// Two ints compare in exact big-int order; a float operand makes it an
+/// IEEE f64 comparison (mirrors how the arithmetic ops pick int vs float).
+pub fn cmp(ip: *const InternPool, op: std.math.CompareOperator, lhs: Value, rhs: Value, is_int: bool) bool {
+    if (is_int) {
+        var lhs_space: Value.BigIntSpace = undefined;
+        var rhs_space: Value.BigIntSpace = undefined;
+        const lhs_bigint = lhs.toBigInt(&lhs_space, ip);
+        const rhs_bigint = rhs.toBigInt(&rhs_space, ip);
+        return lhs_bigint.order(rhs_bigint).compare(op);
+    }
+    return std.math.compare(lhs.toFloat(f64, ip), op, rhs.toFloat(f64, ip));
+}
+
 // Int
 
 /// Add two integers, returning a `comptime_int` regardless of the input types.

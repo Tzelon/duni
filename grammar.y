@@ -14,11 +14,15 @@ paramDecl -> IDENTIFIER typeExpr
 typeExpr -> IDENTIFIER ;
 
 # *** Block level ***
-statement -> exprStmt | printStmt | returnStmt | ifStmt | block;
+statement -> exprStmt | printStmt | returnStmt | block;
 
 # Not sure I want returnStmt
 returnStmt -> "return" expression? NEWLINE ;
-ifStmt -> "if" "(" expression ")" statement ( "else" statement )? ;
+
+# `if` is an expression: block branches, no parens around the condition
+# (a parenthesized condition is just a grouping expression). `else` is
+# optional — an else-less `if` types as void (notes/control_flow.md).
+ifExpr -> "if" expression block ( "else" ( block | ifExpr ) )? ;
 
 block -> "{" statement* "}" ;
 
@@ -43,4 +47,4 @@ factor -> unary ( ("/" | "*") unary )* ;
 unary -> ("-", "!") unary | call ;
 call -> primary ( "(" arguments? ")" | "." IDENTIFIER )* ;
 arguments -> expression ( "," expression )* ;
-primary -> NUMBER | STRING | "true" | "false" | "nil" | "this" | "(" expression ")" | IDENTIFIER | "super" "." IDENTIFIER ;
+primary -> NUMBER | STRING | "true" | "false" | ifExpr | "(" expression ")" | IDENTIFIER ;

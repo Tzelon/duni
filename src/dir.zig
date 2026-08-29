@@ -67,6 +67,21 @@ pub const Inst = struct {
         /// Same as sub with a lhs of 0, split into a separate instruction to save memory.
         /// Uses `un_node`.
         negate,
+        /// `lhs == rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_eq,
+        /// `lhs != rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_neq,
+        /// `lhs < rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_lt,
+        /// `lhs <= rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_lte,
+        /// `lhs > rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_gt,
+        /// `lhs >= rhs`. Uses the `pl_node` union field. Payload is `Bin`.
+        cmp_gte,
+        /// Boolean negation: `!operand`. The operand must be a Bool.
+        /// Uses `un_node`.
+        bool_not,
         /// A block of code, which return a value.
         /// Uses the `pl_node` union field. Payload is `Block`.
         block,
@@ -74,6 +89,11 @@ pub const Inst = struct {
         /// Uses the `break` union field.
         /// Uses the source information from previous instruction.
         @"break",
+        /// Conditional branch. Terminates the enclosing `block`'s body: each
+        /// of the two trailing bodies ends with a `break` to that block
+        /// carrying its branch's value.
+        /// Uses the `pl_node` union field. Payload is `CondBr`.
+        condbr,
         /// A list of instructions which are analyzed in the parent context, without
         /// generating a runtime block. Must terminate with an "inline" variant of
         /// a noreturn instruction.
@@ -106,6 +126,13 @@ pub const Inst = struct {
         /// Uses the `pl_node` union field with payload `Call`.
         /// AST node is the function call.
         call,
+
+        /// Sends control flow back to the function's callers, carrying the
+        /// return value. Terminates a function value body (the implicit
+        /// return of the body's last expression; an explicit `return`
+        /// statement lands here too when it arrives).
+        /// Uses the `un_node` union field.
+        ret_node,
 
         /// Returns a function type, or a function instance, depending on whether
         /// the body_len is 0. Calling convention is auto.
@@ -177,6 +204,7 @@ pub const Inst = struct {
         f64_type,
         comptime_int_type,
         comptime_float_type,
+        bool_type,
         string_type,
         void_type,
         type_type,
@@ -184,6 +212,8 @@ pub const Inst = struct {
         zero,
         one,
         negative_one,
+        bool_true,
+        bool_false,
         void_value,
 
         /// This Ref does not correspond to any DIR instruction or constant
@@ -309,6 +339,14 @@ pub const Inst = struct {
     /// Each operand is an `Index`.
     pub const Block = struct {
         body_len: u32,
+    };
+
+    /// Stored inside extra. Trailing: the then body's `then_body_len`
+    /// instruction indices, then the else body's `else_body_len`.
+    pub const CondBr = struct {
+        condition: Ref,
+        then_body_len: u32,
+        else_body_len: u32,
     };
 
     /// Trailing: inst: Index // for every body_len

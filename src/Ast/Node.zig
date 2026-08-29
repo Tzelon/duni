@@ -26,6 +26,11 @@ pub const Tag = enum {
     /// The `data` field is unused.
     number_literal,
 
+    /// `true` / `false` — which one is recovered from the `main_token`
+    /// (a `keyword_true` or `keyword_false` token). The `data` field is
+    /// unused.
+    bool_literal,
+
     /// The `data` field is unused.
     ///
     /// The `main_token` field is the string literal token.
@@ -45,6 +50,33 @@ pub const Tag = enum {
 
     /// `-expr`. The `main_token` field is the `-` token.
     negation,
+
+    /// `lhs == rhs`. The `main_token` field is the `==` token.
+    equal_equal,
+
+    /// `lhs != rhs`. The `main_token` field is the `!=` token.
+    bang_equal,
+
+    /// `lhs < rhs`. The `main_token` field is the `<` token.
+    less_than,
+
+    /// `lhs <= rhs`. The `main_token` field is the `<=` token.
+    less_or_equal,
+
+    /// `lhs > rhs`. The `main_token` field is the `>` token.
+    greater_than,
+
+    /// `lhs >= rhs`. The `main_token` field is the `>=` token.
+    greater_or_equal,
+
+    /// `lhs and rhs`, short-circuit. The `main_token` field is the `and` token.
+    bool_and,
+
+    /// `lhs or rhs`, short-circuit. The `main_token` field is the `or` token.
+    bool_or,
+
+    /// `!expr`. The `main_token` field is the `!` token.
+    bool_not,
 
     /// `lhs = rhs`. The `main_token` field is the `=` token.
     assign,
@@ -94,6 +126,25 @@ pub const Tag = enum {
     ///
     /// The `main_token` field is the `(` token.
     grouped_expression,
+
+    /// `if cond { then }` — no `else`; the whole expression types as void.
+    ///
+    /// The `data` field is a `.node_and_node`:
+    ///   1. a `Node.Index` to the condition expression.
+    ///   2. a `Node.Index` to the then block.
+    ///
+    /// The `main_token` field is the `if` token.
+    if_simple,
+
+    /// `if cond { then } else { els }` — the else branch may also be
+    /// another `if` (else-if chains).
+    ///
+    /// The `data` field is a `.node_and_extra`:
+    ///   1. a `Node.Index` to the condition expression.
+    ///   2. a `ExtraIndex` to an `If`.
+    ///
+    /// The `main_token` field is the `if` token.
+    if_else,
 };
 
 pub const Data = union {
@@ -192,4 +243,9 @@ pub const Block = struct {
     expressions_end: ExtraIndex,
     /// Needed to make lastToken() work.
     rbrace: TokenIndex,
+};
+
+pub const If = struct {
+    then_expr: Index,
+    else_expr: Index,
 };

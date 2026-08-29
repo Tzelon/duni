@@ -52,6 +52,7 @@ pub const Index = enum(u32) {
     f64_type,
     comptime_int_type,
     comptime_float_type,
+    bool_type,
     string_type,
     void_type,
     type_type,
@@ -62,6 +63,10 @@ pub const Index = enum(u32) {
     one,
     /// `-1` (comptime_int)
     negative_one,
+    /// `true`
+    bool_true,
+    /// `false`
+    bool_false,
     /// `()`
     void_value,
 
@@ -99,6 +104,7 @@ pub const Key = union(enum) {
 
     simple_value: SimpleValue,
     @"extern": Extern,
+    func: Func,
     func_type: FuncType,
 
     pub const Int = struct {
@@ -154,6 +160,17 @@ pub const Key = union(enum) {
         }
     };
 
+    pub const Func = struct {
+        /// The function's type (its `func_type`).
+        ty: Index,
+        /// The `func` Dir instruction that owns this function's body — the
+        /// function's identity (Zig: `zir_body_inst`). Distinct functions
+        /// with the same type stay distinct through it. Callers/codegen get
+        /// the *name* from the declaration layer (`Sema.Result`), never from
+        /// the pool.
+        dir_inst: u32,
+    };
+
     pub const Extern = struct {
         /// The name of the extern function; the wasm import's field name.
         name: NullTerminatedString,
@@ -202,6 +219,8 @@ pub const Key = union(enum) {
             .string => |str| Hash.hash(seed, asBytes(&str)),
 
             .@"extern" => |ext| Hash.hash(seed, asBytes(&ext)),
+
+            .func => |func| Hash.hash(seed, asBytes(&func)),
 
             .func_type => |func| {
                 var hasher = Hash.init(seed);
@@ -275,6 +294,8 @@ pub const Key = union(enum) {
 
             .@"extern" => |a_info| return std.meta.eql(a_info, b.@"extern"),
 
+            .func => |a_info| return std.meta.eql(a_info, b.func),
+
             .func_type => |a_info| return a_info.eql(b.func_type, ip),
         }
     }
@@ -291,12 +312,15 @@ pub const SimpleType = enum(u32) {
     u64 = @intFromEnum(Index.u64_type),
     i64 = @intFromEnum(Index.i64_type),
     f64 = @intFromEnum(Index.f64_type),
+    bool = @intFromEnum(Index.bool_type),
     string = @intFromEnum(Index.string_type),
     void = @intFromEnum(Index.void_type),
     type = @intFromEnum(Index.type_type),
 };
 
 pub const SimpleValue = enum(u32) {
+    true = @intFromEnum(Index.bool_true),
+    false = @intFromEnum(Index.bool_false),
     void = @intFromEnum(Index.void_value),
 };
 
@@ -321,8 +345,8 @@ pub fn init(ip: *InternPool, gpa: Allocator) !void {
     if (std.debug.runtime_safety) {
         // Sanity check.
         assert(ip.indexToKey(.void_value).simple_value == .void);
-        // assert(ip.indexToKey(.bool_true).simple_value == .true);
-        // assert(ip.indexToKey(.bool_false).simple_value == .false);
+        assert(ip.indexToKey(.bool_true).simple_value == .true);
+        assert(ip.indexToKey(.bool_false).simple_value == .false);
     }
 }
 
@@ -463,6 +487,13 @@ pub fn get(ip: *InternPool, gpa: Allocator, key: Key) Allocator.Error!Index {
             });
         },
 
+        .func => |func| {
+            ip.items.appendAssumeCapacity(.{
+                .tag = .func,
+                .data = try addExtra(ip, gpa, func),
+            });
+        },
+
         .func_type => unreachable, // use getFuncType() instead
     }
 
@@ -579,6 +610,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .string => .{ .string = @enumFromInt(data) },
 
         .@"extern" => .{ .@"extern" = extraData(ip, Key.Extern, data) },
+
+        .func => .{ .func = extraData(ip, Key.Func, data) },
 
         .type_function => .{ .func_type = extraFuncType(ip, data) },
     };
@@ -742,12 +775,14 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
         .i32_type,
         .u64_type,
         .i64_type,
+        .bool_type,
         .string_type,
         .void_type,
         .type_type,
         => .type_type,
 
         .zero, .one, .negative_one => .comptime_int_type,
+        .bool_true, .bool_false => .bool_type,
         .void_value => .void_type,
 
         // This optimization on tags is needed so that indexToKey can call
@@ -782,6 +817,8 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
                 },
 
                 .@"extern" => extraData(ip, Key.Extern, item.data).ty,
+
+                .func => extraData(ip, Key.Func, item.data).ty,
 
                 // values, not types
                 .simple_value,
@@ -896,6 +933,9 @@ pub const Tag = enum(u8) {
     /// An extern function (a host import).
     /// `data` is extra index to `Key.Extern`.
     @"extern",
+    /// A function with a body, defined in this module.
+    /// `data` is extra index to `Key.Func`.
+    func,
 
     pub const TypeFunction = struct {
         params_len: u32,
@@ -913,6 +953,7 @@ pub const static_keys: [static_len]Key = .{
     .{ .simple_type = .f64 },
     .{ .simple_type = .comptime_int },
     .{ .simple_type = .comptime_float },
+    .{ .simple_type = .bool },
     .{ .simple_type = .string },
     .{ .simple_type = .void },
     .{ .simple_type = .type },
@@ -929,6 +970,8 @@ pub const static_keys: [static_len]Key = .{
         .ty = .comptime_int_type,
         .storage = .{ .i64 = -1 },
     } },
+    .{ .simple_value = .true },
+    .{ .simple_value = .false },
     .{ .simple_value = .void },
 };
 
@@ -1003,6 +1046,24 @@ test "InternPool extern dedups" {
     const c = try ip.get(gpa, .{ .@"extern" = .{ .name = puts, .ty = ty, .lib_name = .none } });
     try std.testing.expect(a == b);
     try std.testing.expect(a != c);
+}
+
+test "InternPool func value dedups by owning instruction and has its fn type" {
+    const gpa = std.testing.allocator;
+    var ip: InternPool = .{};
+    try ip.init(gpa);
+    defer ip.deinit(gpa);
+
+    const ty = try ip.getFuncType(gpa, .{ .param_types = &.{.f64_type}, .return_type = .f64_type });
+
+    const a = try ip.get(gpa, .{ .func = .{ .ty = ty, .dir_inst = 7 } });
+    const b = try ip.get(gpa, .{ .func = .{ .ty = ty, .dir_inst = 7 } });
+    // Same type but a different owning `func` instruction: a distinct function.
+    const c = try ip.get(gpa, .{ .func = .{ .ty = ty, .dir_inst = 9 } });
+    try std.testing.expect(a == b);
+    try std.testing.expect(a != c);
+    try std.testing.expectEqual(ty, ip.typeOf(a));
+    try std.testing.expectEqual(@as(u32, 7), ip.indexToKey(a).func.dir_inst);
 }
 
 test "InternPool dedups string values" {

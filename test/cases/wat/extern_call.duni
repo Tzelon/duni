@@ -8,8 +8,7 @@ print(43)
 //   (import "host" "print" (func $print (param f64) (result f64)))
 //   (func $main (result f64)
 //     f64.const 43
-//     call $print
-//     return
+//     return_call $print
 //   )
 //   (export "main" (func $main))
 // )

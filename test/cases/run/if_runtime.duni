@@ -1,0 +1,7 @@
+extern fn print(x number) number
+
+print(if print(1) < 2 { 10 } else { 20 })
+
+// run
+// expect_stdout=1
+// expect_stdout=10

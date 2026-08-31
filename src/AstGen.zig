@@ -1071,6 +1071,7 @@ fn deinit(astgen: *AstGen, gpa: Allocator) void {
     astgen.string_bytes.deinit(gpa);
     astgen.string_table.deinit(gpa);
     astgen.scratch.deinit(gpa);
+    astgen.compile_errors.deinit(gpa);
     astgen.scope_arena.deinit();
 }
 
@@ -1794,7 +1795,13 @@ test "negative zero int is rejected" {
 
     var tree = try Ast.parse(gpa, "-0");
     defer tree.deinit(gpa);
-    try std.testing.expectError(error.AnalysisFail, AstGen.generate(gpa, tree));
+
+    // Fatal AstGen error: no instructions, and the compile_errors header
+    // slot points at a `CompileErrors` payload.
+    var dir = try AstGen.generate(gpa, tree);
+    defer dir.deinit(gpa);
+    try std.testing.expectEqual(0, dir.instructions.len);
+    try std.testing.expect(dir.extra[@intFromEnum(Dir.ExtraIndex.compile_errors)] != 0);
 }
 
 test "bind expression" {

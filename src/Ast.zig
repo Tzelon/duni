@@ -9,6 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
 
 const scan = @import("scanner.zig");
 const Scanner = scan.Scanner;
@@ -36,6 +37,25 @@ pub const ByteOffset = u32;
 
 /// Index into `tokens`.
 pub const TokenIndex = u32;
+
+/// Index into `tokens`, or null.
+pub const OptionalTokenIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn unwrap(oti: OptionalTokenIndex) ?TokenIndex {
+        return if (oti == .none) null else @intFromEnum(oti);
+    }
+
+    pub fn fromToken(ti: TokenIndex) OptionalTokenIndex {
+        return @enumFromInt(ti);
+    }
+
+    pub fn fromOptional(oti: ?TokenIndex) OptionalTokenIndex {
+        return if (oti) |ti| @enumFromInt(ti) else .none;
+    }
+};
+
 pub const TokenList = std.MultiArrayList(struct {
     tag: Token.Tag,
     start: ByteOffset,
@@ -241,6 +261,7 @@ pub fn deinit(tree: *Ast, gpa: Allocator) void {
 
 pub const Error = struct {
     tag: Tag,
+    /// A child note of a parent error, appended immediately after the parent.
     is_note: bool = false,
     /// True if `token` points to the token before the token causing an issue.
     token_is_prev: bool = false,
@@ -248,16 +269,11 @@ pub const Error = struct {
     extra: union { none: void, expected_tag: Token.Tag } = .{ .none = {} },
 
     pub const Tag = enum {
-        expected_return_type,
-        expected_comma_after_arg,
-        expected_token,
-        expected_expression,
-        expected_semi_or_lbrace,
-        expected_type_expr,
-        expected_comma_after_param,
-        expected_fn,
-        expected_newline,
         expected_callee,
+        expected_expression,
+        expected_return_type,
+        expected_token,
+        expected_type_expr,
     };
 };
 
@@ -297,6 +313,49 @@ pub fn tokensToSpan(tree: *const Ast, start: Ast.TokenIndex, end: Ast.TokenIndex
     const start_off = tree.tokenStart(start_tok);
     const end_off = tree.tokenStart(end_tok) + @as(u32, @intCast(tree.tokenSlice(end_tok).len));
     return Span{ .start = start_off, .end = end_off, .main = tree.tokenStart(main) };
+}
+
+pub fn renderError(tree: Ast, parse_error: Error, w: *Writer) Writer.Error!void {
+    switch (parse_error.tag) {
+        .expected_callee => {
+            return w.print("expected a function name, found '{s}'", .{
+                tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev)).symbol(),
+            });
+        },
+        .expected_expression => {
+            return w.print("expected expression, found '{s}'", .{
+                tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev)).symbol(),
+            });
+        },
+        .expected_return_type => {
+            return w.print("expected return type expression, found '{s}'", .{
+                tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev)).symbol(),
+            });
+        },
+        .expected_type_expr => {
+            return w.print("expected type expression, found '{s}'", .{
+                tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev)).symbol(),
+            });
+        },
+        .expected_token => {
+            const found_tag = tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev));
+            const expected_symbol = parse_error.extra.expected_tag.symbol();
+            switch (found_tag) {
+                .invalid => return w.print("expected '{s}', found invalid bytes", .{
+                    expected_symbol,
+                }),
+                else => return w.print("expected '{s}', found '{s}'", .{
+                    expected_symbol, found_tag.symbol(),
+                }),
+            }
+        },
+    }
+}
+
+/// Returns an extra offset for column and byte offset of errors that
+/// should point after the token in the error message.
+pub fn errorOffset(tree: Ast, parse_error: Error) u32 {
+    return if (parse_error.token_is_prev) @intCast(tree.tokenSlice(parse_error.token).len) else 0;
 }
 
 pub fn firstToken(tree: *const Ast, node: Node.Index) TokenIndex {

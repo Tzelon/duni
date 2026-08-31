@@ -31,6 +31,17 @@ string_bytes: []u8,
 /// The first few indexes are reserved. See `ExtraIndex` for the values.
 extra: []u32,
 
+pub const ExtraIndex = enum(u32) {
+    /// If this is 0, no compile errors. Otherwise there is a `CompileErrors`
+    /// payload at this index.
+    compile_errors,
+    /// If this is 0, this file contains no imports. Otherwise there is a `Imports`
+    /// payload at this index.
+    imports,
+
+    _,
+};
+
 /// These are untyped instructions generated from an Abstract Syntax Tree.
 /// The data here is immutable because it is possible to have multiple
 /// analyses on the same DIR happening at the same time.
@@ -418,6 +429,32 @@ pub const Inst = struct {
     pub const Call = struct {
         args_len: u32,
         callee: Ref,
+    };
+
+    /// Trailing: `CompileErrors.Item` for each `items_len`.
+    pub const CompileErrors = struct {
+        items_len: u32,
+
+        /// Trailing: `note_payload_index: u32` for each `notes_len`.
+        /// It's a payload index of another `Item`.
+        pub const Item = struct {
+            /// null terminated string index
+            msg: NullTerminatedString,
+            node: Ast.Node.OptionalIndex,
+            /// If node is .none then this will be populated.
+            token: Ast.OptionalTokenIndex,
+            /// Can be used in combination with `token`.
+            byte_offset: u32,
+            /// 0 or a payload index of a `Block`, each is a payload
+            /// index of another `Item`.
+            notes: u32,
+
+            pub fn notesLen(item: Item, dir: Dir) u32 {
+                if (item.notes == 0) return 0;
+                const block = dir.extraData(Block, item.notes);
+                return block.data.body_len;
+            }
+        };
     };
 };
 

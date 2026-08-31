@@ -492,7 +492,6 @@ fn check(p: *Parse, expected_tag: Token.Tag) bool {
 /// consume the current token only if the current token matches the type
 fn consume(p: *Parse, expected_tag: Token.Tag) !TokenIndex {
     if (!p.check(expected_tag)) {
-        log.err("failed to consume {}\n", .{expected_tag});
         return p.failExpected(expected_tag);
     }
 

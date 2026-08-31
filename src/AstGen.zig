@@ -40,6 +40,7 @@ scope_arena: std.heap.ArenaAllocator,
 /// Used for temporary allocations; freed after AstGen is complete.
 /// The resulting DIR code has no references to anything in this arena.
 arena: Allocator,
+compile_errors: ArrayList(Dir.Inst.CompileErrors.Item) = .empty,
 
 /// dedupe table of strings
 string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
@@ -78,14 +79,43 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
         .instructions_top = 0,
     };
 
-    const module_ref = try rootModuleDecl(&main_gd, .root, tree.rootDecls());
-    assert(module_ref.toIndex().? == .main_module_inst);
+    // The AST -> DIR lowering process assumes an AST that does not have any parse errors.
+    // Parse errors, or AstGen errors in the root struct, are considered "fatal", so we emit no DIR.
+    const fatal = if (tree.errors.len == 0) fatal: {
+        if (rootModuleDecl(&main_gd, .root, tree.rootDecls())) |struct_decl_ref| {
+            assert(struct_decl_ref.toIndex().? == .main_module_inst);
+            break :fatal false;
+        } else |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.AnalysisFail => break :fatal true, // Handled via compile_errors below.
+        }
+    } else fatal: {
+        try lowerAstErrors(&astgen);
+        break :fatal true;
+    };
+
+    // write the compile_errors into the DIR's fixed header slot
+    const err_index = @intFromEnum(Dir.ExtraIndex.compile_errors);
+    if (astgen.compile_errors.items.len == 0) {
+        astgen.extra.items[err_index] = 0;
+    } else {
+        try astgen.extra.ensureUnusedCapacity(gpa, 1 + astgen.compile_errors.items.len *
+            @typeInfo(Dir.Inst.CompileErrors.Item).@"struct".fields.len);
+
+        astgen.extra.items[err_index] = astgen.addExtraAssumeCapacity(Dir.Inst.CompileErrors{
+            .items_len = @intCast(astgen.compile_errors.items.len),
+        });
+
+        for (astgen.compile_errors.items) |item| {
+            _ = astgen.addExtraAssumeCapacity(item);
+        }
+    }
 
     try astgen.extra.shrinkToLen(gpa);
     try astgen.string_bytes.shrinkToLen(gpa);
 
     return .{
-        .instructions = astgen.instructions.toOwnedSlice(),
+        .instructions = if (fatal) .empty else astgen.instructions.toOwnedSlice(),
         .extra = astgen.extra.toOwnedSliceAssert(),
         .string_bytes = astgen.string_bytes.toOwnedSliceAssert(),
     };
@@ -688,6 +718,68 @@ fn parseStrLit(
     }
 }
 
+fn errNoteTok(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    comptime format: []const u8,
+    args: anytype,
+) Allocator.Error!u32 {
+    return errNoteTokOff(astgen, token, 0, format, args);
+}
+
+/// add a note to extra
+fn errNoteTokOff(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    byte_offset: u32,
+    comptime format: []const u8,
+    args: anytype,
+) Allocator.Error!u32 {
+    @branchHint(.cold);
+    const string_bytes = &astgen.string_bytes;
+    const msg: Dir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    try string_bytes.print(astgen.gpa, format ++ "\x00", args);
+    return astgen.addExtra(Dir.Inst.CompileErrors.Item{
+        .msg = msg,
+        .node = .none,
+        .token = .fromToken(token),
+        .byte_offset = byte_offset,
+        .notes = 0,
+    });
+}
+
+/// append error to compile_errors with the notes
+fn appendErrorTokNotesOff(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    byte_offset: u32,
+    comptime format: []const u8,
+    args: anytype,
+    notes: []const u32,
+) !void {
+    @branchHint(.cold);
+    const gpa = astgen.gpa;
+    const string_bytes = &astgen.string_bytes;
+    const msg: Dir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    try string_bytes.print(gpa, format ++ "\x00", args);
+
+    // append the notes indexes
+    const notes_index: u32 = if (notes.len != 0) blk: {
+        const notes_start = astgen.extra.items.len;
+        try astgen.extra.ensureTotalCapacity(gpa, notes_start + 1 + notes.len);
+        astgen.extra.appendAssumeCapacity(@intCast(notes.len));
+        astgen.extra.appendSliceAssumeCapacity(notes);
+        break :blk @intCast(notes_start);
+    } else 0;
+    try astgen.compile_errors.append(gpa, .{
+        .msg = msg,
+        .node = .none,
+        .token = .fromToken(token),
+        .byte_offset = byte_offset,
+        .notes = notes_index,
+    });
+}
+
 fn addExtra(astgen: *AstGen, extra: anytype) Allocator.Error!u32 {
     const field_count = std.meta.fieldNames(@TypeOf(extra)).len;
     try astgen.extra.ensureUnusedCapacity(astgen.gpa, field_count);
@@ -713,9 +805,13 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
             Dir.Inst.Index,
             Dir.NullTerminatedString,
             // Ast.TokenIndex is missing because it is a u32.
+            Ast.OptionalTokenIndex,
             Ast.Node.Index,
+            Ast.Node.OptionalIndex,
             => @intFromEnum(@field(extra, field.name)),
 
+            Ast.TokenOffset,
+            Ast.OptionalTokenOffset,
             Ast.Node.Offset,
             Ast.Node.OptionalOffset,
             => @bitCast(@intFromEnum(@field(extra, field.name))),
@@ -1467,6 +1563,46 @@ fn setDeclaration(
 
     args.value_gd.unstack();
     args.type_gd.unstack();
+}
+
+fn lowerAstErrors(astgen: *AstGen) error{OutOfMemory}!void {
+    const gpa = astgen.gpa;
+    const tree = astgen.tree;
+    assert(tree.errors.len > 0);
+
+    var msg: std.Io.Writer.Allocating = .init(gpa);
+    defer msg.deinit();
+    const msg_w = &msg.writer;
+
+    var notes: std.ArrayList(u32) = .empty;
+    defer notes.deinit(gpa);
+
+    //TODO(tzelon): we might want to handle bad byte inside a string/comment as special case.
+
+    var cur_err = tree.errors[0];
+    for (tree.errors[1..]) |err| {
+        if (err.is_note) {
+            tree.renderError(err, msg_w) catch return error.OutOfMemory;
+            try notes.append(gpa, try astgen.errNoteTok(err.token, "{s}", .{msg.written()}));
+        } else {
+            // Flush error
+            const extra_offset = tree.errorOffset(cur_err);
+            tree.renderError(cur_err, msg_w) catch return error.OutOfMemory;
+            try astgen.appendErrorTokNotesOff(cur_err.token, extra_offset, "{s}", .{msg.written()}, notes.items);
+            notes.clearRetainingCapacity();
+            cur_err = err;
+
+            // TODO: `Parse` currently does not have good error recovery mechanisms, so the remaining errors could be bogus.
+            // As such, we'll ignore all remaining errors for now. We should improve `Parse` so that we can report all the errors.
+            return;
+        }
+        msg.clearRetainingCapacity();
+    }
+
+    // Flush error
+    const extra_offset = tree.errorOffset(cur_err);
+    tree.renderError(cur_err, msg_w) catch return error.OutOfMemory;
+    try astgen.appendErrorTokNotesOff(cur_err.token, extra_offset, "{s}", .{msg.written()}, notes.items);
 }
 
 fn expect(source: [:0]const u8, expected: [:0]const u8) !void {

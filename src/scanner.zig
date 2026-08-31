@@ -349,6 +349,19 @@ pub const Token = struct {
                 .r_brace => "}",
             };
         }
+
+        /// How a diagnostic names this token.
+        pub fn symbol(tag: Tag) []const u8 {
+            return tag.lexeme() orelse switch (tag) {
+                .invalid => "invalid token",
+                .identifier => "an identifier",
+                .string_literal => "a string literal",
+                .eof => "EOF",
+                .number_literal => "a number literal",
+                .newline => "a newline",
+                else => unreachable,
+            };
+        }
     };
 };
 

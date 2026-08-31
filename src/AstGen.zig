@@ -66,6 +66,11 @@ pub fn generate(gpa: Allocator, tree: Ast) !Dir {
     try astgen.instructions.ensureTotalCapacity(gpa, tree.nodes.len);
     try astgen.extra.ensureTotalCapacity(gpa, tree.nodes.len);
 
+    // First few indexes of extra are reserved and set at the end.
+    const reserved_count = @typeInfo(Dir.ExtraIndex).@"enum".fields.len;
+    try astgen.extra.ensureTotalCapacity(gpa, tree.nodes.len + reserved_count);
+    astgen.extra.items.len += reserved_count;
+
     var top_scope: Scope.Top = .{};
     var instrs: ArrayList(Dir.Inst.Index) = .empty;
     defer instrs.deinit(gpa);
@@ -325,12 +330,15 @@ fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index,
 
     const result: Dir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
         .int => |num| switch (num) {
-            0 => if (sign == .positive) try gd.addInt(num) else {
-                // TODO(tzelon): report through AstGen error reporting once it
-                // exists; log.warn because the test runner fails on log.err.
-                std.log.warn("0 cannot be negative", .{});
-                return error.AnalysisFail;
-            },
+            0 => if (sign == .positive) try gd.addInt(num) else return astgen.failTokNotes(
+                num_token,
+                "integer literal '-0' is ambiguous",
+                .{},
+                &.{
+                    try astgen.errNoteTok(num_token, "use '0' for an integer zero", .{}),
+                    try astgen.errNoteTok(num_token, "use '-0.0' for a floating-point signed zero", .{}),
+                },
+            ),
 
             else => try gd.addInt(num),
         },
@@ -703,7 +711,6 @@ fn parseStrLit(
     bytes: []const u8,
     offset: u32,
 ) InnerError!void {
-    _ = token;
     const raw_string = bytes[offset..];
     const result = r: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(astgen.gpa, buf);
@@ -714,8 +721,19 @@ fn parseStrLit(
     };
     switch (result) {
         .success => return,
-        .failure => |err| return std.log.warn("{f}", .{err.fmt(raw_string)}), //astgen.failWithStrLitError(err, token, bytes, offset),
+        .failure => |err| return astgen.failWithStrLitError(err, token, bytes, offset),
     }
+}
+
+fn failTokNotes(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    comptime format: []const u8,
+    args: anytype,
+    notes: []const u32,
+) InnerError {
+    try appendErrorTokNotesOff(astgen, token, 0, format, args, notes);
+    return error.AnalysisFail;
 }
 
 fn errNoteTok(
@@ -748,6 +766,16 @@ fn errNoteTokOff(
     });
 }
 
+fn appendErrorTokNotes(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    comptime format: []const u8,
+    args: anytype,
+    notes: []const u32,
+) !void {
+    return appendErrorTokNotesOff(astgen, token, 0, format, args, notes);
+}
+
 /// append error to compile_errors with the notes
 fn appendErrorTokNotesOff(
     astgen: *AstGen,
@@ -778,6 +806,48 @@ fn appendErrorTokNotesOff(
         .byte_offset = byte_offset,
         .notes = notes_index,
     });
+}
+
+fn errNoteNode(
+    astgen: *AstGen,
+    node: Ast.Node.Index,
+    comptime format: []const u8,
+    args: anytype,
+) Allocator.Error!u32 {
+    @branchHint(.cold);
+    const string_bytes = &astgen.string_bytes;
+    const msg: Dir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    try string_bytes.print(astgen.gpa, format ++ "\x00", args);
+    return astgen.addExtra(Dir.Inst.CompileErrors.Item{
+        .msg = msg,
+        .node = node.toOptional(),
+        .token = .none,
+        .byte_offset = 0,
+        .notes = 0,
+    });
+}
+
+fn failWithStrLitError(
+    astgen: *AstGen,
+    err: std.zig.string_literal.Error,
+    token: Ast.TokenIndex,
+    bytes: []const u8,
+    offset: u32,
+) InnerError {
+    const raw_string = bytes[offset..];
+    return failOff(astgen, token, @intCast(offset + err.offset()), "{f}", .{err.fmt(raw_string)});
+}
+
+/// Same as `fail`, except given a token plus an offset from its starting byte offset.
+fn failOff(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    byte_offset: u32,
+    comptime format: []const u8,
+    args: anytype,
+) InnerError {
+    try appendErrorTokNotesOff(astgen, token, byte_offset, format, args, &.{});
+    return error.AnalysisFail;
 }
 
 fn addExtra(astgen: *AstGen, extra: anytype) Allocator.Error!u32 {
@@ -922,21 +992,20 @@ fn scanContainer(
             }
         }
 
-        // const token_bytes = astgen.tree.tokenSlice(name_token);
+        const token_bytes = astgen.tree.tokenSlice(name_token);
 
         find_scope: switch (namespace.parent.unwrap()) {
             .local_val => |local_val| {
                 if (local_val.name == name_str_index) {
-                    std.log.err("declaration shadows", .{});
-                    // try astgen.appendErrorTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
-                    //     token_bytes, @tagName(local_val.id_cat),
-                    // }, &.{
-                    //     try astgen.errNoteTok(
-                    //         local_val.token_src,
-                    //         "previous declaration here",
-                    //         .{},
-                    //     ),
-                    // });
+                    try astgen.appendErrorTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
+                        token_bytes, @tagName(local_val.id_cat),
+                    }, &.{
+                        try astgen.errNoteTok(
+                            local_val.token_src,
+                            "previous declaration here",
+                            .{},
+                        ),
+                    });
                     any_invalid_declarations = true;
                     break :find_scope;
                 }
@@ -954,19 +1023,18 @@ fn scanContainer(
         };
     }
 
-    for (names.keys(), names.values()) |_, first| {
+    for (names.keys(), names.values()) |name, first| {
         if (first.next == null) continue;
-        // var notes: std.ArrayList(u32) = .empty;
+        var notes: std.ArrayList(u32) = .empty;
         var prev: NameEntry = first;
         while (prev.next) |cur| : (prev = cur.*) {
-            std.log.err("duplicate name here", .{});
-            // try notes.append(astgen.arena, try astgen.errNoteTok(cur.tok, "duplicate name here", .{}));
+            try notes.append(astgen.arena, try astgen.errNoteTok(cur.tok, "duplicate name here", .{}));
         }
-        // try notes.append(astgen.arena, try astgen.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
-        // const name_duped = try astgen.arena.dupe(u8, mem.span(astgen.nullTerminatedString(name)));
+        try notes.append(astgen.arena, try astgen.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
+        const name_duped = try astgen.arena.dupe(u8, mem.span(astgen.nullTerminatedString(name)));
 
         std.log.err("duplicate {s} member name", .{@tagName(container_kind)});
-        // try astgen.appendErrorTokNotes(first.tok, "duplicate {s} member name '{s}'", .{ @tagName(container_kind), name_duped }, notes.items);
+        try astgen.appendErrorTokNotes(first.tok, "duplicate {s} member name '{s}'", .{ @tagName(container_kind), name_duped }, notes.items);
 
         any_invalid_declarations = true;
     }
@@ -1486,6 +1554,12 @@ pub const GenDir = struct {
         return new_index.toRef();
     }
 };
+
+/// This can only be for short-lived references; the memory becomes invalidated
+/// when another string is added.
+fn nullTerminatedString(astgen: AstGen, index: Dir.NullTerminatedString) [*:0]const u8 {
+    return @ptrCast(astgen.string_bytes.items[@intFromEnum(index)..]);
+}
 
 //TODO(tzelon): should all comptime expression needs to go through this function?
 fn comptimeExpr(

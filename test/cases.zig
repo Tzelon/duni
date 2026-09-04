@@ -1,6 +1,6 @@
 //! Data-driven compiler test harness (see test_plan.md §5).
 //!
-//! Walks `test/cases/` and builds one chain of Run steps per `.duni` case
+//! Walks `test/cases/` and builds one chain of build steps per `.duni` case
 //! file. A case file is the whole test: the program at the top, the expected
 //! result in a trailing `//` comment block (the footer). Subdirectories carry
 //! no meaning to the harness beyond the case name prefix.
@@ -64,19 +64,18 @@ pub fn addCases(b: *std.Build, step: *std.Build.Step, options: Options) !void {
         // The compiler must not see the footer — give it a stripped copy.
         const stripped_source = b.addWriteFiles().add(entry.basename, case.program);
 
-        const compile = b.addRunArtifact(options.duni_exe);
-        compile.setName(b.fmt("duni {s}", .{case_name}));
-        compile.addFileArg(stripped_source);
-
         switch (case.directive) {
             .wat => {
+                const compile = runCompiler(b, options.duni_exe, case_name, stripped_source);
                 compile.expectStdOutEqual(case.expected);
                 step.dependOn(ReportStep.create(b, case_name, &compile.step));
             },
             .@"error" => {
-                compile.expectExitCode(1);
-                const stderr_file = compile.captureStdErr(.{});
-                const check = DiagnosticsStep.create(b, case_name, stderr_file, stripped_source, case.expected);
+                const check = DiagnosticsStep.create(b, case_name, .{
+                    .exe = options.duni_exe.getEmittedBin(),
+                    .source_file = stripped_source,
+                    .expected = case.expected,
+                });
                 step.dependOn(ReportStep.create(b, case_name, check));
             },
             .run => {
@@ -89,6 +88,7 @@ pub fn addCases(b: *std.Build, step: *std.Build.Step, options: Options) !void {
                     continue;
                 };
 
+                const compile = runCompiler(b, options.duni_exe, case_name, stripped_source);
                 const wat = compile.captureStdOut(.{ .basename = "case.wat" });
 
                 const assemble = b.addSystemCommand(&.{wat2wasm_path});
@@ -115,23 +115,44 @@ pub fn addCases(b: *std.Build, step: *std.Build.Step, options: Options) !void {
     }
 }
 
-/// Compares the compiler's captured stderr against an `// error` case's
-/// expected diagnostics, byte for byte, after stripping the compiler's input
-/// path (a machine-specific cache path) so case files stay portable.
-/// Modeled on `std.Build.Step.CheckFile`.
+fn runCompiler(
+    b: *std.Build,
+    duni_exe: *std.Build.Step.Compile,
+    case_name: []const u8,
+    source_file: std.Build.LazyPath,
+) *std.Build.Step.Run {
+    const compile = b.addRunArtifact(duni_exe);
+    compile.setName(b.fmt("duni {s}", .{case_name}));
+    compile.addFileArg(source_file);
+    return compile;
+}
+
+/// Runs the compiler on an `// error` case and asserts both that it exited 1
+/// and that its stderr matches the case's expected diagnostics byte for byte,
+/// after stripping the compiler's input path (a machine-specific cache path)
+/// so case files stay portable.
+///
+/// This spawns the child itself rather than checking a `std.Build.Step.Run`.
+/// A failed check inside `Run` aborts the chain before any dependent step
+/// gets to look at the output, and its message for a wrong exit status is just
+/// `process exited with code N` — the captured stderr is written to a file in
+/// the cache and never shown. Owning the spawn means one failure message can
+/// carry the exit status and the diagnostics together, which is what you
+/// actually need to tell "the compiler said the wrong thing" apart from "the
+/// compiler said nothing at all".
 const DiagnosticsStep = struct {
     step: std.Build.Step,
-    stderr_file: std.Build.LazyPath,
+    exe: std.Build.LazyPath,
     source_file: std.Build.LazyPath,
     expected: []const u8,
 
-    fn create(
-        b: *std.Build,
-        case_name: []const u8,
-        stderr_file: std.Build.LazyPath,
+    const CaseInfo = struct {
+        exe: std.Build.LazyPath,
         source_file: std.Build.LazyPath,
         expected: []const u8,
-    ) *std.Build.Step {
+    };
+
+    fn create(b: *std.Build, case_name: []const u8, case: CaseInfo) *std.Build.Step {
         const diagnostics = b.allocator.create(DiagnosticsStep) catch @panic("OOM");
         diagnostics.* = .{
             .step = std.Build.Step.init(.{
@@ -140,40 +161,63 @@ const DiagnosticsStep = struct {
                 .owner = b,
                 .makeFn = make,
             }),
-            .stderr_file = stderr_file.dupe(b),
-            .source_file = source_file.dupe(b),
-            .expected = expected,
+            .exe = case.exe.dupe(b),
+            .source_file = case.source_file.dupe(b),
+            .expected = case.expected,
         };
-        diagnostics.stderr_file.addStepDependencies(&diagnostics.step);
+        diagnostics.exe.addStepDependencies(&diagnostics.step);
         diagnostics.source_file.addStepDependencies(&diagnostics.step);
         return &diagnostics.step;
     }
 
     fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-        _ = options;
         const b = step.owner;
-        const io = b.graph.io;
         const diagnostics: *DiagnosticsStep = @fieldParentPtr("step", step);
-        try step.singleUnchangingWatchInput(diagnostics.stderr_file);
+        try step.singleUnchangingWatchInput(diagnostics.source_file);
 
-        const stderr_path = diagnostics.stderr_file.getPath2(b, step);
-        const contents = std.Io.Dir.cwd().readFileAlloc(io, stderr_path, b.allocator, .limited(1024 * 1024)) catch |err| {
-            return step.fail("unable to read '{s}': {t}", .{ stderr_path, err });
-        };
-
+        const exe_path = diagnostics.exe.getPath2(b, step);
         const source_path = diagnostics.source_file.getPath2(b, step);
-        const normalized = try std.mem.replaceOwned(u8, b.allocator, contents, source_path, "");
 
-        if (!std.mem.eql(u8, diagnostics.expected, normalized)) {
-            return step.fail(
-                \\
-                \\========= expected diagnostics: =========
-                \\{s}
-                \\========= but found: ====================
-                \\{s}
-                \\=========================================
-            , .{ diagnostics.expected, normalized });
-        }
+        const result = try step.captureChildProcess(
+            options.gpa,
+            options.progress_node,
+            &.{ exe_path, source_path },
+        );
+        // The compiler is expected to write to stderr — that output is this
+        // step's input, not a report that the child misbehaved. Drop what
+        // `captureChildProcess` queued so a passing case stays quiet and a
+        // failing one shows the output once, inside the diff below.
+        step.result_error_msgs.clearRetainingCapacity();
+
+        const found = try std.mem.replaceOwned(u8, b.allocator, result.stderr, source_path, "");
+        const exit_ok = switch (result.term) {
+            .exited => |code| code == 1,
+            else => false,
+        };
+        if (exit_ok and std.mem.eql(u8, diagnostics.expected, found)) return;
+
+        // Only call out the exit status when it is the thing that went wrong;
+        // for a plain text mismatch the diff below is the whole story.
+        const term_line = if (exit_ok) "" else b.fmt(
+            "========= the compiler {s}, expected exit code 1\n",
+            .{describeTerm(b, result.term)},
+        );
+
+        return step.fail(
+            \\
+            \\{s}========= expected diagnostics: =========
+            \\{s}========= but found: ====================
+            \\{s}=========================================
+        , .{ term_line, diagnostics.expected, if (found.len == 0) "(nothing on stderr)\n" else found });
+    }
+
+    fn describeTerm(b: *std.Build, term: std.process.Child.Term) []const u8 {
+        return switch (term) {
+            .exited => |code| b.fmt("exited with code {d}", .{code}),
+            .signal => |signal| b.fmt("terminated with signal {d}", .{signal}),
+            .stopped => |signal| b.fmt("stopped with signal {d}", .{signal}),
+            .unknown => |code| b.fmt("terminated unexpectedly ({d})", .{code}),
+        };
     }
 };
 

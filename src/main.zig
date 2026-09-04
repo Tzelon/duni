@@ -3,6 +3,7 @@ const AstGen = @import("AstGen.zig");
 const Ast = @import("Ast.zig");
 const Sema = @import("Sema.zig");
 const InternPool = @import("InternPool.zig");
+const Compliation = @import("Compilation.zig");
 const WatGen = @import("WatGen.zig");
 const Io = std.Io;
 const process = std.process;
@@ -17,7 +18,11 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 1) {
         try repl(io, gpa);
     } else if (args.len == 2) {
-        runFile(io, gpa, args[1]) catch process.exit(64);
+        runFile(io, gpa, args[1]) catch |err| switch (err) {
+            // Diagnostics were already rendered, so exit quietly.
+            error.CompileErrorsReported => process.exit(1),
+            else => |e| return e,
+        };
     } else {
         std.debug.print("Usage: duni [path]\n", .{});
         process.exit(64);
@@ -48,30 +53,47 @@ fn repl(io: std.Io, _: Allocator) !void {
     }
 }
 
-fn runFile(io: std.Io, allocator: Allocator, path: []const u8) !void {
-    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, std.Io.Limit.unlimited, std.mem.Alignment.of(u8), 0);
-    defer allocator.free(source);
+fn runFile(io: std.Io, gpa: Allocator, source_path: []const u8) !void {
+    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
 
-    var ip: InternPool = .{};
-    try ip.init(allocator);
-    defer ip.deinit(allocator);
+    //load root file
 
-    var tree = try Ast.parse(allocator, source);
-    defer tree.deinit(allocator);
-    if (tree.errors.len != 0) {
-        for (tree.errors) |err| std.debug.print("Error: {any}\n", .{err.tag});
-        return error.ParseFailed;
+    const path = try Compliation.Path.fromUnresolved(gpa, &.{source_path});
+    const new_file = try gpa.create(Compliation.File);
+
+    new_file.* = .{
+        .status = .never_loaded,
+        .path = path,
+        .source = null,
+        .tree = null,
+        .dir = null,
+    };
+
+    const comp = try arena.create(Compliation);
+    comp.* = .{
+        .file = new_file,
+        .gpa = gpa,
+        .io = io,
+    };
+    try comp.init(gpa, io);
+    defer comp.deinit();
+
+    try comp.compile();
+
+    var errors = try comp.getAllErrorsAlloc();
+    defer errors.deinit(comp.gpa);
+
+    if (errors.errorMessageCount() > 0) {
+        const color: std.zig.Color = .auto;
+        errors.renderToStderr(comp.io, .{}, color) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => return error.PrintingErrorsFailed,
+        };
+        return error.CompileErrorsReported;
     }
 
-    var dir = try AstGen.generate(allocator, tree);
-    defer dir.deinit(allocator);
-
-    var air = try Sema.analyze(allocator, dir, &ip);
-    defer air.deinit(allocator);
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-    const stdout = &stdout_writer.interface;
-    try WatGen.emit(allocator, &air, &ip, stdout);
-    try stdout.flush();
+    // var air = try Sema.analyze(allocator, dir, &ip);
+    // defer air.deinit(allocator);
 }

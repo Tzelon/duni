@@ -475,6 +475,8 @@ pub fn extraData(code: Dir, comptime T: type, index: usize) ExtraData(T) {
             Inst.Ref,
             Inst.Index,
             Ast.Node.Index,
+            Ast.Node.OptionalIndex,
+            Ast.OptionalTokenIndex,
             NullTerminatedString,
             => @enumFromInt(code.extra[i]),
 
@@ -571,6 +573,26 @@ pub fn getDeclaration(dir: Dir, inst: Dir.Inst.Index) Inst.Declaration.Unwrapped
         .type_body = if (type_body_len == 0) null else type_body,
         .value_body = if (value_body_len == 0) null else value_body,
     };
+}
+
+/// has any compile errors parser or astgen
+pub fn hasCompileErrors(code: Dir) bool {
+    if (code.extra[@intFromEnum(ExtraIndex.compile_errors)] != 0) {
+        return true;
+    } else {
+        assert(code.instructions.len != 0); // i.e. lowering did not fail
+        return false;
+    }
+}
+
+/// parser ok, but astgen failed
+pub fn loweringFailed(code: Dir) bool {
+    if (code.instructions.len == 0) {
+        assert(code.hasCompileErrors());
+        return true;
+    } else {
+        return false;
+    }
 }
 
 pub const NullTerminatedString = enum(u32) {

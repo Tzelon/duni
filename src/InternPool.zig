@@ -9,6 +9,7 @@ const BigIntMutable = std.math.big.int.Mutable;
 const Limb = std.math.big.Limb;
 
 const Dir = @import("Dir.zig");
+const Compilation = @import("Compilation.zig");
 
 const string = @import("string.zig");
 const NullTerminatedString = string.NullTerminatedString;
@@ -30,6 +31,8 @@ string_bytes: std.ArrayListUnmanaged(u8) = .empty,
 strings: std.ArrayListUnmanaged(u32) = .empty,
 // A map to check if a string is already exists
 string_map: std.hash_map.HashMapUnmanaged(NullTerminatedString, void, NullTerminatedString.Context, std.hash_map.default_max_load_percentage) = .empty,
+
+files: std.MultiArrayList(File) = .empty,
 
 pub const Item = struct {
     tag: Tag,
@@ -806,6 +809,43 @@ pub fn indexToFuncType(ip: *const InternPool, val: Index) ?Key.FuncType {
     }
 }
 
+// ====== FILES ======
+
+pub fn filePtr(ip: *const InternPool, file_index: FileIndex) *Compilation.File {
+    const files = ip.files;
+    return files.items(.file)[@intFromEnum(file_index)];
+}
+
+pub fn createFile(ip: *InternPool, gpa: Allocator, file: File) Allocator.Error!FileIndex {
+    const file_index: FileIndex = @enumFromInt(ip.files.len);
+    try ip.files.append(gpa, file);
+    return file_index;
+}
+
+const File = struct {
+    file: *Compilation.File,
+    /// `.none` means no type has been created yet.
+    root_type: InternPool.Index,
+};
+
+pub const FileIndex = enum(u32) {
+    _,
+
+    pub fn toOptional(i: FileIndex) Optional {
+        return @enumFromInt(@intFromEnum(i));
+    }
+    pub const Optional = enum(u32) {
+        none = std.math.maxInt(u32),
+        _,
+        pub fn unwrap(opt: Optional) ?FileIndex {
+            return switch (opt) {
+                .none => null,
+                _ => @enumFromInt(@intFromEnum(opt)),
+            };
+        }
+    };
+};
+
 pub fn deinit(
     ip: *InternPool,
     gpa: Allocator,
@@ -817,6 +857,7 @@ pub fn deinit(
     ip.string_map.deinit(gpa);
     ip.extra.deinit(gpa);
     ip.limbs.deinit(gpa);
+    ip.files.deinit(gpa);
 }
 
 /// Stored-side context. The map holds `Index`es; we need the ip to
@@ -849,6 +890,8 @@ pub const GetFuncTypeKey = struct {
     param_types: []const Index,
     return_type: Index,
 };
+
+pub const empty: InternPool = .{};
 
 /// How many items in the InternPool are statically known.
 /// This is specified with an integer literal and a corresponding comptime

@@ -45,7 +45,7 @@ pub fn parseRoot(p: *Parse) !void {
         .data = undefined,
     });
 
-    const span = try p.parseBlock();
+    const span = try p.parseBlock(.root);
     p.nodes.items(.data)[0] = .{ .extra_range = span };
 }
 
@@ -67,12 +67,19 @@ fn expression(p: *Parse) !Node.Index {
     return p.parsePrecedence(.prec_assignment);
 }
 
-fn parseBlock(p: *Parse) !Node.SubRange {
+fn parseBlock(p: *Parse, mode: enum { root, block }) !Node.SubRange {
     const scratch_top = p.scratch.items.len;
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
     while (true) {
         while (p.check(.newline)) _ = p.advance(); // blank lines / separators
+
+        if (mode == .root and p.check(.r_brace)) {
+            try p.warn(.unexpected_rbrace);
+            _ = p.advance();
+            continue;
+        }
+
         if (p.check(.eof) or p.check(.r_brace)) break;
 
         const stmt = p.expression() catch |err| switch (err) {
@@ -327,7 +334,7 @@ fn externFunction(p: *Parse) !Node.Index {
 
 fn block(p: *Parse) !Node.Index {
     const main_token = p.advance();
-    const span = try p.parseBlock();
+    const span = try p.parseBlock(.block);
     const r_brace = try p.consume(.r_brace);
 
     return p.addNode(.{
@@ -499,6 +506,10 @@ fn consume(p: *Parse, expected_tag: Token.Tag) !TokenIndex {
 }
 
 // Helpers messages
+// warn* - continue parse.
+// fail* - unwinds to sync point.
+
+/// recoverable "expected token T here". parsing continues.
 fn warnExpected(p: *Parse, expected_token: Token.Tag) error{OutOfMemory}!void {
     @branchHint(.cold);
     try p.warnMsg(.{
@@ -508,6 +519,13 @@ fn warnExpected(p: *Parse, expected_token: Token.Tag) error{OutOfMemory}!void {
     });
 }
 
+/// recoverable tag-only error at the current token.
+fn warn(p: *Parse, error_tag: Ast.Error.Tag) error{OutOfMemory}!void {
+    @branchHint(.cold);
+    try p.warnMsg(.{ .tag = error_tag, .token = p.token_index });
+}
+
+/// recoverable a hand-built message.
 fn warnMsg(p: *Parse, msg: Ast.Error) error{OutOfMemory}!void {
     @branchHint(.cold);
 
@@ -523,17 +541,7 @@ fn warnMsg(p: *Parse, msg: Ast.Error) error{OutOfMemory}!void {
     try p.errors.append(p.gpa, msg);
 }
 
-fn warn(p: *Parse, error_tag: Ast.Error.Tag) error{OutOfMemory}!void {
-    @branchHint(.cold);
-    try p.warnMsg(.{ .tag = error_tag, .token = p.token_index });
-}
-
-fn failMsg(p: *Parse, msg: Ast.Error) error{ ParseError, OutOfMemory } {
-    @branchHint(.cold);
-    try p.warnMsg(msg);
-    return error.ParseError;
-}
-
+/// fatal "expected token T here". unwinds to resync point.
 fn failExpected(p: *Parse, expected_token: Token.Tag) error{ ParseError, OutOfMemory } {
     @branchHint(.cold);
     return p.failMsg(.{
@@ -541,4 +549,11 @@ fn failExpected(p: *Parse, expected_token: Token.Tag) error{ ParseError, OutOfMe
         .token = p.token_index,
         .extra = .{ .expected_tag = expected_token },
     });
+}
+
+/// fatal error a hand-built message
+fn failMsg(p: *Parse, msg: Ast.Error) error{ ParseError, OutOfMemory } {
+    @branchHint(.cold);
+    try p.warnMsg(msg);
+    return error.ParseError;
 }

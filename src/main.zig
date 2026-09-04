@@ -121,11 +121,12 @@ pub fn log(
     {
         if (!build_options.enable_logging) return;
 
-        const scope_name = @tagName(scope);
-        for (log_scopes.items) |log_scope| {
-            if (mem.eql(u8, log_scope, scope_name))
-                break;
-        } else return;
+        // TODO(tzelon): implement log per scope
+        // const scope_name = @tagName(scope);
+        // for (log_scopes.items) |log_scope| {
+        //     if (mem.eql(u8, log_scope, scope_name))
+        //         break;
+        // } else return;
     }
 
     // Otherwise, use the default implementation.

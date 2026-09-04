@@ -274,6 +274,7 @@ pub const Error = struct {
         expected_return_type,
         expected_token,
         expected_type_expr,
+        unexpected_rbrace,
     };
 };
 
@@ -348,6 +349,11 @@ pub fn renderError(tree: Ast, parse_error: Error, w: *Writer) Writer.Error!void 
                     expected_symbol, found_tag.symbol(),
                 }),
             }
+        },
+        .unexpected_rbrace => {
+            return w.print("unexpected '{s}' no matching '{{'", .{
+                tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev)).symbol(),
+            });
         },
     }
 }

@@ -4,4 +4,6 @@
 
 // error
 //
-// :2:1: error: expected expression, found '}'
+// :2:1: error: unexpected '}' no matching '{'
+// }
+// ^

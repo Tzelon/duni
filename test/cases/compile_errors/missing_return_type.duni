@@ -2,4 +2,6 @@ extern fn print(x number)
 
 // error
 //
-// :1:25: error: expected return type
+// :1:26: error: expected return type expression, found 'newline'
+// extern fn print(x number)
+//                          ^

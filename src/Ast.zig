@@ -217,6 +217,9 @@ pub fn tokenSlice(tree: Ast, token_index: TokenIndex) []const u8 {
         return lexeme;
     }
 
+    // special case for `.newline`.
+    if (token_tag == .newline) return "\n";
+
     // For some tokens, re-tokenization is needed to find the end.
     var scanner: Scanner = .{
         .buffer = tree.source,
@@ -341,10 +344,9 @@ pub fn renderError(tree: Ast, parse_error: Error, w: *Writer) Writer.Error!void 
         .expected_token => {
             const found_tag = tree.tokenTag(parse_error.token + @intFromBool(parse_error.token_is_prev));
             const expected_symbol = parse_error.extra.expected_tag.symbol();
+            const token_slice = tree.tokenSlice(parse_error.token + @intFromBool(parse_error.token_is_prev));
             switch (found_tag) {
-                .invalid => return w.print("expected '{s}', found invalid bytes", .{
-                    expected_symbol,
-                }),
+                .invalid => return w.print("found invalid bytes '{s}'", .{token_slice}),
                 else => return w.print("expected '{s}', found '{s}'", .{
                     expected_symbol, found_tag.symbol(),
                 }),

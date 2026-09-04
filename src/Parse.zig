@@ -96,7 +96,7 @@ fn parseModuleMembers(p: *Parse) !Node.SubRange {
 
         try p.scratch.append(p.gpa, stmt);
 
-        if (!p.check(.newline) and !p.check(.eof) and !p.check(.r_brace)) {
+        if (!p.check(.newline) and !p.check(.eof)) {
             try p.warnExpected(.newline);
             p.findNextStmt();
         }
@@ -500,6 +500,9 @@ fn tokenSlice(p: *Parse, token_index: TokenIndex) []const u8 {
     if (token_tag.lexeme()) |lexeme| {
         return lexeme;
     }
+
+    // special case for `.newline`.
+    if (token_tag == .newline) return "\n";
 
     // For some tokens, re-tokenization is needed to find the end.
     var scanner: Scanner = .{

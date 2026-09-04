@@ -358,7 +358,7 @@ pub const Token = struct {
                 .string_literal => "a string literal",
                 .eof => "EOF",
                 .number_literal => "a number literal",
-                .newline => "a newline",
+                .newline => "newline",
                 else => unreachable,
             };
         }

@@ -45,7 +45,7 @@ pub fn parseRoot(p: *Parse) !void {
         .data = undefined,
     });
 
-    const span = try p.parseBlock(.root);
+    const span = try p.parseModuleMembers();
     p.nodes.items(.data)[0] = .{ .extra_range = span };
 }
 
@@ -67,18 +67,51 @@ fn expression(p: *Parse) !Node.Index {
     return p.parsePrecedence(.prec_assignment);
 }
 
-fn parseBlock(p: *Parse, mode: enum { root, block }) !Node.SubRange {
+fn parseModuleMembers(p: *Parse) !Node.SubRange {
     const scratch_top = p.scratch.items.len;
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
     while (true) {
         while (p.check(.newline)) _ = p.advance(); // blank lines / separators
 
-        if (mode == .root and p.check(.r_brace)) {
+        if (p.check(.r_brace)) {
             try p.warn(.unexpected_rbrace);
             _ = p.advance();
             continue;
         }
+
+        if (p.check(.eof)) break;
+
+        const stmt = (switch (p.current()) {
+            .keyword_fn => p.function(),
+            .keyword_extern => p.externFunction(),
+            else => p.expression(),
+        }) catch |err| switch (err) {
+            error.ParseError => {
+                p.findNextStmt();
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+
+        try p.scratch.append(p.gpa, stmt);
+
+        if (!p.check(.newline) and !p.check(.eof) and !p.check(.r_brace)) {
+            try p.warnExpected(.newline);
+            p.findNextStmt();
+        }
+    }
+
+    const span = try p.listToSpan(p.scratch.items[scratch_top..]);
+    return span;
+}
+
+fn parseBlock(p: *Parse) !Node.SubRange {
+    const scratch_top = p.scratch.items.len;
+    defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (true) {
+        while (p.check(.newline)) _ = p.advance(); // blank lines / separators
 
         if (p.check(.eof) or p.check(.r_brace)) break;
 
@@ -224,8 +257,8 @@ fn addExtra(p: *Parse, extra: anytype) Allocator.Error!Node.ExtraIndex {
 fn getRule(self: *Parse, tag: Token.Tag) ParseRule {
     _ = self;
     const rule = switch (tag) {
-        .keyword_fn => comptime ParseRule.init(Parse.function, null, .prec_none),
-        .keyword_extern => comptime ParseRule.init(Parse.externFunction, null, .prec_none),
+        .keyword_fn => comptime ParseRule.init(null, null, .prec_none),
+        .keyword_extern => comptime ParseRule.init(null, null, .prec_none),
         .l_paren => comptime ParseRule.init(Parse.grouping, Parse.call, .prec_call),
         .r_paren => comptime ParseRule.init(null, null, .prec_none),
         .l_brace => comptime ParseRule.init(Parse.block, null, .prec_none),
@@ -334,7 +367,7 @@ fn externFunction(p: *Parse) !Node.Index {
 
 fn block(p: *Parse) !Node.Index {
     const main_token = p.advance();
-    const span = try p.parseBlock(.block);
+    const span = try p.parseBlock();
     const r_brace = try p.consume(.r_brace);
 
     return p.addNode(.{

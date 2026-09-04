@@ -3,3 +3,5 @@
 // error
 //
 // :1:5: error: expected expression, found 'fn'
+// 1 + fn f(x number) number {}
+//     ^~

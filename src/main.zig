@@ -1,18 +1,24 @@
+const build_options = @import("build_options");
+
 const std = @import("std");
-const AstGen = @import("AstGen.zig");
-const Ast = @import("Ast.zig");
-const Sema = @import("Sema.zig");
-const InternPool = @import("InternPool.zig");
-const Compliation = @import("Compilation.zig");
-const WatGen = @import("WatGen.zig");
+const mem = std.mem;
 const Io = std.Io;
 const process = std.process;
 const Allocator = std.mem.Allocator;
+
+const Sema = @import("Sema.zig");
+const Compliation = @import("Compilation.zig");
+const WatGen = @import("WatGen.zig");
+
+pub const std_options: std.Options = .{
+    .logFn = log,
+};
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
+    // TODO(tzelon): handle args in more robust way
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len == 1) {
@@ -96,4 +102,32 @@ fn runFile(io: std.Io, gpa: Allocator, source_path: []const u8) !void {
 
     // var air = try Sema.analyze(allocator, dir, &ip);
     // defer air.deinit(allocator);
+}
+
+// TODO(tzelon): implement log per scope
+var log_scopes: std.ArrayList([]const u8) = .empty;
+
+pub fn log(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // Hide debug messages unless:
+    // * logging enabled with `-Dlog`.
+    // * the --debug-log arg for the scope has been provided
+    if (@intFromEnum(level) > @intFromEnum(std.options.log_level) or
+        @intFromEnum(level) > @intFromEnum(std.log.Level.info))
+    {
+        if (!build_options.enable_logging) return;
+
+        const scope_name = @tagName(scope);
+        for (log_scopes.items) |log_scope| {
+            if (mem.eql(u8, log_scope, scope_name))
+                break;
+        } else return;
+    }
+
+    // Otherwise, use the default implementation.
+    std.log.defaultLog(level, scope, format, args);
 }

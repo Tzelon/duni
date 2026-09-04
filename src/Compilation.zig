@@ -321,7 +321,6 @@ pub fn compile(comp: *Compilation) !void {
 pub fn anyErrors(comp: *Compilation) bool {
     var errors = comp.getAllErrorsAlloc() catch return true;
     defer errors.deinit(comp.gpa);
-    std.log.info("errors count {d}", .{errors.errorMessageCount()});
     return errors.errorMessageCount() > 0;
 }
 

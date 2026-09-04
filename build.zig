@@ -89,6 +89,13 @@ pub fn build(b: *std.Build) !void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    const exe_options = b.addOptions();
+    exe.root_module.addOptions("build_options", exe_options);
+
+    const is_debug = optimize == .Debug;
+    const enable_logging = b.option(bool, "log", "Enable debug logging with --debug-log") orelse is_debug;
+    exe_options.addOption(bool, "enable_logging", enable_logging);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

@@ -137,6 +137,13 @@ pub const Inst = struct {
         /// `small` is `ModuleDecl.Small`.
         module_decl,
 
+        /// At this point, AstGen encountered a fatal error which terminated DIR lowering for this body.
+        /// A file-level error has been reported. Sema should terminate semantic analysis.
+        /// `operand` and `small` are ignored.
+        /// This instruction is always `noreturn`, however, it is not considered as such by DIR-level queries. This allows AstGen to assume that
+        /// any code may have gone here, avoiding false-positive "unreachable code" errors.
+        astgen_error,
+
         pub const InstData = struct {
             opcode: Extended,
             small: u16,

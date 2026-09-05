@@ -218,15 +218,13 @@ fn rootModuleDecl(
                 error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
-                    std.log.err("boooooom", .{});
-                    // try addFailedDeclaration(
-                    //     wip_decls,
-                    //     gz,
-                    //     .@"const",
-                    //     try astgen.identAsString(full.name_token.?),
-                    //     full.ast.proto_node,
-                    //     full.visib_token != null,
-                    // );
+                    try addFailedDeclaration(
+                        &wip_decls,
+                        gd,
+                        .@"const",
+                        try astgen.identAsString(full_proto.name_token),
+                        full_proto.ast.proto_node,
+                    );
                 },
             };
         },
@@ -274,8 +272,7 @@ fn fnDecl(
 
     if (body_node == .none) {
         if (!is_extern) {
-            std.log.err("non-extern function has no body", .{});
-            // return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
+            return astgen.failTok(fn_proto.ast.fn_token, "non-extern function has no body", .{});
         }
     }
 
@@ -368,10 +365,7 @@ fn numberLiteral(gd: *GenDir, node: Ast.Node.Index, source_node: Ast.Node.Index,
             const smaller_float: f64 = @floatCast(float_number);
             return try gd.addFloat(smaller_float);
         },
-        .failure => {
-            std.log.warn("failed to parse literal number", .{});
-            return error.AnalysisFail;
-        },
+        .failure => |err| return astgen.failWithNumberError(err, num_token, bytes),
     };
 
     if (sign == .positive) {
@@ -423,9 +417,7 @@ fn bind(gd: *GenDir, node: Ast.Node.Index) InnerError!Dir.Inst.Ref {
 
     // The lhs is a pattern; today only a plain identifier is supported.
     if (tree.nodeTag(lhs_node) != .identifier) {
-        // TODO(tzelon): AstGen error reporting phase 1.
-        std.log.warn("unsupported pattern", .{});
-        return error.AnalysisFail;
+        return astgen.failNode(node, "invalid left-hand side to assignment", .{});
     }
 
     // Lower the rhs BEFORE pushing the note: in `x = x + 1`, the rhs `x`
@@ -590,9 +582,8 @@ fn identifier(gd: *GenDir, ident: Ast.Node.Index) InnerError!Dir.Inst.Ref {
     return localVarRef(gd, ident, ident_token);
 }
 
+/// given an identifier, resolve it to a local, parameter, or container decl by walking scopes outward
 fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) InnerError!Dir.Inst.Ref {
-    _ = ident;
-
     const astgen = gd.astgen;
     const name_str_index = try astgen.identAsString(ident_token);
     find_scope: switch (gd.cursor.tip.unwrap()) {
@@ -615,11 +606,9 @@ fn localVarRef(gd: *GenDir, ident: Ast.Node.Index, ident_token: Ast.TokenIndex) 
         .top => break :find_scope,
     }
 
-    // No namespaces yet: the scope chain is the complete set of names,
     // so a miss means the identifier is undeclared.
-    // TODO(tzelon): AstGen error reporting phase 1.
-    std.log.warn("use of undeclared identifier '{s}'", .{try astgen.identifierTokenString(ident_token)});
-    return error.AnalysisFail;
+    const ident_name = try astgen.identifierTokenString(ident_token);
+    return astgen.failNode(ident, "use of undeclared identifier '{s}'", .{ident_name});
 }
 
 fn identAsString(astgen: *AstGen, ident_token: Ast.TokenIndex) !Dir.NullTerminatedString {
@@ -722,6 +711,38 @@ fn parseStrLit(
     switch (result) {
         .success => return,
         .failure => |err| return astgen.failWithStrLitError(err, token, bytes, offset),
+    }
+}
+
+fn failWithNumberError(astgen: *AstGen, err: std.zig.number_literal.Error, token: Ast.TokenIndex, bytes: []const u8) InnerError {
+    const is_float = std.mem.findScalar(u8, bytes, '.') != null;
+    switch (err) {
+        .leading_zero => if (is_float) {
+            return astgen.failTok(token, "number '{s}' has leading zero", .{bytes});
+        } else {
+            return astgen.failTokNotes(token, "number '{s}' has leading zero", .{bytes}, &.{
+                try astgen.errNoteTok(token, "use '0o' prefix for octal literals", .{}),
+            });
+        },
+        .digit_after_base => return astgen.failTok(token, "expected a digit after base prefix", .{}),
+        .upper_case_base => |i| return astgen.failOff(token, @intCast(i), "base prefix must be lowercase", .{}),
+        .invalid_float_base => |i| return astgen.failOff(token, @intCast(i), "invalid base for float literal", .{}),
+        .repeated_underscore => |i| return astgen.failOff(token, @intCast(i), "repeated digit separator", .{}),
+        .invalid_underscore_after_special => |i| return astgen.failOff(token, @intCast(i), "expected digit before digit separator", .{}),
+        .invalid_digit => |info| return astgen.failOff(token, @intCast(info.i), "invalid digit '{c}' for {s} base", .{ bytes[info.i], @tagName(info.base) }),
+        .invalid_digit_exponent => |i| return astgen.failOff(token, @intCast(i), "invalid digit '{c}' in exponent", .{bytes[i]}),
+        .duplicate_exponent => |i| return astgen.failOff(token, @intCast(i), "duplicate exponent", .{}),
+        .exponent_after_underscore => |i| return astgen.failOff(token, @intCast(i), "expected digit before exponent", .{}),
+        .special_after_underscore => |i| return astgen.failOff(token, @intCast(i), "expected digit before '{c}'", .{bytes[i]}),
+        .trailing_special => |i| return astgen.failOff(token, @intCast(i), "expected digit after '{c}'", .{bytes[i - 1]}),
+        .trailing_underscore => |i| return astgen.failOff(token, @intCast(i), "trailing digit separator", .{}),
+        .duplicate_period => unreachable, // Validated by tokenizer
+        .invalid_character => unreachable, // Validated by tokenizer
+        .invalid_exponent_sign => |i| {
+            assert(bytes.len >= 2 and bytes[0] == '0' and bytes[1] == 'x'); // Validated by tokenizer
+            return astgen.failOff(token, @intCast(i), "sign '{c}' cannot follow digit '{c}' in hex base", .{ bytes[i], bytes[i - 1] });
+        },
+        .period_after_exponent => |i| return astgen.failOff(token, @intCast(i), "unexpected period after exponent", .{}),
     }
 }
 
@@ -850,6 +871,75 @@ fn failOff(
     return error.AnalysisFail;
 }
 
+fn appendErrorNode(
+    astgen: *AstGen,
+    node: Ast.Node.Index,
+    comptime format: []const u8,
+    args: anytype,
+) Allocator.Error!void {
+    try astgen.appendErrorNodeNotes(node, format, args, &[0]u32{});
+}
+
+fn failTok(
+    astgen: *AstGen,
+    token: Ast.TokenIndex,
+    comptime format: []const u8,
+    args: anytype,
+) InnerError {
+    return astgen.failTokNotes(token, format, args, &[0]u32{});
+}
+
+/// Record an error at `node` and abort analysis.
+fn failNode(
+    astgen: *AstGen,
+    node: Ast.Node.Index,
+    comptime format: []const u8,
+    args: anytype,
+) InnerError {
+    return astgen.failNodeNotes(node, format, args, &[0]u32{});
+}
+
+/// Record an error with notes at `node` and abort analysis.
+fn failNodeNotes(
+    astgen: *AstGen,
+    node: Ast.Node.Index,
+    comptime format: []const u8,
+    args: anytype,
+    notes: []const u32,
+) InnerError {
+    try appendErrorNodeNotes(astgen, node, format, args, notes);
+    return error.AnalysisFail;
+}
+
+/// Record an error with notes at `node` without aborting analysis.
+fn appendErrorNodeNotes(
+    astgen: *AstGen,
+    node: Ast.Node.Index,
+    comptime format: []const u8,
+    args: anytype,
+    notes: []const u32,
+) Allocator.Error!void {
+    @branchHint(.cold);
+    const gpa = astgen.gpa;
+    const string_bytes = &astgen.string_bytes;
+    const msg: Dir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    try string_bytes.print(gpa, format ++ "\x00", args);
+    const notes_index: u32 = if (notes.len != 0) blk: {
+        const notes_start = astgen.extra.items.len;
+        try astgen.extra.ensureTotalCapacity(gpa, notes_start + 1 + notes.len);
+        astgen.extra.appendAssumeCapacity(@intCast(notes.len));
+        astgen.extra.appendSliceAssumeCapacity(notes);
+        break :blk @intCast(notes_start);
+    } else 0;
+    try astgen.compile_errors.append(gpa, .{
+        .msg = msg,
+        .node = node.toOptional(),
+        .token = .none,
+        .byte_offset = 0,
+        .notes = notes_index,
+    });
+}
+
 fn addExtra(astgen: *AstGen, extra: anytype) Allocator.Error!u32 {
     const field_count = std.meta.fieldNames(@TypeOf(extra)).len;
     try astgen.extra.ensureUnusedCapacity(astgen.gpa, field_count);
@@ -953,8 +1043,7 @@ fn scanContainer(
                 decl_count += 1;
                 const ident = tree.nodeMainToken(member_node) + 1;
                 if (tree.tokenTag(ident) != .identifier) {
-                    std.log.err("missing function name", .{});
-                    // try astgen.appendErrorNode(member_node, "missing function name", .{});
+                    try astgen.appendErrorNode(member_node, "missing function name", .{});
                     any_invalid_declarations = true;
                     continue;
                 }
@@ -1000,11 +1089,7 @@ fn scanContainer(
                     try astgen.appendErrorTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
                         token_bytes, @tagName(local_val.id_cat),
                     }, &.{
-                        try astgen.errNoteTok(
-                            local_val.token_src,
-                            "previous declaration here",
-                            .{},
-                        ),
+                        try astgen.errNoteTok(local_val.token_src, "previous declaration here", .{}),
                     });
                     any_invalid_declarations = true;
                     break :find_scope;
@@ -1568,6 +1653,37 @@ fn comptimeExpr(
     node: Ast.Node.Index,
 ) InnerError!Dir.Inst.Ref {
     return expr(gd, node);
+}
+
+fn addFailedDeclaration(
+    wip_decls: *WipDecls,
+    gd: *GenDir,
+    kind: Dir.Inst.Declaration.Unwrapped.Kind,
+    name: Dir.NullTerminatedString,
+    src_node: Ast.Node.Index,
+) !void {
+    const decl_inst = try gd.makeDeclaration(src_node);
+    wip_decls.nextDecl(decl_inst);
+
+    var dummy_gd = gd.makeSubBlock();
+
+    var value_gd = gd.makeSubBlock(); // scope doesn't matter here
+    _ = try value_gd.add(.{
+        .tag = .extended,
+        .data = .{ .extended = .{
+            .opcode = .astgen_error,
+            .small = undefined,
+            .operand = undefined,
+        } },
+    });
+
+    try setDeclaration(decl_inst, .{
+        .kind = kind,
+        .name = name,
+        .linkage = .normal,
+        .type_gd = &dummy_gd,
+        .value_gd = &value_gd,
+    });
 }
 
 /// Sets all extra data for a `declaration` instruction.

@@ -360,9 +360,15 @@ fn function(p: *Parse) !Node.Index {
 /// An extern function is a bare `fn_proto` with no body; the `extern`
 /// keyword is the token before the proto's `fn` token.
 fn externFunction(p: *Parse) !Node.Index {
-    _ = p.advance(); // `extern`
+    const extern_export_token = p.advance(); // `extern`
     const fn_token = try p.consume(.keyword_fn);
-    return p.parseProto(fn_token);
+    const fn_proto = try p.parseProto(fn_token);
+
+    if (p.check(.r_brace)) {
+        try p.warnMsg(.{ .tag = .extern_fn_body, .token = extern_export_token });
+    }
+
+    return fn_proto;
 }
 
 fn block(p: *Parse) !Node.Index {

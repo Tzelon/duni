@@ -1,0 +1,7 @@
+10__1
+
+// error
+//
+// :1:4: error: repeated digit separator
+// 10__1
+//    ^~

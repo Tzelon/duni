@@ -1,0 +1,7 @@
+fn foo(x number) number
+
+// error
+//
+// :1:24: error: expected '{', found 'newline'
+// fn foo(x number) number
+//                        ^

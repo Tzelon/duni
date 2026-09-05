@@ -1,0 +1,7 @@
+fn (x number) number {}
+
+// error
+//
+// :1:4: error: expected 'an identifier', found '('
+// fn (x number) number {}
+//    ^

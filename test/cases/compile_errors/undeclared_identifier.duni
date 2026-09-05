@@ -1,0 +1,9 @@
+extern fn print(x number) number
+
+print(x)
+
+// error
+//
+// :3:7: error: use of undeclared identifier 'x'
+// print(x)
+//       ^

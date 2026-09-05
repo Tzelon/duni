@@ -1118,7 +1118,6 @@ fn scanContainer(
         try notes.append(astgen.arena, try astgen.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
         const name_duped = try astgen.arena.dupe(u8, mem.span(astgen.nullTerminatedString(name)));
 
-        std.log.err("duplicate {s} member name", .{@tagName(container_kind)});
         try astgen.appendErrorTokNotes(first.tok, "duplicate {s} member name '{s}'", .{ @tagName(container_kind), name_duped }, notes.items);
 
         any_invalid_declarations = true;
